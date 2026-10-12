@@ -852,6 +852,73 @@ Do the legacy thing.
         assert result["readiness_status"] == "available"
 
 
+class TestRequiredCommandsDiscovery:
+    """required_commands must be discovered via PATH (not hardcoded empty) and
+    rechecked on every view."""
+
+    def test_present_commands_leave_skill_available(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("shutil.which", lambda cmd: f"/usr/bin/{cmd}")
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "font-skill",
+                        frontmatter_extra="required_commands: [node, npx]\n")
+            raw = skill_view("font-skill")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["required_commands"] == ["node", "npx"]
+        assert result["missing_required_commands"] == []
+        assert result["setup_needed"] is False
+        assert result["readiness_status"] == "available"
+
+    def test_missing_commands_flag_setup_needed(self, tmp_path, monkeypatch):
+        def _which(cmd):
+            return None if cmd == "ffmpeg" else f"/usr/bin/{cmd}"
+
+        monkeypatch.setattr("shutil.which", _which)
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "video-skill",
+                        frontmatter_extra="required_commands: [ffmpeg, ffprobe, python3]\n")
+            raw = skill_view("video-skill")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["required_commands"] == ["ffmpeg", "ffprobe", "python3"]
+        assert result["missing_required_commands"] == ["ffmpeg"]
+        assert result["setup_needed"] is True
+        assert result["readiness_status"] == "setup_needed"
+        assert "command 'ffmpeg'" in result.get("setup_note", "")
+
+    def test_recheck_after_install_clears_missing(self, tmp_path, monkeypatch):
+        state = {"installed": False}
+
+        def _which(cmd):
+            if cmd == "ffmpeg" and not state["installed"]:
+                return None
+            return f"/usr/bin/{cmd}"
+
+        monkeypatch.setattr("shutil.which", _which)
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "recheck-skill",
+                        frontmatter_extra="required_commands: [ffmpeg]\n")
+            first = json.loads(skill_view("recheck-skill"))
+            assert first["missing_required_commands"] == ["ffmpeg"]
+            assert first["setup_needed"] is True
+            state["installed"] = True
+            second = json.loads(skill_view("recheck-skill"))
+            assert second["missing_required_commands"] == []
+            assert second["setup_needed"] is False
+            assert second["readiness_status"] == "available"
+
+    def test_malformed_declaration_never_blocks(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("shutil.which", lambda cmd: f"/usr/bin/{cmd}")
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "odd-skill",
+                        frontmatter_extra="required_commands: ffmpeg\n")
+            raw = skill_view("odd-skill")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["required_commands"] == ["ffmpeg"]
+        assert result["missing_required_commands"] == []
+
+
 class TestSkillViewCollisionDetection:
     """Regression tests for skill_view name collision handling.
 

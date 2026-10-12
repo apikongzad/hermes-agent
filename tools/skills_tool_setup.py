@@ -80,6 +80,44 @@ def _get_required_environment_variables(frontmatter: dict[str, Any]) -> list[dic
     return list(required.values())
 
 
+def _get_required_commands(frontmatter: dict[str, Any]) -> list[str]:
+    """Declared ``required_commands`` (e.g. ``[node, npx]``, ``[ffmpeg, ffprobe]``).
+
+    Accepts a list of strings (or single string, or list of ``{name:}`` dicts);
+    dedupes preserving order, drops blanks. Anything else is treated as empty
+    so a malformed declaration never blocks a skill.
+    """
+    raw = frontmatter.get("required_commands", [])
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    required: list[str] = []
+    for item in raw:
+        if isinstance(item, dict):
+            name = str(item.get("name") or item.get("command") or "").strip()
+        else:
+            name = str(item).strip() if isinstance(item, str) else ""
+        if not name or name in required:
+            continue
+        required.append(name)
+    return required
+
+
+def _missing_required_commands(required: list[str]) -> list[str]:
+    """Actual discovery: commands in *required* with no executable on PATH."""
+    import shutil
+
+    missing: list[str] = []
+    for cmd in required:
+        try:
+            if shutil.which(cmd) is None:
+                missing.append(cmd)
+        except Exception:
+            missing.append(cmd)
+    return missing
+
+
 def _capture_result(missing_names, setup_skipped=False, gateway_setup_hint=None):
     return {"missing_names": missing_names, "setup_skipped": setup_skipped, "gateway_setup_hint": gateway_setup_hint}
 
