@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import simpleGit from 'simple-git'
+import { simpleGit } from 'simple-git'
 import { afterEach, test, vi } from 'vitest'
 
 import {
@@ -97,11 +97,12 @@ test('gitFor accepts a Windows no-console host tuple with restricted characters'
   }
 })
 
-test('gitFor suppresses only the known custom-binary warning and restores console.warn', () => {
+test('gitFor with an unsafe binary does not spam console.warn on simple-git v4', () => {
   const spacedBin = String.raw`C:\Program Files\Git\cmd\git.exe`
-  // `windowsGitHost()` resolves nothing in this process (no configured roots, no
-  // HERMES_DESKTOP_PYTHON), so `gitBin` itself is what simple-git validates — the
-  // spaced `Program Files` path, which warns once per factory call.
+  // v3 console.warned SIMPLE_GIT_UNSAFE_BINARY_WARN once per factory call when
+  // the escape hatch was set; v4 logs via `debug` instead, so the factory must
+  // stay silent on console.warn. The constant still names the throw text used
+  // when the hatch is missing.
   const warnings: unknown[][] = []
   const originalWarn = console.warn
 
@@ -118,16 +119,83 @@ test('gitFor suppresses only the known custom-binary warning and restores consol
 
     assert.equal(console.warn, recordingWarn)
 
-    // The escape hatch used directly still warns: the message gitFor filters is a
-    // live emission of the installed simple-git, so the filter cannot go stale
-    // silently (an upgrade that rewords it fails this test, not production).
+    // The escape hatch used directly stays silent too on v4 (debug, not warn).
     simpleGit({ baseDir: process.cwd(), binary: spacedBin, unsafe: { allowUnsafeCustomBinary: true } })
     console.warn('unrelated warning')
   } finally {
     console.warn = originalWarn
   }
 
-  assert.deepEqual(warnings, [[SIMPLE_GIT_UNSAFE_BINARY_WARN], ['unrelated warning']])
+  assert.deepEqual(warnings, [['unrelated warning']])
+  assert.ok(SIMPLE_GIT_UNSAFE_BINARY_WARN.includes('allowUnsafeCustomBinary'))
+})
+
+test('simple-git v4: named export is the supported factory (no default import)', async () => {
+  // v4 removed the default export (`import simpleGit from 'simple-git'`);
+  // the only supported shape is `import { simpleGit } from 'simple-git'`.
+  assert.equal(typeof simpleGit, 'function')
+
+  const mod = await import('simple-git')
+
+  assert.equal(typeof (mod as unknown as { simpleGit: unknown }).simpleGit, 'function')
+  assert.equal((mod as unknown as { default?: unknown }).default, undefined)
+})
+
+test('simple-git v4: VISUAL editor env is blocked without the unsafe opt-in', async () => {
+  // GHSA-v5rq-49vh-5v5c: argv-parser <2.0.1 dropped VISUAL before the
+  // allowUnsafeEditor check, so `VISUAL=/tmp/evileditor git commit --amend`
+  // bypassed the guard that already blocked EDITOR/GIT_EDITOR. Patched
+  // parser (2.0.1, via simple-git 4.0.2) must flag VISUAL like its siblings.
+  const { vulnerabilityCheck } = await import('@simple-git/argv-parser')
+
+  for (const key of ['EDITOR', 'GIT_EDITOR', 'GIT_SEQUENCE_EDITOR', 'VISUAL']) {
+    const found = vulnerabilityCheck(['commit', '--amend'], { [key]: '/tmp/evileditor' })
+
+    assert.ok(
+      found.some(vulnerability => vulnerability.category === 'allowUnsafeEditor'),
+      `${key} must be classified as allowUnsafeEditor`
+    )
+  }
+})
+
+test('gitFor on the Windows host tuple allowlists only the guarded env it needs', async () => {
+  vi.resetModules()
+  vi.doMock('./no-console-git', async importOriginal => {
+    const actual = await importOriginal<typeof NoConsoleGit>()
+
+    return {
+      ...actual,
+      windowsGitHost: () => ({
+        isWindows: true,
+        pythonBin: String.raw`C:\Tools\python-3.14+build\python.exe`,
+        scriptPath: String.raw`C:\Hermes\hermes-no-console-git.py`
+      })
+    }
+  })
+
+  try {
+    const withHost = await import('./git-review-ops')
+    const git = withHost.gitFor(process.cwd(), 'git') as unknown as {
+      env?: unknown
+      _executor?: { env?: Record<string, string> }
+    }
+    const env =
+      (git._executor?.env as Record<string, string> | undefined) ??
+      (git.env as Record<string, string> | undefined)
+
+    assert.ok(env, 'Windows tuple must set an explicit env for the python host')
+    assert.equal(env.HERMES_GIT_ARGV0, JSON.stringify('git'))
+    assert.equal(env.GIT_TERMINAL_PROMPT, '0')
+    // Guarded host keys (GIT_SSH, EDITOR, VISUAL, ...) must not be forwarded
+    // explicitly: v4 rejects an explicit guarded key without allowEnvironment,
+    // and only GIT_TERMINAL_PROMPT is allowlisted for this path.
+    assert.equal(env.GIT_SSH, undefined)
+    assert.equal(env.EDITOR, undefined)
+    assert.equal(env.VISUAL, undefined)
+  } finally {
+    vi.doUnmock('./no-console-git')
+    vi.resetModules()
+  }
 })
 
 test('resolveRenamePath: simple rename resolves to the new path', () => {
