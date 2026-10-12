@@ -89,14 +89,24 @@ def load_tracked() -> list[dict[str, Any]]:
 
 
 def save_tracked(tracked: list[dict[str, Any]]) -> None:
-    """Atomic write: ``.tmp`` → backup old → rename."""
+    """Durable atomic write via shared ``utils.atomic_json_write`` + ``.bak``.
+
+    Uses a unique ``mkstemp`` staging file (no ``.json.tmp`` collision under
+    concurrent writers), file fsync + directory fsync (``fsync_dir=True``) so a
+    just-renamed file survives power loss, and ``BaseException`` temp cleanup.
+    The ``.bak`` sibling preserves last-known-good state for ``load_tracked``'s
+    corruption restore: it is copied from the pre-write file best-effort (a
+    backup failure logs and still attempts the atomic write; an atomic-write
+    failure propagates with the original file untouched and no temp orphan).
+    """
+    from utils import atomic_json_write
+
     tf = _state_file("tracked.json")
     tf.parent.mkdir(parents=True, exist_ok=True)
-    tmp = tf.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(tracked, indent=2), encoding="utf-8")
     if tf.exists():
-        shutil.copy2(tf, tf.with_suffix(".json.bak"))
-    tmp.replace(tf)
+        with contextlib.suppress(OSError):
+            shutil.copy2(tf, tf.with_suffix(".json.bak"))
+    atomic_json_write(tf, tracked, fsync_dir=True)
 
 
 ALLOWED_CATEGORIES = {

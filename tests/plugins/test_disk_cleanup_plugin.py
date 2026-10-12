@@ -709,3 +709,107 @@ class TestBundledDiscovery:
         mgr.discover_and_load()
         assert "memory" not in mgr._plugins
         assert "context_engine" not in mgr._plugins
+
+
+class TestSaveTrackedDurability:
+    """save_tracked must use shared atomic_json_write (unique staging, file+dir
+    fsync, temp cleanup) and preserve .bak for load_tracked restore."""
+
+    def test_uses_shared_atomic_write_with_dir_fsync(self, _isolate_env, monkeypatch):
+        dg = _load_lib()
+        seen = {}
+
+        import utils as _utils
+
+        real = _utils.atomic_json_write
+
+        def _spy(path, data, **kw):
+            seen["kw"] = kw
+            seen["path"] = str(path)
+            return real(path, data, **kw)
+
+        monkeypatch.setattr(_utils, "atomic_json_write", _spy)
+        dg.save_tracked([{"path": "/tmp/x", "timestamp": "t", "category": "temp", "size": 1}])
+        assert seen["kw"].get("fsync_dir") is True
+        tf = _isolate_env / "disk-cleanup" / "tracked.json"
+        assert json.loads(tf.read_text(encoding="utf-8"))[0]["path"] == "/tmp/x"
+
+    def test_backup_preserves_last_good_for_restore(self, _isolate_env):
+        dg = _load_lib()
+        first = [{"path": "/tmp/a", "timestamp": "t", "category": "temp", "size": 1}]
+        second = [{"path": "/tmp/b", "timestamp": "t", "category": "temp", "size": 2}]
+        dg.save_tracked(first)
+        dg.save_tracked(second)
+        tf = _isolate_env / "disk-cleanup" / "tracked.json"
+        bak = _isolate_env / "disk-cleanup" / "tracked.json.bak"
+        assert json.loads(tf.read_text(encoding="utf-8")) == second
+        assert json.loads(bak.read_text(encoding="utf-8")) == first
+        # Corrupt live file -> load restores from .bak.
+        tf.write_text("{corrupt", encoding="utf-8")
+        assert dg.load_tracked() == first
+
+    def test_concurrent_writers_leave_valid_json_no_tmp_orphan(self, _isolate_env):
+        import threading
+
+        dg = _load_lib()
+        errors = []
+
+        def _writer(n):
+            try:
+                dg.save_tracked([{"path": f"/tmp/w{n}", "timestamp": "t",
+                                   "category": "temp", "size": n}])
+            except Exception as exc:  # noqa: BLE001 -- collecting thread failures
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_writer, args=(i,)) for i in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors
+        state_dir = _isolate_env / "disk-cleanup"
+        orphans = [p for p in state_dir.iterdir() if p.suffix == ".tmp" or p.name.endswith(".tmp")]
+        assert orphans == []
+        tf = state_dir / "tracked.json"
+        data = json.loads(tf.read_text(encoding="utf-8"))
+        assert isinstance(data, list) and len(data) == 1
+
+    def test_injected_fsync_failure_preserves_state_no_tmp(self, _isolate_env, monkeypatch):
+        dg = _load_lib()
+        original = [{"path": "/tmp/keep", "timestamp": "t", "category": "temp", "size": 1}]
+        dg.save_tracked(original)
+        tf = _isolate_env / "disk-cleanup" / "tracked.json"
+
+        import os as _os
+
+        real_fsync = _os.fsync
+
+        def _flaky(fd):
+            raise OSError("injected fsync failure")
+
+        monkeypatch.setattr(_os, "fsync", _flaky)
+        with pytest.raises(OSError):
+            dg.save_tracked([{"path": "/tmp/new", "timestamp": "t", "category": "temp", "size": 2}])
+        monkeypatch.setattr(_os, "fsync", real_fsync)
+        # Original preserved, no temp orphan.
+        assert json.loads(tf.read_text(encoding="utf-8")) == original
+        state_dir = _isolate_env / "disk-cleanup"
+        assert [p for p in state_dir.iterdir() if ".tmp" in p.name] == []
+
+    def test_injected_replace_failure_preserves_state_no_tmp(self, _isolate_env, monkeypatch):
+        dg = _load_lib()
+        original = [{"path": "/tmp/keep", "timestamp": "t", "category": "temp", "size": 1}]
+        dg.save_tracked(original)
+        tf = _isolate_env / "disk-cleanup" / "tracked.json"
+
+        import utils as _utils
+
+        def _boom(*a, **k):
+            raise OSError("injected replace failure")
+
+        monkeypatch.setattr(_utils, "atomic_replace", _boom)
+        with pytest.raises(OSError):
+            dg.save_tracked([{"path": "/tmp/new", "timestamp": "t", "category": "temp", "size": 2}])
+        assert json.loads(tf.read_text(encoding="utf-8")) == original
+        state_dir = _isolate_env / "disk-cleanup"
+        assert [p for p in state_dir.iterdir() if ".tmp" in p.name] == []
