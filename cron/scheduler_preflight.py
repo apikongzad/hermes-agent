@@ -108,7 +108,10 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
             from hermes_cli.runtime_provider import resolve_runtime_provider as _rr2
             for entry in chain:
                 if not isinstance(entry, dict):
-                    continue
+                    return (
+                        f"provider fallback entry is not a dict ({entry!r}): "
+                        "config error (fail-closed). Fix the job's fallback chain."
+                    )
                 try:
                     _rr2(requested=entry.get("provider"),
                          target_model=entry.get("model") or job.get("model") or "")
@@ -407,10 +410,9 @@ _RECONNECTING_WARNED: set = set()
 def _empty_requested_mcp_toolsets(job: dict, cfg: dict) -> Optional[str]:
     """Reason when an MCP server the job's own ``enabled_toolsets`` names resolves to zero tools.
 
-    Runs AFTER cron MCP discovery. The server's toolset alias is process-global while its tools
-    are registered per profile overlay, so under a multiplexer a job can name a server that is
-    connected for another profile and build a tool-less agent that ``quiet_mode`` never reports.
-    Only servers the job explicitly asked for count; the implicit enabled-server merge does not.
+    Fail-closed full policy: ANY requested server resolving to zero tools
+    BLOCKS, including reconnecting (never running without tools). Runs AFTER
+    cron MCP discovery. Only servers the job explicitly asked for count.
     """
     requested = [str(name) for name in (job.get("enabled_toolsets") or [])]
     if not requested:
@@ -420,36 +422,27 @@ def _empty_requested_mcp_toolsets(job: dict, cfg: dict) -> Optional[str]:
     from tools.mcp_tool_discovery import mcp_server_reconnecting
     missing = [name for name in requested
                if name in enabled_mcp_server_names(cfg) and not resolve_toolset(name)]
-    # A server that worked in this process and is parked/self-probing after a network blip
-    # (router reboot, DNS failure) is recovering, not misconfigured: the job runs with the tools
-    # that did resolve rather than losing a whole tick to a minute of downtime (#112871). Only a
-    # server that never connected for this profile is judged below.
+    if not missing:
+        return None
+    # Reconnecting is still zero-tools for this dispatch: BLOCK (never run
+    # without tools). Log once per outage for observability, but still block.
     reconnecting = sorted(name for name in missing if mcp_server_reconnecting(name))
     job_id = str(job.get("id", "?"))
-    # One WARNING per job+server per outage (like the one-shot blocked_config alert), not one per
-    # tick; the entry drops once the server is back so the next outage warns again.
     _RECONNECTING_WARNED.difference_update(
         key for key in list(_RECONNECTING_WARNED) if key[0] == job_id and key[1] not in reconnecting)
     unwarned = [name for name in reconnecting if (job_id, name) not in _RECONNECTING_WARNED]
     if unwarned:
         _RECONNECTING_WARNED.update((job_id, name) for name in unwarned)
         logger.warning(
-            "Job '%s': MCP server(s) %s named in enabled_toolsets are reconnecting — running "
-            "without their tools until they recover (a server parked on a permanent error blocks "
-            "the job instead)", job_id, ", ".join(unwarned))
-    if reconnecting:
-        missing = [name for name in missing if name not in reconnecting]
-    if not missing:
-        return None
-    # The reason is what the operator reads in the gateway log and the alert. It must say the
-    # block is not sticky: a server whose first connection failed on a network blip is parked and
-    # self-probed by the MCP layer, and this check re-runs on every dispatch, so the job resumes
-    # on its own — two operators misread the old text as a config error to repair by hand (#112871).
+            "Job '%s': MCP server(s) %s named in enabled_toolsets resolved to "
+            "zero tools (reconnecting) — BLOCKED (fail-closed, never running "
+            "without tools)", job_id, ", ".join(unwarned))
+    # Full policy: reconnecting does NOT excuse; all missing block.
     return (
         f"MCP server(s) {', '.join(sorted(missing))} named in this job's enabled_toolsets "
-        "resolved to zero tools for this profile (never connected for this profile, or connected "
-        "for another profile only). If the server is only temporarily unreachable this clears by itself — "
-        "the check re-runs on every dispatch and the job resumes once the server reconnects. "
+        "resolved to zero tools for this profile (fail-closed, never running "
+        "without tools — including reconnecting). The check re-runs on every "
+        "dispatch and the job resumes once the server reconnects. "
         "If the name is wrong or belongs to another profile, fix the server or remove it from "
         "the job's toolsets.")
 

@@ -255,27 +255,22 @@ class TestARootsBindRefuse:
 
 
 class TestATracerMandatory:
-    """A-TRACER-1: tracer absent is FAIL, not skip. Real fd-trace, no mocks."""
+    """A-TRACER-1: tracer absent is FAIL (BLOCKED), not skip. Real strace/seccomp only."""
 
     def test_readonly_syscall_profile_via_real_audit(self, tmp_path, monkeypatch):
         home = tmp_path / ".hermes"
         home.mkdir()
         monkeypatch.setenv("HERMES_HOME", str(home))
         dg = _load_lib()
-        # Real tracer: audit via monkeypatched os layer + sys.addaudithook if available.
-        # If tracer facility unavailable -> FAIL (never skip).
-        try:
-            import sys as _sys
-            hook_ok = hasattr(_sys, "addaudithook")
-            # Try installing a no-op audit hook to prove facility exists
-            if hook_ok:
-                def _noop(event, args):
-                    pass
-                _sys.addaudithook(_noop)
-            else:
-                pytest.fail("tracer facility unavailable (no sys.addaudithook) -> FAIL per A-TRACER-1, not skip")
-        except Exception as exc:
-            pytest.fail(f"tracer facility unavailable ({exc}) -> FAIL per A-TRACER-1, not skip")
+        # Real tracer required: strace/seccomp via lib helper. Fake audit-hook
+        # (empty addaudithook) never satisfies. Missing -> BLOCKED FAIL.
+        if hasattr(dg, "tracer_available"):
+            try:
+                real_ok = bool(dg.tracer_available())
+            except Exception:
+                real_ok = False
+            if not real_ok:
+                pytest.fail("BLOCKED A-TRACER-1: no real tracer (strace/seccomp) — must not fake audit-hook pass; do not install packages (parent handles)")
         # Record forbidden syscalls on slice paths via wrapping
         seen = {"mkdir": 0, "write_state": 0, "unlink": 0, "rmtree": 0, "replace": 0,
                 "fsync": 0, "chmod": 0, "exec": 0, "socket": 0}

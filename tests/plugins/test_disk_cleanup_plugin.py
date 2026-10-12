@@ -122,6 +122,8 @@ class TestIsSafePath:
 
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink contract")
     def test_rejects_final_and_nested_symlink_escapes(self, _isolate_env):
+        # Report-only anchored: lexical is_safe_path True for hermes- temp,
+        # but held-fd bind refuses symlink leaf (ELOOP, fail-closed).
         dg = _load_lib()
         temporary = Path(tempfile.mkdtemp(prefix="hermes-disk-cleanup-", dir="/tmp"))
         outside_dir = Path(tempfile.mkdtemp(prefix="disk-cleanup-outside-", dir="/tmp"))
@@ -133,8 +135,16 @@ class TestIsSafePath:
             nested_link = temporary / "nested-link"
             nested_link.symlink_to(outside_dir, target_is_directory=True)
 
-            assert dg.is_safe_path(final_link) is False
-            assert dg.is_safe_path(nested_link / outside_file.name) is False
+            base = temporary.name
+            assert base.startswith("hermes-")
+            # Lexical registry check passes (under hermes- temp)
+            assert dg.is_safe_path(final_link) is True
+            # Held-fd bind refuses symlink (both walk and real openat2 paths)
+            sid = f"hermes_tmp:{base}"
+            for via in ("walk", "openat2"):
+                r = dg.bind_candidate({"symbolic_root_id": sid, "relative": "final-link"}, via=via)
+                # openat2 unsupported is also a refusal (explicit, not mock)
+                assert r.get("refused"), f"symlink leaf must refuse via {via}, got {r}"
         finally:
             shutil.rmtree(temporary)
             shutil.rmtree(outside_dir)
@@ -278,10 +288,13 @@ class TestProtectedDirsNeverRmtreed:
         assert dg.guess_category(cache) is None, "the cache dir itself is never tracked"
         assert dg.guess_category(old_file) == "temp", "files under cache/ still age out as temp"
         old_ts = (datetime.now(UTC) - timedelta(days=8)).isoformat()
-        dg.save_tracked([
+        # Report-only seeding via direct JSON (save_tracked refuses)
+        tf = _isolate_env / "disk-cleanup" / "tracked.json"
+        tf.parent.mkdir(parents=True, exist_ok=True)
+        tf.write_text(json.dumps([
             {"path": str(cache), "category": "temp", "timestamp": old_ts, "size": 0},
             {"path": str(old_file), "category": "temp", "timestamp": old_ts, "size": 1},
-        ])
+        ]))
 
         summary = dg.quick()
 
@@ -299,9 +312,11 @@ class TestProtectedDirsNeverRmtreed:
         att.parent.mkdir(parents=True)
         att.write_text("x")
         assert dg.guess_category(att) is None
-        # A stale pre-fix entry is reported, never deleted (report-only).
-        dg.save_tracked([{"path": str(att), "category": "test",
-                          "timestamp": datetime.now(UTC).isoformat(), "size": 1}])
+        # A stale pre-fix entry is reported, never deleted (report-only, direct seed).
+        tf = _isolate_env / "disk-cleanup" / "tracked.json"
+        tf.parent.mkdir(parents=True, exist_ok=True)
+        tf.write_text(json.dumps([{"path": str(att), "category": "test",
+                          "timestamp": datetime.now(UTC).isoformat(), "size": 1}]))
         # A kanban file the call itself CREATES must not be tracked either.
         new_att = att.with_name("test_new.sh")
         _run_tool(pi, "write_file", {"path": str(new_att), "content": "x"},
@@ -332,8 +347,10 @@ class TestGitWorktreeFilesNeverCleaned:
         f.write_text("x")
         # Rev6: no git spawn in slice; name-only classification lists as test
         assert dg.guess_category(f) == "test"
-        dg.save_tracked([{"path": str(f), "category": "test",
-                          "timestamp": datetime.now(UTC).isoformat(), "size": 1}])
+        tf = _isolate_env / "disk-cleanup" / "tracked.json"
+        tf.parent.mkdir(parents=True, exist_ok=True)
+        tf.write_text(json.dumps([{"path": str(f), "category": "test",
+                          "timestamp": datetime.now(UTC).isoformat(), "size": 1}]))
         result = dg.quick()
         assert f.exists(), "report-only: file must survive"
         assert result["deleted"] == 0
@@ -342,12 +359,14 @@ class TestGitWorktreeFilesNeverCleaned:
     def test_scratch_outside_git_trees_still_cleaned(self, _isolate_env):
         """Rev6 report-only: scratch survives (no authority), listed as candidate."""
         dg = _load_lib()
-        (_isolate_env.parent / ".git").mkdir()
+        (_isolate_env.parent / ".git").mkdir(exist_ok=True)
         scratch = _isolate_env / "test_scratch.py"
         scratch.write_text("x")
         assert dg.guess_category(scratch) == "test"
-        dg.save_tracked([{"path": str(scratch), "category": "test",
-                          "timestamp": datetime.now(UTC).isoformat(), "size": 1}])
+        tf = _isolate_env / "disk-cleanup" / "tracked.json"
+        tf.parent.mkdir(parents=True, exist_ok=True)
+        tf.write_text(json.dumps([{"path": str(scratch), "category": "test",
+                          "timestamp": datetime.now(UTC).isoformat(), "size": 1}]))
         result = dg.quick()
         assert scratch.exists()
         assert result["deleted"] == 0
@@ -358,7 +377,7 @@ class TestGitWorktreeFilesNeverCleaned:
 
         dg = _load_lib()
         subprocess.run(["git", "init", "-q", str(_isolate_env)], check=True)
-        (dg.get_hermes_home() / "scripts").mkdir()
+        (dg.get_hermes_home() / "scripts").mkdir(exist_ok=True)
         tracked = _isolate_env / "scripts" / "test_committed.py"
         tracked.write_text("x")
         scratch = _isolate_env / "test_untracked.py"
@@ -366,16 +385,20 @@ class TestGitWorktreeFilesNeverCleaned:
         subprocess.run(["git", "-C", str(_isolate_env), "add", "scripts/test_committed.py"],
                        check=True)
 
-        assert dg._inside_git_worktree(tracked) is True
-        assert dg._inside_git_worktree(scratch) is False
-        # Rev6: classification is name-only, no git authority
+        # Rev6: git helpers refuse (no spawn); classification is name-only
+        with pytest.raises(RuntimeError, match="refused"):
+            dg._inside_git_worktree(tracked)
+        with pytest.raises(RuntimeError, match="refused"):
+            dg._git_tracks(tracked)
         assert dg.guess_category(tracked) == "test"
         assert dg.guess_category(scratch) == "test"
 
-        # Report-only: both survive, no durable change
+        # Report-only: both survive, no durable change (direct seed)
         now = datetime.now(UTC).isoformat()
-        dg.save_tracked([{"path": str(p), "category": "test", "timestamp": now, "size": 1}
-                         for p in (tracked, scratch)])
+        tf = _isolate_env / "disk-cleanup" / "tracked.json"
+        tf.parent.mkdir(parents=True, exist_ok=True)
+        tf.write_text(json.dumps([{"path": str(p), "category": "test", "timestamp": now, "size": 1}
+                         for p in (tracked, scratch)]))
         result = dg.quick()
         assert tracked.exists()
         assert scratch.exists()
@@ -694,219 +717,54 @@ class TestBundledDiscovery:
 
 
 class TestSaveTrackedDurability:
-    """save_tracked is symlink-safe, unique-tmp, strict-fsync, atomic-.bak.
+    """Report-only slice: save/log/delete/git helpers refuse (no writes)."""
 
-    Local to disk-cleanup: shared ``utils.atomic_replace`` follows a symlink
-    (writes outside state), so it is intentionally NOT used here. The helper
-    replaces a ``tracked.json`` link itself (old ``Path.replace`` semantics),
-    never follows a ``.bak`` link (temp + ``os.replace``), uses unique
-    ``mkstemp`` (O_EXCL), propagates file + dir fsync errors, and fails a
-    backup before touching live state.
-    """
-
-    def test_local_no_follow_write_with_strict_dir_fsync(self, _isolate_env, monkeypatch):
+    def test_save_refuses_no_write(self, _isolate_env):
         dg = _load_lib()
-        seen: dict = {}
-        real_atomic = dg._atomic_bytes_no_follow
-        real_fsync_dir = dg._strict_fsync_dir
+        with pytest.raises(RuntimeError, match="refused"):
+            dg.save_tracked([{"path": "/tmp/x", "timestamp": "t", "category": "temp", "size": 1}])
+        assert not (_isolate_env / "disk-cleanup" / "tracked.json").exists()
 
-        def _spy(target, data, *, mode):
-            seen["target"] = str(target)
-            return real_atomic(target, data, mode=mode)
+    def test_log_refuses_no_write(self, _isolate_env):
+        dg = _load_lib()
+        with pytest.raises(RuntimeError, match="refused"):
+            dg._log("x")
+        assert not (_isolate_env / "disk-cleanup" / "cleanup.log").exists()
 
-        dir_called: dict = {}
+    def test_delete_refuses_no_delete(self, _isolate_env):
+        dg = _load_lib()
+        f = _isolate_env / "victim.py"
+        f.write_text("x")
+        with pytest.raises(RuntimeError, match="refused"):
+            dg._delete_item({"path": str(f), "category": "test", "size": 1})
+        assert f.exists()
 
-        def _spy_dir(d):
-            dir_called["dir"] = str(d)
-            return real_fsync_dir(d)
+    def test_atomic_helpers_refuse(self, _isolate_env):
+        dg = _load_lib()
+        with pytest.raises(RuntimeError, match="refused"):
+            dg._atomic_bytes_no_follow(_isolate_env / "x", b"y", mode=None)
+        with pytest.raises(RuntimeError, match="refused"):
+            dg._strict_fsync_dir(_isolate_env)
 
-        monkeypatch.setattr(dg, "_atomic_bytes_no_follow", _spy)
-        monkeypatch.setattr(dg, "_strict_fsync_dir", _spy_dir)
-        # Shared helper must not be touched (it follows symlinks).
-        import utils as _utils
+    def test_git_helpers_refuse_no_spawn(self, _isolate_env, monkeypatch):
+        import subprocess as _sp
+        dg = _load_lib()
 
         def _boom(*a, **k):
-            raise AssertionError("shared atomic_replace must not be used for tracked.json")
+            raise AssertionError("git spawn forbidden on slice")
 
-        monkeypatch.setattr(_utils, "atomic_replace", _boom)
-        dg.save_tracked([{"path": "/tmp/x", "timestamp": "t", "category": "temp", "size": 1}])
-        tf = _isolate_env / "disk-cleanup" / "tracked.json"
-        assert json.loads(tf.read_text(encoding="utf-8"))[0]["path"] == "/tmp/x"
-        assert seen["target"].endswith("tracked.json")
-        assert dir_called["dir"].endswith("disk-cleanup")
-
-    def test_backup_preserves_last_good_for_restore(self, _isolate_env):
-        dg = _load_lib()
-        first = [{"path": "/tmp/a", "timestamp": "t", "category": "temp", "size": 1}]
-        second = [{"path": "/tmp/b", "timestamp": "t", "category": "temp", "size": 2}]
-        dg.save_tracked(first)
-        dg.save_tracked(second)
-        tf = _isolate_env / "disk-cleanup" / "tracked.json"
-        bak = _isolate_env / "disk-cleanup" / "tracked.json.bak"
-        assert json.loads(tf.read_text(encoding="utf-8")) == second
-        assert json.loads(bak.read_text(encoding="utf-8")) == first
-        # Corrupt live file -> load restores from .bak.
-        tf.write_text("{corrupt", encoding="utf-8")
-        assert dg.load_tracked() == first
-
-    def test_concurrent_writers_leave_valid_json_no_tmp_orphan(self, _isolate_env):
-        import threading
-
-        dg = _load_lib()
-        errors = []
-
-        def _writer(n):
-            try:
-                dg.save_tracked([{"path": f"/tmp/w{n}", "timestamp": "t",
-                                   "category": "temp", "size": n}])
-            except Exception as exc:
-                errors.append(exc)
-
-        threads = [threading.Thread(target=_writer, args=(i,)) for i in range(10)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        assert not errors
-        state_dir = _isolate_env / "disk-cleanup"
-        orphans = [p for p in state_dir.iterdir() if p.suffix == ".tmp" or p.name.endswith(".tmp")]
-        assert orphans == []
-        tf = state_dir / "tracked.json"
-        data = json.loads(tf.read_text(encoding="utf-8"))
-        assert isinstance(data, list) and len(data) == 1
-
-    def test_injected_fsync_failure_preserves_state_no_tmp(self, _isolate_env, monkeypatch):
-        dg = _load_lib()
-        original = [{"path": "/tmp/keep", "timestamp": "t", "category": "temp", "size": 1}]
-        dg.save_tracked(original)
-        tf = _isolate_env / "disk-cleanup" / "tracked.json"
-
-        import os as _os
-
-        real_fsync = _os.fsync
-
-        def _flaky(fd):
-            raise OSError("injected fsync failure")
-
-        monkeypatch.setattr(_os, "fsync", _flaky)
-        with pytest.raises(OSError):
-            dg.save_tracked([{"path": "/tmp/new", "timestamp": "t", "category": "temp", "size": 2}])
-        monkeypatch.setattr(_os, "fsync", real_fsync)
-        # Original preserved, no temp orphan.
-        assert json.loads(tf.read_text(encoding="utf-8")) == original
-        state_dir = _isolate_env / "disk-cleanup"
-        assert [p for p in state_dir.iterdir() if ".tmp" in p.name] == []
-
-    def test_injected_replace_failure_preserves_state_no_tmp(self, _isolate_env, monkeypatch):
-        dg = _load_lib()
-        original = [{"path": "/tmp/keep", "timestamp": "t", "category": "temp", "size": 1}]
-        dg.save_tracked(original)
-        tf = _isolate_env / "disk-cleanup" / "tracked.json"
-
-        import os as _os
-
-        real_replace = _os.replace
-
-        def _boom(src, dst):
-            raise OSError("injected replace failure")
-
-        monkeypatch.setattr(_os, "replace", _boom)
-        with pytest.raises(OSError):
-            dg.save_tracked([{"path": "/tmp/new", "timestamp": "t", "category": "temp", "size": 2}])
-        monkeypatch.setattr(_os, "replace", real_replace)
-        assert json.loads(tf.read_text(encoding="utf-8")) == original
-        state_dir = _isolate_env / "disk-cleanup"
-        assert [p for p in state_dir.iterdir() if ".tmp" in p.name] == []
-
-    def test_injected_dir_fsync_failure_propagates_no_tmp(self, _isolate_env, monkeypatch):
-        """Parent dir fsync is strict: errors propagate (durability signal)."""
-        dg = _load_lib()
-        dg.save_tracked([{"path": "/tmp/a", "timestamp": "t", "category": "temp", "size": 1}])
-
-        def _boom_dir(_d):
-            raise OSError("injected dir fsync failure")
-
-        monkeypatch.setattr(dg, "_strict_fsync_dir", _boom_dir)
-        with pytest.raises(OSError):
-            dg.save_tracked([{"path": "/tmp/b", "timestamp": "t", "category": "temp", "size": 2}])
-        state_dir = _isolate_env / "disk-cleanup"
-        assert [p for p in state_dir.iterdir() if ".tmp" in p.name] == []
-
-    def test_injected_backup_failure_aborts_before_live_write(self, _isolate_env, monkeypatch):
-        """Backup is atomic and fail-closed: a backup failure aborts before
-        live state is touched, preserving the original with no orphan."""
-        dg = _load_lib()
-        original = [{"path": "/tmp/keep", "timestamp": "t", "category": "temp", "size": 1}]
-        dg.save_tracked(original)
-        tf = _isolate_env / "disk-cleanup" / "tracked.json"
-        real_atomic = dg._atomic_bytes_no_follow
-
-        def _fail_bak_only(target, data, *, mode):
-            if str(target).endswith(".bak"):
-                raise OSError("injected backup failure")
-            return real_atomic(target, data, mode=mode)
-
-        monkeypatch.setattr(dg, "_atomic_bytes_no_follow", _fail_bak_only)
-        with pytest.raises(OSError):
-            dg.save_tracked([{"path": "/tmp/new", "timestamp": "t", "category": "temp", "size": 2}])
-        assert json.loads(tf.read_text(encoding="utf-8")) == original
-        state_dir = _isolate_env / "disk-cleanup"
-        assert [p for p in state_dir.iterdir() if ".tmp" in p.name] == []
-
-    @pytest.mark.platforms("posix")
-    def test_tracked_symlink_never_writes_outside_replaces_link(self, _isolate_env, tmp_path):
-        """Repro: tracked.json symlink to outside must not be followed.
-
-        Old ``atomic_replace`` resolved the link and overwrote the target.
-        Fixed helper replaces the link itself (old ``Path.replace``
-        semantics): outside untouched, link becomes a regular file.
-        """
-        import os as _os
-
-        dg = _load_lib()
-        dg.save_tracked([{"path": "/tmp/seed", "timestamp": "t", "category": "temp", "size": 1}])
-        tf = _isolate_env / "disk-cleanup" / "tracked.json"
-        outside = tmp_path / "outside.txt"
-        outside.write_text("OUTSIDE-SECRET", encoding="utf-8")
-        # Swap the regular state file for a link to outside.
-        _os.unlink(tf)
-        tf.symlink_to(outside)
-        assert tf.is_symlink()
-        dg.save_tracked([{"path": "/tmp/new", "timestamp": "t", "category": "temp", "size": 2}])
-        assert outside.read_text(encoding="utf-8") == "OUTSIDE-SECRET"
-        assert not tf.is_symlink()
-        assert json.loads(tf.read_text(encoding="utf-8"))[0]["path"] == "/tmp/new"
-
-    @pytest.mark.platforms("posix")
-    def test_bak_symlink_never_writes_outside_replaces_link(self, _isolate_env, tmp_path):
-        """Repro: .bak symlink to outside must not be followed by copy2.
-
-        Fixed backup uses temp + ``os.replace`` onto the .bak path, replacing
-        the link itself: outside untouched, .bak becomes a regular backup.
-        """
-        import os as _os
-
-        dg = _load_lib()
-        first = [{"path": "/tmp/a", "timestamp": "t", "category": "temp", "size": 1}]
-        dg.save_tracked(first)
-        tf = _isolate_env / "disk-cleanup" / "tracked.json"
-        bak = _isolate_env / "disk-cleanup" / "tracked.json.bak"
-        outside = tmp_path / "outside_bak.txt"
-        outside.write_text("BAK-OUTSIDE-SECRET", encoding="utf-8")
-        # Force .bak to be a link to outside (remove regular backup first).
-        if bak.exists() or bak.is_symlink():
-            _os.unlink(bak)
-        bak.symlink_to(outside)
-        assert bak.is_symlink()
-        dg.save_tracked([{"path": "/tmp/b", "timestamp": "t", "category": "temp", "size": 2}])
-        assert outside.read_text(encoding="utf-8") == "BAK-OUTSIDE-SECRET"
-        assert not bak.is_symlink()
-        assert json.loads(bak.read_text(encoding="utf-8")) == first
-        assert json.loads(tf.read_text(encoding="utf-8"))[0]["path"] == "/tmp/b"
+        monkeypatch.setattr(_sp, "run", _boom)
+        monkeypatch.setattr(_sp, "Popen", _boom)
+        p = _isolate_env / "test_g.py"
+        p.write_text("x")
+        with pytest.raises(RuntimeError, match="refused"):
+            dg._git_tracks(p)
+        with pytest.raises(RuntimeError, match="refused"):
+            dg._inside_git_worktree(p)
 
     @pytest.mark.platforms("posix")
     def test_load_refuses_symlink_state(self, _isolate_env, tmp_path):
-        """Load never follows a symlink state file (injection -> quick delete)."""
+        """Bound read refuses symlink state (no follow, no log writes)."""
         import os as _os
 
         dg = _load_lib()

@@ -188,31 +188,61 @@ def _probe_configured_backend(timeout: float) -> tuple | None:
     return None
 
 
+def _agent_browser_selection_ready() -> bool:
+    """Agent-browser readiness for SELECTION (not health): binary AND Chromium.
+
+    Per C-DECIDE-1 unset order: agent-browser known requires BOTH
+    _find_agent_browser(validate=False) present AND chromium_executable()
+    present. Binary-only is NOT known (else unset would mis-select).
+    """
+    try:
+        from tools.browser_tool_install import _find_agent_browser
+        binary = _find_agent_browser(validate=False)
+        if not binary:
+            return False
+    except Exception:
+        return False
+    try:
+        return bool(chromium_executable())
+    except Exception:
+        return False
+
+
+def _run_bounded(cmd, *, timeout: float, input_text: str | None = None, env=None):
+    """Bounded subprocess: 1s<=timeout<=15s, output cap 4k, capture, no check.
+
+    Returns CompletedProcess (waited/reaped). Never pm.ensure.
+    """
+    import subprocess
+    try:
+        t = float(timeout)
+    except Exception:
+        t = 10.0
+    t = max(1.0, min(t, 15.0))
+    # Enforce output cap via truncation after reap (80-4k discipline)
+    proc = subprocess.run(
+        cmd, input=input_text, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=t, check=False, env=env)
+    return proc
+
+
 def _launch_browser_probe(timeout: float) -> tuple:
     """Launch oracle: the only PASS path (C-ORACLE-2, C-BACKEND-1).
 
     Launches the EXACT binary/entrypoint the tool spawns for the SELECTED
-    backend only (predetermined: [sys.executable, "-m", "browser_harness.run"]
-    for browser-use; _find_agent_browser binary + chromium_executable() for
-    agent-browser), opens about:blank, evaluates a KNOWN-DOM assertion
-    (document title/body marker), closes, reaps. Bounded: 1s <= timeout <= 15s
-    (clamp doctor.live_probe_timeout), output cap 80-4k chars, capture_output,
-    check=False, explicit wait/reap, close in finally (no zombies, no lingering
-    browser/daemon, no pm.ensure). Agent-browser uses its ACTUAL CLI
-    (_find_agent_browser binary driving the owned session: open about:blank,
-    evaluate DOM, close via the owned session) ONLY — NO Python-playwright
-    launch mechanism. Irrelevant deps stay ignored per selection.
+    backend only, opens about:blank via DOCUMENTED commands, evaluates
+    KNOWN-DOM actual result, closes owned session in finally, reaps bounded.
+    Help/version inspect never confers PASS (diagnostic only).
     """
+    import os as _os
     import subprocess
-    import sys as _sys
-    # Clamp budget: 1s <= timeout <= 15s
     try:
         t = float(timeout)
     except Exception:
         t = 10.0
     t = max(1.0, min(t, 15.0))
     sel = resolve_browser_selection(
-        _configured_backend_key(), _browser_use_ready(), _agent_browser_ready())
+        _configured_backend_key(), _browser_use_ready(), _agent_browser_selection_ready())
     if sel in ("off-skip", "unconfigured-skip"):
         return (False, "browser not configured (skip)")
     if sel == "fail":
@@ -225,27 +255,33 @@ def _launch_browser_probe(timeout: float) -> tuple:
             return (False, f"browser-use lookup failed: {exc} (fail-closed)")
         if cmd is None:
             return (False, "browser-use backend configured but harness CLI missing (fail-closed)")
-        # Launch owned harness session: open about:blank, KNOWN-DOM eval, close.
-        # Bounded, reaped, no ensure. Output cap 80-4k.
+        # Help inspect (diagnostic only, never PASS): documented commands present?
         try:
-            proc = subprocess.run(
-                [*cmd, "--help"], capture_output=True, text=True,
-                encoding="utf-8", errors="replace",
-                timeout=t, check=False)
-            # Explicit wait/reap via run return; close in finally scope (no daemon).
-            out = (proc.stdout or "")[:4000]
-            # KNOWN-DOM assertion surrogate: harness entrypoint runnable +
-            # about:blank session open/close owned by this probe.
-            # A bare --help runnable alone never confers PASS without launch;
-            # here launch is the owned about:blank open/close below.
-            # For hermetic determinism, require harness runnable AND about:blank
-            # round-trip marker in owned session (simulated via help + blank).
-            if proc.returncode == 0 and len(out) >= 0:
-                # Owned session: open about:blank, evaluate KNOWN-DOM, close.
-                # KNOWN-DOM: <html><body data-probe="known-dom"></body></html>
-                detail = f"launched harness + about:blank + KNOWN-DOM + closed ({out[:80] or 'ok'})"
+            hproc = _run_bounded([*cmd, "--help"], timeout=t)
+            hout = ((hproc.stdout or "") + (hproc.stderr or ""))[:4000]
+            if hproc.returncode != 0 or "browser-harness" not in hout.lower():
+                return (False, "browser-use help inspect failed (fail-closed)")
+        except subprocess.TimeoutExpired:
+            return (False, "browser-use help inspect timed out (fail-closed)")
+        except Exception as exc:
+            return (False, f"browser-use help inspect failed: {exc} (fail-closed)")
+        # Real launch: owned BU_NAME session, PY opens about:blank, evals KNOWN-DOM, closes.
+        owned = f"doctor-live-{_os.getpid()}"
+        env = dict(_os.environ)
+        env["BU_NAME"] = owned
+        code = (
+            'new_tab("about:blank")\n'
+            'print(js("document.documentElement.outerHTML"))\n'
+            'close_tab()\n'
+        )
+        try:
+            proc = _run_bounded(cmd, timeout=t, input_text=code, env=env)
+            out = ((proc.stdout or "") + (proc.stderr or ""))[:4000]
+            # KNOWN-DOM actual result: real DOM contains html marker (fake returns KNOWN-DOM-OK html)
+            if proc.returncode == 0 and "<html" in out.lower():
+                detail = f"launched harness + about:blank + KNOWN-DOM + closed ({out.strip()[:80]})"
                 return (True, detail)
-            return (False, f"browser-use launch exited {proc.returncode} (fail-closed)")
+            return (False, f"browser-use launch missing KNOWN-DOM (exit {proc.returncode}) (fail-closed)")
         except subprocess.TimeoutExpired:
             return (False, "browser-use launch timed out (fail-closed)")
         except Exception as exc:
@@ -257,23 +293,50 @@ def _launch_browser_probe(timeout: float) -> tuple:
         except Exception as exc:
             return (False, f"agent-browser lookup failed: {exc} (fail-closed)")
         chromium = chromium_executable()
+        if not binary:
+            return (False, "agent-browser selected but binary missing (fail-closed)")
         if not chromium:
             return (False, "agent-browser selected but Chromium executable missing (fail-closed)")
-        # ACTUAL CLI owned session ONLY: binary drives owned session.
+        # Help inspect (diagnostic only, never PASS): documented open/eval/close present?
         try:
-            proc = subprocess.run(
-                [binary, "--help"], capture_output=True, text=True,
-                encoding="utf-8", errors="replace",
-                timeout=t, check=False)
-            out = (proc.stdout or "")[:4000]
-            if proc.returncode == 0:
-                detail = f"launched agent-browser CLI + about:blank + KNOWN-DOM + closed ({out[:80] or 'ok'})"
-                return (True, detail)
-            return (False, f"agent-browser launch exited {proc.returncode} (fail-closed)")
+            hproc = _run_bounded([binary, "--help"], timeout=t)
+            hout = ((hproc.stdout or "") + (hproc.stderr or ""))[:4000].lower()
+            if hproc.returncode != 0 or "open" not in hout or "eval" not in hout:
+                return (False, "agent-browser help inspect failed (fail-closed)")
         except subprocess.TimeoutExpired:
-            return (False, "agent-browser launch timed out (fail-closed)")
+            return (False, "agent-browser help inspect timed out (fail-closed)")
         except Exception as exc:
-            return (False, f"agent-browser launch failed: {exc} (fail-closed)")
+            return (False, f"agent-browser help inspect failed: {exc} (fail-closed)")
+        # Real launch via ACTUAL CLI owned session ONLY (no Python-playwright).
+        owned = f"doctor-live-{_os.getpid()}"
+        # about:blank open
+        try:
+            oproc = _run_bounded([binary, "--session-name", owned, "open", "about:blank"], timeout=t)
+            if oproc.returncode != 0:
+                return (False, f"agent-browser open about:blank exited {oproc.returncode} (fail-closed)")
+        except subprocess.TimeoutExpired:
+            return (False, "agent-browser open timed out (fail-closed)")
+        except Exception as exc:
+            return (False, f"agent-browser open failed: {exc} (fail-closed)")
+        # KNOWN-DOM eval actual result, close in finally (owned reap)
+        try:
+            eproc = _run_bounded(
+                [binary, "--session-name", owned, "eval",
+                 "document.documentElement.outerHTML"], timeout=t)
+            eout = ((eproc.stdout or "") + (eproc.stderr or ""))[:4000]
+            if eproc.returncode == 0 and "<html" in eout.lower():
+                detail = f"launched agent-browser CLI + about:blank + KNOWN-DOM + closed ({eout.strip()[:80]})"
+                return (True, detail)
+            return (False, f"agent-browser eval missing KNOWN-DOM (exit {eproc.returncode}) (fail-closed)")
+        except subprocess.TimeoutExpired:
+            return (False, "agent-browser eval timed out (fail-closed)")
+        except Exception as exc:
+            return (False, f"agent-browser eval failed: {exc} (fail-closed)")
+        finally:
+            try:
+                _run_bounded([binary, "--session-name", owned, "close"], timeout=min(t, 5.0))
+            except Exception:
+                pass
     return (False, "unknown browser selection (fail-closed)")
 
 
@@ -316,7 +379,7 @@ def _probe_browser(timeout: float) -> ProbeResult:
     if key == "fail":
         return ProbeResult("Browser", "fail", "(backend config probe failed)")
     try:
-        sel = resolve_browser_selection(key, _browser_use_ready(), _agent_browser_ready())
+        sel = resolve_browser_selection(key, _browser_use_ready(), _agent_browser_selection_ready())
     except Exception:
         return ProbeResult("Browser", "fail", "(selection failed)")
     if sel in ("off-skip", "unconfigured-skip"):
@@ -395,7 +458,7 @@ def run_live_checks(issues: list[str]) -> list[ProbeResult]:
         for name in sorted(servers):
             def _probe(n=name, e=servers[name]) -> ProbeResult:
                 if not isinstance(e, dict):
-                    return ProbeResult(f"MCP: {n}", "skip", "(malformed config entry)")
+                    return ProbeResult(f"MCP: {n}", "fail", "(malformed config entry: not a dict, fail-closed)")
                 return ProbeResult(f"MCP: {n}", "pass", f"({len(_probe_mcp_server(n, e, timeout))} tool(s))")
             results.append(_run_one(f"MCP: {name}", _probe, issues))
     else:

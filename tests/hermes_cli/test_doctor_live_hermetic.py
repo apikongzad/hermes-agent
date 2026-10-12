@@ -84,20 +84,31 @@ class TestCOracleLaunchOnly:
                 "version subprocess must NEVER confer PASS alone (C-ORACLE-1)"
 
     def test_launch_oracle_bounded_owned_known_dom(self, tmp_path, monkeypatch):
-        # PASS requires ACTUAL launch: exact binary, about:blank, KNOWN-DOM eval, close/reap.
-        # Bounded 1s<=timeout<=15s, output cap, capture_output, check=False, wait/reap, close finally.
+        # PASS requires ACTUAL launch via fake harness binary (no live host changes):
+        # exact binary, about:blank PY, KNOWN-DOM eval (outerHTML), close/reap.
         import inspect
+        import sys
         src = inspect.getsource(doctor_live)
         assert "about:blank" in src, "launch oracle must open about:blank (C-ORACLE-2)"
         assert "15" in src, "timeout clamp 1..15s must be pinned (C-ORACLE-2)"
-        # No Python-playwright launch mechanism for agent-browser
         assert "sync_playwright" not in src or "NEVER" in src or "ACTUAL CLI" in src, \
             "agent-browser via ACTUAL CLI ONLY, no Python-playwright (C-ORACLE-2)"
-        # Irrelevant deps ignored: browser-use PASS with Chromium/playwright/agent-browser absent
+        # Fake harness implementing documented --help + stdin PY protocol
+        fake = tmp_path / "fake_harness.py"
+        fake.write_text(
+            "import sys\n"
+            "args=sys.argv[1:]\n"
+            "data=sys.stdin.read() if not sys.stdin.isatty() else ''\n"
+            "if '--help' in args:\n"
+            " print('browser-harness\\nCommands:')\n"
+            " sys.exit(0)\n"
+            "if 'about:blank' in data and ('outerHTML' in data or 'js(' in data):\n"
+            " print('<html><body>KNOWN-DOM-OK</body></html>')\n"
+            " sys.exit(0)\n"
+            "print('missing', file=sys.stderr); sys.exit(2)\n", encoding="utf-8")
         monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "browser-use")
-        # Harness runnable via launch oracle only
         monkeypatch.setattr("tools.browser_use_cli._find_cli",
-                            lambda: ["python", "-m", "browser_harness.run"])
+                            lambda: [sys.executable, str(fake)])
         # Chromium/playwright/agent-browser absent must be ignored for browser-use
         monkeypatch.setattr(doctor_live, "chromium_executable", lambda: None)
         import builtins as _bi
@@ -107,17 +118,18 @@ class TestCOracleLaunchOnly:
                 raise ImportError("No module named playwright")
             return real_import(name, *a, **k)
         monkeypatch.setattr(_bi, "__import__", _no_pw)
-        # Fake launch oracle to prove selection ignores irrelevant deps
-        monkeypatch.setattr(doctor_live, "_launch_browser_probe",
-                            lambda timeout: (True, "launched + about:blank + KNOWN-DOM + closed"))
+        # Real oracle (no mocked _launch_browser_probe) must PASS with only harness
         res = doctor_live._probe_browser(5.0)
-        assert res.status == "pass", "browser-use must PASS with only harness launch (irrelevant ignored)"
+        assert res.status == "pass", f"browser-use must PASS with only harness launch (irrelevant ignored), got {res.status} {res.detail}"
 
-    def test_explicit_selected_launch_fail_never_fallback(self, monkeypatch):
+    def test_explicit_selected_launch_fail_never_fallback(self, monkeypatch, tmp_path):
+        import sys
+        # Real failing harness (exits 1, no KNOWN-DOM) -> must be fail, never fallback
+        fake = tmp_path / "fail_harness.py"
+        fake.write_text("import sys; print('fail', file=sys.stderr); sys.exit(1)\n", encoding="utf-8")
         monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "browser-use")
-        monkeypatch.setattr(doctor_live, "_launch_browser_probe",
-                            lambda timeout: (False, "selected launch failed"))
-        # Must be fail, never fallback to other backend
+        monkeypatch.setattr("tools.browser_use_cli._find_cli",
+                            lambda: [sys.executable, str(fake)])
         res = doctor_live._probe_browser(5.0)
         assert res.status == "fail", "explicit-selected launch-fail must be fail, never fallback (C-BACKEND-1)"
 

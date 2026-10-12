@@ -8,13 +8,10 @@ Scope: strictly HERMES_HOME and /tmp/hermes-*; never ~/.hermes/logs/ or system d
 
 from __future__ import annotations
 
-import contextlib
-import errno as _errno_mod
 import functools
 import json
 import logging
 import os as _os_mod
-import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone, UTC
 from pathlib import Path
@@ -61,126 +58,194 @@ def _validate_relative(relative: str) -> list[str] | None:
     return parts
 
 
+def _require_nofollow_capability() -> None:
+    """Fail-closed when O_NOFOLLOW/O_DIRECTORY absent (no silent downgrade)."""
+    if not hasattr(_os_mod, "O_NOFOLLOW") or not hasattr(_os_mod, "O_DIRECTORY"):
+        raise OSError("refused: missing O_NOFOLLOW/O_DIRECTORY capability (fail-closed)")
+
+
 def _open_single(parent_fd: int, name: str, *, is_dir: bool) -> int:
-    flags = _os_mod.O_RDONLY | getattr(_os_mod, "O_NOFOLLOW", 0) | getattr(_os_mod, "O_CLOEXEC", 0)
+    _require_nofollow_capability()
+    if not _validate_basename(name):
+        raise OSError("refused-escape: invalid basename")
+    flags = _os_mod.O_RDONLY | _os_mod.O_NOFOLLOW | getattr(_os_mod, "O_CLOEXEC", 0)
     if is_dir:
-        flags |= getattr(_os_mod, "O_DIRECTORY", 0)
+        flags |= _os_mod.O_DIRECTORY
     return _os_mod.open(name, flags, dir_fd=parent_fd)
 
 
-def bootstrap_roots() -> dict[str, RootCapability]:
-    """Open / once to locate explicit roots into registry, then close bootstrap.
-
-    A-ROOTS-2: walk ONLY single validated basenames from / toward EACH explicit
-    allowed root, validate each step nofollow, retain held_dirfd, re-validate
-    fstat(held) == identity on later bind, close / fd after registration.
-    """
-    registry: dict[str, RootCapability] = {}
-    bfd = _os_mod.open("/", _os_mod.O_RDONLY | getattr(_os_mod, "O_DIRECTORY", 0)
-                        | getattr(_os_mod, "O_NOFOLLOW", 0) | getattr(_os_mod, "O_CLOEXEC", 0))
+def tracer_available() -> bool:
+    """Real tracer (strace runnable or seccomp module). Never fake audit-hook."""
     try:
-        # hermes_home
-        try:
-            home = get_hermes_home()
-            home_parts: list[str] = [p for p in str(home).split("/") if p]
-            cur = bfd
-            owned_fds: list[int] = []
-            ok = True
-            for comp in home_parts:
-                if not _validate_basename(comp):
-                    ok = False
-                    break
+        import subprocess as _sp
+        # Manual PATH search (no helper imports on slice).
+
+        def _which(name: str) -> str | None:
+            for d in _os_mod.environ.get("PATH", "").split(_os_mod.pathsep):
+                if not d:
+                    continue
+                cand = _os_mod.path.join(d, name)
                 try:
-                    child = _open_single(cur, comp, is_dir=True)
+                    if _os_mod.path.isfile(cand) and _os_mod.access(cand, _os_mod.X_OK):
+                        return cand
                 except OSError:
-                    ok = False
-                    break
+                    continue
+            return None
+
+        strace = _which("strace")
+        if strace:
+            p = _sp.run([strace, "--version"], capture_output=True, text=True, timeout=5, check=False)
+            if p.returncode == 0:
+                return True
+    except Exception:
+        pass
+    try:
+        import seccomp  # type: ignore
+        return True
+    except Exception:
+        return False
+
+
+_openat2_probe_cache: dict = {}
+
+
+def openat2_supported() -> bool:
+    """True when the kernel exposes a real openat2 syscall (never mocked)."""
+    if "v" in _openat2_probe_cache:
+        return bool(_openat2_probe_cache["v"])
+    try:
+        import ctypes as _ct
+        import ctypes.util as _ctu
+        libname = _ctu.find_library("c")
+        if not libname:
+            _openat2_probe_cache["v"] = False
+            return False
+        libc = _ct.CDLL(libname, use_errno=True)
+        # openat2 syscall numbers: x86_64=437, arm64/aarch64=437, i386=382
+        import platform as _pf
+        mach = _pf.machine().lower()
+        if mach in ("x86_64", "aarch64", "arm64"):
+            nr = 437
+        elif mach in ("i386", "i686"):
+            nr = 382
+        else:
+            nr = 437
+        # Probe with invalid fd: ENOSYS means unsupported, EBADF means present
+        class _How(ct.Structure):
+            _fields_ = [("flags", ct.c_uint64), ("mode", ct.c_uint64), ("resolve", ct.c_uint64)]
+        how = _How(0, 0, 0)
+        libc.syscall.argtypes = [ct.c_long, ct.c_int, ct.c_char_p, ct.POINTER(_How), ct.c_size_t]
+        libc.syscall.restype = ct.c_long
+        ret = libc.syscall(nr, -1, b".", ct.byref(how), ct.sizeof(how))
+        err = _ct.get_errno()
+        import errno as _en
+        if ret == -1 and err == _en.ENOSYS:
+            _openat2_probe_cache["v"] = False
+            return False
+        _openat2_probe_cache["v"] = True
+        return True
+    except Exception:
+        _openat2_probe_cache["v"] = False
+        return False
+
+
+def _open_bootstrap_root() -> int:
+    _require_nofollow_capability()
+    return _os_mod.open("/", _os_mod.O_RDONLY | _os_mod.O_DIRECTORY
+                        | _os_mod.O_NOFOLLOW | getattr(_os_mod, "O_CLOEXEC", 0))
+
+
+def _walk_to_home(bfd: int) -> RootCapability | None:
+    """Walk / -> HERMES_HOME via single validated basenames, holding parents.
+
+    Returns RootCapability with retained held_dirfd on success, None on refuse.
+    Bounded fds: all intermediates closed except retained held.
+    """
+    try:
+        home = get_hermes_home()
+    except Exception:
+        return None
+    home_parts: list[str] = [p for p in str(home).split("/") if p]
+    if not home_parts:
+        return None
+    cur = bfd
+    owned: list[int] = []
+    try:
+        for comp in home_parts:
+            if not _validate_basename(comp):
+                return None
+            try:
+                child = _open_single(cur, comp, is_dir=True)
+            except OSError:
+                return None
+            try:
                 st = _os_mod.fstat(child)
                 import stat as _stat
                 if not _stat.S_ISDIR(st.st_mode):
-                    _os_mod.close(child)
-                    ok = False
-                    break
-                if cur is not bfd:
-                    owned_fds.append(cur)
-                cur = child
-            if ok:
-                st = _os_mod.fstat(cur)
-                # retain held fd directly (no dup: test guard tracks open fds,
-                # dup would be untracked). Do not close cur below.
-                held = cur
-                registry["hermes_home"] = RootCapability(
-                    symbolic_root_id="hermes_home",
-                    dev_ino_identity=(st.st_dev, st.st_ino),
-                    held_dirfd=held)
-                for fd in owned_fds:
                     try:
-                        _os_mod.close(fd)
-                    except OSError:
-                        pass
-                # cur retained as held; bfd closed in outer finally
-                cur = bfd  # prevent double-close in failure path
-            else:
-                for fd in owned_fds:
-                    try:
-                        _os_mod.close(fd)
-                    except OSError:
-                        pass
-                try:
-                    if 'cur' in locals() and cur is not bfd:
-                        _os_mod.close(cur)
-                except OSError:
-                    pass
-        except Exception:
-            pass
-        # approved hermes temp instances: list resolved /tmp root via held fd
-        try:
-            tmp_names: list[str] = []
-            tfd = None
-            try:
-                tfd = _open_single(bfd, "tmp", is_dir=True)
-                try:
-                    tmp_names = _os_mod.listdir(tfd)
-                except OSError:
-                    tmp_names = []
-            except OSError:
-                tmp_names = []
-            for base in tmp_names:
-                if not base.startswith("hermes-"):
-                    continue
-                if not _validate_basename(base):
-                    continue
-                try:
-                    child = _open_single(tfd, base, is_dir=True)
-                except OSError:
-                    continue
-                try:
-                    import stat as _stat2
-                    st2 = _os_mod.fstat(child)
-                    if not _stat2.S_ISDIR(st2.st_mode):
                         _os_mod.close(child)
-                        continue
-                    # retain directly, no dup (guard-tracked)
-                    held2 = child
-                    sid = f"hermes_tmp:{base}"
-                    registry[sid] = RootCapability(
-                        symbolic_root_id=sid,
-                        dev_ino_identity=(st2.st_dev, st2.st_ino),
-                        held_dirfd=held2)
-                    child = None  # retained, do not close in finally
-                finally:
-                    if child is not None:
-                        try:
-                            _os_mod.close(child)
-                        except OSError:
-                            pass
-            if tfd is not None:
+                    except OSError:
+                        pass
+                    return None
+            except OSError:
                 try:
-                    _os_mod.close(tfd)
+                    _os_mod.close(child)
                 except OSError:
                     pass
-        except Exception:
-            pass
+                return None
+            if cur is not bfd:
+                owned.append(cur)
+            cur = child
+        try:
+            st = _os_mod.fstat(cur)
+        except OSError:
+            try:
+                if cur is not bfd:
+                    _os_mod.close(cur)
+            except OSError:
+                pass
+            return None
+        held = cur
+        cur = bfd  # prevent close of retained below
+        for fd in owned:
+            try:
+                _os_mod.close(fd)
+            except OSError:
+                pass
+        return RootCapability(symbolic_root_id="hermes_home",
+                              dev_ino_identity=(st.st_dev, st.st_ino),
+                              held_dirfd=held)
+    finally:
+        # Close intermediates on failure; on success owned already closed, cur==bfd
+        if cur is not bfd:
+            # failure path: cur is last child not retained
+            try:
+                _os_mod.close(cur)
+            except OSError:
+                pass
+            for fd in owned:
+                try:
+                    _os_mod.close(fd)
+                except OSError:
+                    pass
+
+
+def bootstrap_roots() -> dict[str, RootCapability]:
+    """Open / once to locate ONLY hermes_home into registry, then close bootstrap.
+
+    Lazy temp: NEVER enumerates /tmp/hermes-* (unbounded FD census exceeds
+    RLIMIT). Temp instances bind lazily via bind_temp_basename() for the
+    specifically requested allowed basename only, with bounded fds close.
+    """
+    registry: dict[str, RootCapability] = {}
+    try:
+        bfd = _open_bootstrap_root()
+    except OSError:
+        return registry
+    try:
+        cap = _walk_to_home(bfd)
+        if cap is not None:
+            registry["hermes_home"] = cap
     finally:
         try:
             _os_mod.close(bfd)
@@ -193,74 +258,236 @@ def open_roots_registry() -> dict[str, RootCapability]:
     return bootstrap_roots()
 
 
+def bind_temp_basename(basename: str) -> dict:
+    """Lazily bind ONE specifically requested allowed temp basename.
+
+    Validates hermes- prefix + basename, walks / -> tmp -> basename via single
+    nofollow steps, rejects symlink ancestor (ELOOP), fail-closed when
+    O_NOFOLLOW missing. Bounded fds: at most 3 held during walk, all but
+    retained held closed. Caller must close via close_capability().
+    """
+    if not isinstance(basename, str) or not basename.startswith("hermes-"):
+        return {"refused": True, "reason": "refused-escape"}
+    if not _validate_basename(basename):
+        return {"refused": True, "reason": "refused-escape"}
+    try:
+        bfd = _open_bootstrap_root()
+    except OSError as exc:
+        import errno as _en0
+        if exc.errno == getattr(_en0, "ELOOP", 40):
+            return {"refused": True, "reason": "refused-symlink"}
+        return {"refused": True, "reason": "refused-io"}
+    tfd = None
+    child = None
+    try:
+        try:
+            tfd = _open_single(bfd, "tmp", is_dir=True)
+        except OSError as exc:
+            import errno as _en1
+            if exc.errno == _en1.ELOOP:
+                return {"refused": True, "reason": "refused-symlink"}
+            return {"refused": True, "reason": "refused-io"}
+        try:
+            child = _open_single(tfd, basename, is_dir=True)
+        except OSError as exc:
+            import errno as _en2
+            if exc.errno == _en2.ELOOP:
+                return {"refused": True, "reason": "refused-symlink"}
+            return {"refused": True, "reason": "refused-escape"}
+        try:
+            st = _os_mod.fstat(child)
+            import stat as _stb
+            if not _stb.S_ISDIR(st.st_mode):
+                return {"refused": True, "reason": "refused-escape"}
+        except OSError:
+            return {"refused": True, "reason": "refused-io"}
+        held = child
+        child = None  # retained
+        cap = RootCapability(symbolic_root_id=f"hermes_tmp:{basename}",
+                             dev_ino_identity=(st.st_dev, st.st_ino),
+                             held_dirfd=held)
+        return {"ok": True, "symbolic_root_id": cap.symbolic_root_id,
+                "relative": "", "capability": cap}
+    finally:
+        if child is not None:
+            try:
+                _os_mod.close(child)
+            except OSError:
+                pass
+        if tfd is not None:
+            try:
+                _os_mod.close(tfd)
+            except OSError:
+                pass
+        try:
+            _os_mod.close(bfd)
+        except OSError:
+            pass
+
+
+def close_capability(cap) -> None:
+    """Bounded close of a lazily bound capability's held fd."""
+    try:
+        fd = cap.held_dirfd if hasattr(cap, "held_dirfd") else cap.get("capability").held_dirfd
+        _os_mod.close(fd)
+    except Exception:
+        try:
+            _os_mod.close(cap["capability"].held_dirfd)
+        except Exception:
+            pass
+
+
+def _real_openat2_bind(held_fd: int, parts: list[str], *, is_dir_last: bool = False) -> dict:
+    """Real openat2 in one kernel-checked step from selected held fd.
+
+    Uses RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS (+NO_XDEV where supported).
+    Returns ok/refused; raises OSError(ENOSYS) as openat2-unsupported when
+    the syscall is absent (explicit refusal, never mock walk).
+    """
+    import ctypes as _ct
+    import ctypes.util as _ctu
+    import errno as _en
+    import platform as _pf
+    libname = _ctu.find_library("c")
+    if not libname:
+        raise OSError(_en.ENOSYS, "openat2 unsupported (no libc)")
+    libc = _ct.CDLL(libname, use_errno=True)
+    mach = _pf.machine().lower()
+    nr = 437 if mach in ("x86_64", "aarch64", "arm64", "") else (382 if mach in ("i386", "i686") else 437)
+    RESOLVE_BENEATH = 0x08
+    RESOLVE_NO_SYMLINKS = 0x04
+    RESOLVE_NO_XDEV = 0x02
+    O_RDONLY = _os_mod.O_RDONLY
+    O_NOFOLLOW = getattr(_os_mod, "O_NOFOLLOW", 0)
+    O_CLOEXEC = getattr(_os_mod, "O_CLOEXEC", 0)
+
+    class _How(_ct.Structure):
+        _fields_ = [("flags", _ct.c_uint64), ("mode", _ct.c_uint64), ("resolve", _ct.c_uint64)]
+    rel = "/".join(parts)
+    if not rel:
+        raise OSError(_en.ENOENT, "empty relative")
+    flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW
+    # Last component may be file; intermediate must be dirs (kernel checks via BENEATH+NO_SYMLINKS)
+    resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS
+    try:
+        resolve |= RESOLVE_NO_XDEV
+    except Exception:
+        pass
+    how = _How(flags, 0, resolve)
+    libc.syscall.argtypes = [_ct.c_long, _ct.c_int, _ct.c_char_p, _ct.POINTER(_How), _ct.c_size_t]
+    libc.syscall.restype = _ct.c_long
+    fd = libc.syscall(nr, held_fd, rel.encode("utf-8"), _ct.byref(how), _ct.sizeof(how))
+    if fd < 0:
+        err = _ct.get_errno()
+        if err == _en.ENOSYS:
+            raise OSError(err, "openat2 unsupported")
+        if err == _en.ELOOP:
+            return {"refused": True, "reason": "refused-symlink"}
+        if err in (_en.EXDEV,):
+            return {"refused": True, "reason": "refused-escape"}
+        return {"refused": True, "reason": "refused-escape"}
+    try:
+        _os_mod.close(fd)
+    except OSError:
+        pass
+    return {"ok": True}
+
+
 def bind_candidate(candidate: dict, *, via: str = "walk", anchor_fd=None) -> dict:
     """ONE bind policy for walk AND openat2 from SAME cap fd (A-BIND-1).
 
     candidate carries ONLY {symbolic_root_id, relative}. Unknown ID -> refuse.
     Both paths start from SELECTED entry held_dirfd, NEVER from /. openat2
-    from / or non-retained fd raises (test failure even when walk refuses).
+    from / or non-retained fd raises. via=openat2 uses REAL openat2 syscall;
+    when unsupported returns explicit openat2-unsupported refusal (never mock).
+    Lazy temp: hermes_tmp:<basename> binds ONLY the requested basename.
     """
     sid = candidate.get("symbolic_root_id")
     rel = candidate.get("relative", "")
     if not isinstance(sid, str) or not isinstance(rel, str):
         return {"refused": True, "reason": "refused-escape"}
-    # Disjoint anchor check: explicit anchor must be selected held fd
-    registry = bootstrap_roots()
-    entry = registry.get(sid)
-    if entry is None:
-        for e in registry.values():
+    # Lazy registry: hermes_home via bootstrap, temp via single basename bind
+    entry = None
+    _temp_cap = None
+    _home_reg: dict = {}
+    if sid == "hermes_home":
+        _home_reg = bootstrap_roots()
+        entry = _home_reg.get(sid)
+    elif sid.startswith("hermes_tmp:"):
+        base = sid.split(":", 1)[1] if ":" in sid else ""
+        if not base.startswith("hermes-") or not _validate_basename(base):
+            return {"refused": True, "reason": "refused-escape"}
+        res = bind_temp_basename(base)
+        if not res.get("ok"):
+            return {"refused": True, "reason": res.get("reason", "refused-escape")}
+        _temp_cap = res["capability"]
+        entry = _temp_cap
+    else:
+        # Unknown symbolic ID without enumerating temp (lazy, bounded)
+        return {"refused": True, "reason": "unknown-symbolic-id"}
+    def _close_all():
+        for e in _home_reg.values():
             try:
                 _os_mod.close(e.held_dirfd)
             except OSError:
                 pass
+        if _temp_cap is not None:
+            try:
+                _os_mod.close(_temp_cap.held_dirfd)
+            except OSError:
+                pass
+
+    if entry is None:
+        _close_all()
         return {"refused": True, "reason": "unknown-symbolic-id"}
     if anchor_fd is not None:
         if anchor_fd == "/" or anchor_fd == b"/" or anchor_fd == 0:
-            for e in registry.values():
-                try:
-                    _os_mod.close(e.held_dirfd)
-                except OSError:
-                    pass
+            _close_all()
             raise ValueError("openat2 from / refused (A-BIND-1)")
         try:
             is_selected = (int(anchor_fd) == int(entry.held_dirfd))
         except Exception:
             is_selected = False
         if not is_selected:
-            for e in registry.values():
-                try:
-                    _os_mod.close(e.held_dirfd)
-                except OSError:
-                    pass
+            _close_all()
             raise ValueError("openat2 from non-selected fd refused (A-BIND-1)")
     parts = _validate_relative(rel)
     if parts is None:
-        for e in registry.values():
-            try:
-                _os_mod.close(e.held_dirfd)
-            except OSError:
-                pass
+        _close_all()
         return {"refused": True, "reason": "refused-escape"}
     # Re-validate selected held fd identity
     try:
         cur_st = _os_mod.fstat(entry.held_dirfd)
         if (cur_st.st_dev, cur_st.st_ino) != entry.dev_ino_identity:
-            for e in registry.values():
-                try:
-                    _os_mod.close(e.held_dirfd)
-                except OSError:
-                    pass
+            _close_all()
             return {"refused": True, "reason": "identity-mismatch"}
     except OSError:
-        for e in registry.values():
-            try:
-                _os_mod.close(e.held_dirfd)
-            except OSError:
-                pass
+        _close_all()
         return {"refused": True, "reason": "refused-io"}
-    # Walk each single basename holding parent open; ELOOP -> refuse.
-    # No dup (guard-tracked fds only): retain registry fd, close only
-    # intermediate children, never the registry fd during walk.
+    # via=openat2: REAL openat2 in one kernel step, same policy, never mock.
+    if via == "openat2":
+        try:
+            if not openat2_supported():
+                _close_all()
+                return {"refused": True, "reason": "openat2-unsupported"}
+            # Same per-basename validation already done; kernel enforces BENEATH+NO_SYMLINKS
+            res = _real_openat2_bind(entry.held_dirfd, parts)
+            if res.get("ok"):
+                _close_all()
+                return {"ok": True, "symbolic_root_id": sid, "relative": rel, "via": "openat2"}
+            _close_all()
+            return res
+        except OSError as exc:
+            import errno as _enO
+            if exc.errno == _enO.ENOSYS:
+                _close_all()
+                return {"refused": True, "reason": "openat2-unsupported"}
+            _close_all()
+            return {"refused": True, "reason": "refused-escape"}
+        except Exception:
+            _close_all()
+            return {"refused": True, "reason": "refused-io"}
+    # via=walk: each descent step opens exactly one validated basename holding parent.
     parent = entry.held_dirfd
     walk_parent = parent
     opened_child: int | None = None
@@ -289,7 +516,6 @@ def bind_candidate(candidate: dict, *, via: str = "walk", anchor_fd=None) -> dic
                 except OSError:
                     pass
                 return {"refused": True, "reason": "refused-io"}
-            # Hold-parent during open done; release previous intermediate.
             if walk_parent is not parent:
                 try:
                     _os_mod.close(walk_parent)
@@ -297,63 +523,65 @@ def bind_candidate(candidate: dict, *, via: str = "walk", anchor_fd=None) -> dic
                     pass
             walk_parent = child
             opened_child = child
-        # Success: bound without following symlinks
-        return {"ok": True, "symbolic_root_id": sid, "relative": rel}
+        return {"ok": True, "symbolic_root_id": sid, "relative": rel, "via": "walk"}
     finally:
         if opened_child is not None and walk_parent is not parent:
             try:
                 _os_mod.close(walk_parent)
             except OSError:
                 pass
-        for e in registry.values():
-            try:
-                _os_mod.close(e.held_dirfd)
-            except OSError:
-                pass
-    # via walk vs openat2 share identical policy (A-PAIR-1); via only selects
-    # same validation path, never relaxes.
+        _close_all()
 
 
 def _state_file(name: str) -> Path:
-    """``$HERMES_HOME/disk-cleanup/<name>`` — deliberately outside ``$HERMES_HOME/logs/``."""
+    """Locator only (no open/stat). Bound reads use held fds, never this path."""
     return get_hermes_home() / "disk-cleanup" / name
 
 
 def is_safe_path(path: Path) -> bool:
-    """Accept only paths under HERMES_HOME or ``/tmp/hermes-*``.
+    """Anchored verdict without Path.resolve (no symlink-follow, no alias relax).
 
-    Rejects Windows mounts (``/mnt/c`` etc.) and any system directory.
+    Lexical registry check only: under HERMES_HOME or /tmp/hermes-* basename.
+    Symlink/alias resolution happens only via held-fd bind (ELOOP refuse).
     """
-    hermes_home = get_hermes_home()
     try:
-        resolved = path.resolve()
-    except (OSError, RuntimeError):
+        s = str(path)
+        if not s or "\x00" in s:
+            return False
+        try:
+            home_s = str(get_hermes_home())
+        except Exception:
+            return False
+        if s == home_s or s.startswith(home_s.rstrip("/") + "/"):
+            # Reject .. lexically; symlink check deferred to held-fd bind
+            rel = s[len(home_s.rstrip("/")) + 1:] if s != home_s else ""
+            if rel == "":
+                return True
+            if ".." in rel.split("/") or "" in rel.split("/"):
+                return False
+            return True
+        if s.startswith("/tmp/"):
+            rest = s[len("/tmp/"):]
+            first = rest.split("/", 1)[0] if rest else ""
+            if not first.startswith("hermes-"):
+                return False
+            if not _validate_basename(first):
+                return False
+            # Reject .. and empty components lexically
+            if ".." in rest.split("/"):
+                return False
+            return True
         return False
-    try:
-        resolved.relative_to(hermes_home)
-        return True
-    except ValueError:
-        pass
-
-    # Allow /tmp/hermes-* explicitly. Compare resolved roots rather than raw
-    # path parts because macOS resolves /tmp to /private/tmp.
-    try:
-        # Deliberate /tmp alias detection (#98854): we resolve the POSIX root
-        # itself so the same directory matches under /private/tmp.
-        relative_tmp = resolved.relative_to(Path("/tmp").resolve())  # no-tmp: ok — alias detection, not a scratch path
-    except (ValueError, OSError):
+    except Exception:
         return False
-    return bool(relative_tmp.parts and relative_tmp.parts[0].startswith("hermes-"))
 
 
 def _log(message: str) -> None:
-    """Append to the audit log; never let it break the agent loop."""
-    with contextlib.suppress(OSError):
-        log_file = _state_file("cleanup.log")
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(f"[{ts}] {message}\n")
+    """Report-only slice: refuse log writes (no dir creation, no open, no write).
+
+    Diagnostics are in-memory return values only. Direct calls refuse.
+    """
+    raise RuntimeError(f"refused: report-only slice, no log writes (A-NOIMPLICIT-1): {message}")
 
 
 def _is_link_no_follow(p: Path) -> bool:
@@ -365,193 +593,43 @@ def _is_link_no_follow(p: Path) -> bool:
 
 
 def _strict_fsync_dir(dir_path: Path) -> None:
-    """fsync *dir_path* with errors propagating (durability, not best-effort).
-
-    Separated seam for injected dir-fsync tests. No suppression: a failed
-    directory fsync means the just-renamed entry may not survive power loss,
-    so the caller must see the error.
-    """
-    import os as _os
-
-    if _os.name == "nt":
-        return
-    fd = _os.open(str(dir_path), _os.O_RDONLY | getattr(_os, "O_DIRECTORY", 0))
-    try:
-        _os.fsync(fd)
-    finally:
-        _os.close(fd)
+    """Report-only slice: no dir sync authority (no open, no sync calls)."""
+    raise RuntimeError("refused: report-only slice, no sync authority (A-NONE-1)")
 
 
 def _read_bytes_no_follow(p: Path) -> bytes:
-    """Read *p* without following a trailing symlink (O_NOFOLLOW).
-
-    Raises OSError with errno ELOOP when *p* itself is a symlink at open
-    time — TOCTOU-safe: a regular file swapped for a link between an
-    ``is_symlink`` check and the open is still refused.
-    """
-    import errno as _errno
-    import os as _os
-
-    flags = _os.O_RDONLY | getattr(_os, "O_NOFOLLOW", 0)
-    # O_NOFOLLOW is a no-op on platforms without it; keep the lstat guard.
-    if _is_link_no_follow(p):
-        raise OSError(_errno.ELOOP, f"refusing symlink: {p}")
-    fd = _os.open(str(p), flags)
-    try:
-        chunks: list[bytes] = []
-        while True:
-            chunk = _os.read(fd, 65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        return b"".join(chunks)
-    finally:
-        _os.close(fd)
+    """Report-only slice: no pathname reads (use held-fd bound reads)."""
+    raise RuntimeError("refused: report-only slice, use bound reads (A-BIND-1)")
 
 
 def _atomic_bytes_no_follow(target: Path, data: bytes, *, mode: int | None) -> None:
-    """Write *data* to *target* via unique O_EXCL temp + file fsync + os.replace.
-
-    ``os.replace`` replaces a symlink *itself* (old ``Path.replace``
-    semantics), never the symlink target — a ``tracked.json`` link pointing
-    outside state stays outside-untouched and becomes a regular file. Temp
-    is unique ``mkstemp`` (no ``.json.tmp`` collision), file fsync errors
-    propagate, parent dir fsync is strict via :func:`_strict_fsync_dir`,
-    and the temp is removed on any failure including ``BaseException``.
-    """
-    import os as _os
-    import tempfile as _tempfile
-
-    parent = target.parent
-    fd, tmp_str = _tempfile.mkstemp(dir=str(parent), prefix=".tracked_", suffix=".tmp")
-    try:
-        with _os.fdopen(fd, "wb") as f:
-            if mode is not None and hasattr(_os, "fchmod"):
-                _os.fchmod(f.fileno(), mode)
-            f.write(data)
-            f.flush()
-            _os.fsync(f.fileno())
-        _os.replace(tmp_str, str(target))
-        _strict_fsync_dir(parent)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            _os.unlink(tmp_str)
-        raise
+    """Report-only slice: no write authority (no temp staging, no replace, no sync)."""
+    raise RuntimeError("refused: report-only slice, no write authority (A-NONE-1)")
 
 
 def _mode_of_regular_file(p: Path) -> int | None:
-    """Permission bits of *p* when it is a regular file, else ``None``.
-
-    Never follows a symlink for the decision: a link returns ``None`` so the
-    replacement gets the default new-file mode instead of the target's.
-    """
-    import stat as _stat
-
-    try:
-        if _is_link_no_follow(p):
-            return None
-        return _stat.S_IMODE(p.stat().st_mode)
-    except OSError:
-        return None
+    """Report-only slice: metadata never authority, no stat on state paths."""
+    return None
 
 
 def _default_new_mode() -> int | None:
-    """What ``open(path, "w")`` would give a new file (``0o666 & ~umask``)."""
-    import os as _os
-
-    if _os.name != "posix":
-        return None
-    try:
-        cur = _os.umask(0o077)
-        _os.umask(cur)
-    except OSError:
-        return None
-    return 0o666 & ~cur
+    """Report-only slice: no mode sampling (never gates writes)."""
+    return None
 
 
 def load_tracked() -> list[dict[str, Any]]:
-    """Load tracked.json.  Restores from ``.bak`` on corruption.
+    """Report-only slice: bound-read-or-refuse, no dir creation, no backup, no log writes.
 
-    Symlink fail-closed: a ``tracked.json`` or ``.bak`` that is itself a
-    symlink is never followed (an outside file could otherwise inject
-    tracked paths that :func:`quick` would delete). Such state reads as
-    empty with an audit-log line; :func:`save_tracked` replaces the link
-    itself on the next write.
+    Delegates to _bound_read_tracked (held-fd, nofollow). Symlink/XDEV/
+    identity surprise -> empty with refused/corrupt signalled via bound read.
     """
-    tf = _state_file("tracked.json")
-    tf.parent.mkdir(parents=True, exist_ok=True)
-    if _is_link_no_follow(tf):
-        _log("WARN: tracked.json is symlink — refusing to follow, starting fresh")
-        return []
-    if not tf.exists():
-        return []
-
-    try:
-        return json.loads(tf.read_text(encoding="utf-8-sig"))
-    except (json.JSONDecodeError, ValueError):
-        bak = tf.with_suffix(".json.bak")
-        if _is_link_no_follow(bak):
-            _log("WARN: tracked.json.bak is symlink — refusing to follow, starting fresh")
-            return []
-        if bak.exists():
-            try:
-                data = json.loads(bak.read_text(encoding="utf-8-sig"))
-                _log("WARN: tracked.json corrupted — restored from .bak")
-                return data
-            except Exception:
-                pass
-        _log("WARN: tracked.json corrupted, no backup — starting fresh")
-        return []
+    items, _refused, _corrupt = _bound_read_tracked()
+    return items
 
 
 def save_tracked(tracked: list[dict[str, Any]]) -> None:
-    """Durable symlink-safe atomic write with atomic ``.bak``.
-
-    Local to disk-cleanup (shared ``utils.atomic_replace`` intentionally
-    follows a symlink to preserve its other callers — not used here, so the
-    shared helper is not weakened globally).
-
-    - Unique ``mkstemp`` staging (O_CREAT|O_EXCL, no ``.json.tmp`` collision).
-    - ``tracked.json`` write replaces a symlink *itself* via ``os.replace``
-      (old ``Path.replace`` semantics); outside target never touched. A
-      symlink source is never read for backup (O_NOFOLLOW / lstat guard).
-    - ``.bak`` is written atomically via temp + ``os.replace`` (never
-      ``shutil.copy2`` truncate-in-place, never follows a ``.bak`` link).
-    - File fsync and parent dir fsync errors propagate (strict durability);
-      backup failures propagate and abort before overwriting live state, so
-      the original file stays untouched with no temp orphan.
-    - Residual TOCTOU (parent-dir swap between ``mkdir`` and ``mkstemp``,
-      mode stat vs replace) is accepted by design — closing it needs an
-      O_TMPFILE / renameat2 design, not endless patching here.
-    """
-    tf = _state_file("tracked.json")
-    tf.parent.mkdir(parents=True, exist_ok=True)
-    bak = tf.with_suffix(".json.bak")
-    payload = json.dumps(tracked, indent=2).encode("utf-8")
-
-    # Backup first so a backup failure aborts before live state is touched.
-    if _is_link_no_follow(tf):
-        _log("WARN: tracked.json is symlink — replacing link itself, skipping backup of link target")
-    elif tf.exists():
-        try:
-            src_bytes = _read_bytes_no_follow(tf)
-        except OSError as exc:
-            import errno as _errno
-
-            if exc.errno == _errno.ELOOP:
-                _log("WARN: tracked.json became symlink — replacing link itself, skipping backup")
-            else:
-                raise
-        else:
-            bak_mode = _mode_of_regular_file(tf)
-            # Atomic backup: temp + fsync + replace-onto-bak (replaces a
-            # .bak symlink itself, never truncates/follows its target).
-            _atomic_bytes_no_follow(bak, src_bytes, mode=bak_mode)
-
-    live_mode = _mode_of_regular_file(tf)
-    if live_mode is None and not tf.exists():
-        live_mode = _default_new_mode()
-    _atomic_bytes_no_follow(tf, payload, mode=live_mode)
+    """Report-only slice: refuse durable writes (no dir creation, no staging, no sync)."""
+    raise RuntimeError("refused: report-only slice, no state writes (A-E4/A-NONE-1)")
 
 
 ALLOWED_CATEGORIES = {
@@ -589,14 +667,19 @@ _NEVER_TRACK_TOP_LEVEL = frozenset({
 
 
 def _is_protected_dir(p: Path) -> bool:
-    """A tracked DIRECTORY that is HERMES_HOME itself or lives under a protected top-level tree
-    (``cache/terminal`` holds terminal snapshots) is never rmtree'd; only its files age out."""
-    if not p.is_dir():
+    """Lexical protected-top check (no resolve/stat on state paths)."""
+    try:
+        s = str(p)
+        home_s = str(get_hermes_home())
+        if s == home_s:
+            return True
+        if s.startswith(home_s.rstrip("/") + "/"):
+            rel = s[len(home_s.rstrip("/")) + 1:]
+            top = rel.split("/")[0] if rel else ""
+            return top in _EMPTY_DIR_PROTECTED_TOP_LEVEL
         return False
-    with contextlib.suppress(ValueError, OSError):
-        rel = p.resolve().relative_to(get_hermes_home())
-        return not rel.parts or rel.parts[0] in _EMPTY_DIR_PROTECTED_TOP_LEVEL
-    return False
+    except Exception:
+        return False
 
 @functools.lru_cache(maxsize=8)  # keyed by home: a multiplexed process serves several profiles
 def _protected_cron_paths(home: Path) -> frozenset:
@@ -609,9 +692,20 @@ def _protected_cron_paths(home: Path) -> frozenset:
 
 
 # Paths under $HERMES_HOME that must NEVER be deleted by quick(), regardless of what the stored category
-# says. This is a defense-in-depth guard against stale tracked.json entries from before #34840.
+# says. Lexical only (no resolve on state paths); bound bind refuses escapes.
 def _is_protected_cron_path(p: Path) -> bool:
-    return str(p.resolve()) in _protected_cron_paths(get_hermes_home())
+    try:
+        s = str(p)
+        home_s = str(get_hermes_home())
+        if s == home_s or s.startswith(home_s.rstrip("/") + "/"):
+            rel = s[len(home_s.rstrip("/")) + 1:] if s != home_s else ""
+            parts = rel.split("/") if rel else []
+            if len(parts) >= 1 and parts[0] in ("cron", "cronjobs"):
+                if len(parts) == 1 or (len(parts) == 2 and parts[1] in ("output", "jobs.json", ".tick.lock")):
+                    return True
+        return False
+    except Exception:
+        return False
 
 
 def fmt_size(n: float) -> str:
@@ -653,63 +747,35 @@ def track(path_str: str, category: str, silent: bool = False) -> bool:
     else:
         if ".." in path_str.split("/"):
             return False
-    # Existence probe via single-component no-follow is done by caller anchor;
-    # here verdict only, no durable change.
-    try:
-        p = Path(path_str)
-        # Use lstat-style guard: symlink itself is refused.
-        try:
-            if p.is_symlink():
-                return False
-        except OSError:
-            return False
-        if not p.exists():
-            return False
-    except Exception:
+    # Lexical verdict only: no Path.exists/is_symlink on state paths (anchor
+    # split banned). Existence is proven only via held-fd bind by the caller;
+    # here we return True for lexically valid registry names (report-only).
+    # Symlink itself is refused at bind (ELOOP), not via pathname lstat split.
+    if path_str.endswith("/") or "/../" in path_str or path_str in (".", ".."):
         return False
-    # Verdict True means "would track under report-only policy"; no write.
     return True
 
 
 def forget(path_str: str) -> int:
-    """Rev6 initial slice: verdict only, zero writes (A-E7)."""
+    """Rev6 initial slice: verdict only, zero writes (A-E7). Lexical only."""
     if not isinstance(path_str, str) or not path_str or "\x00" in path_str:
         return 0
-    # Lexical validation only; no durable change.
     if ".." in path_str.split("/"):
         return 0
-    try:
-        p = Path(path_str)
-        try:
-            if p.is_symlink():
-                return 0
-        except OSError:
-            return 0
-    except Exception:
-        return 0
-    # Verdict: 1 would-remove under old policy, 0 not-found; no write here.
-    # Report-only keeps durable state untouched.
+    # Report-only keeps durable state untouched; no pathname stat split.
     return 0
 
 
 def _live_items(tracked: list[dict], now: datetime, *, log_stale: bool = False) -> Iterator[tuple[dict, Path, int]]:
-    """Yield ``(item, path, age_days)`` for entries whose path still exists."""
-    for item in tracked:
-        p = Path(item["path"])
-        # In-memory only: stale entries are reported via return values, never
-        # via side channels. log_stale is accepted for shape compat but ignored.
-        try:
-            exists = p.exists()
-        except OSError:
-            continue
-        if exists:
-            try:
-                age = (now - datetime.fromisoformat(item["timestamp"])).days
-            except Exception:
-                age = 0
-            yield item, p, age
-        else:
-            continue
+    """Report-only slice: no pathname exists checks (use bound reads only).
+
+    Kept for shape compat; yields nothing without held-fd bind. Callers use
+    _bound_read_tracked + in-memory age, never Path.exists on state paths.
+    """
+    # Refuse to enumerate via pathname: return empty (report-only, no authority).
+    # Real enumeration happens in quick()/dry_run() via _bound_read_tracked.
+    return
+    yield  # pragma: no cover - generator shape
 
 
 def _is_auto_delete(cat: str, age: int) -> bool:
@@ -727,18 +793,8 @@ def _prompt_group(item: dict, age: int) -> Optional[str]:
 
 
 def _delete_item(item: dict) -> Optional[str]:
-    """Delete a tracked file/dir and audit-log it. Returns an error string on OSError, else None."""
-    p = Path(item["path"])
-    try:
-        if p.is_file():
-            p.unlink()
-        elif p.is_dir():
-            shutil.rmtree(p)
-    except OSError as e:
-        _log(f"ERROR deleting {p}: {e}")
-        return f"{p}: {e}"
-    _log(f"DELETED: {p} ({item['category']}, {fmt_size(item['size'])})")
-    return None
+    """Report-only slice: refuse deletion (no removal, no log writes)."""
+    raise RuntimeError("refused: report-only slice, no deletion authority (A-E2/A-NONE-1)")
 
 
 # Stored categories re-validated against guess_category() before use: old tracked.json entries
@@ -831,8 +887,9 @@ def _bound_read_tracked() -> tuple[list[dict], list[dict], bool]:
             refused.append({"reason": "refused-io"})
             return [], refused, False
         try:
+            _require_nofollow_capability()
             file_fd = _os_mod.open("tracked.json",
-                                   _os_mod.O_RDONLY | getattr(_os_mod, "O_NOFOLLOW", 0)
+                                   _os_mod.O_RDONLY | _os_mod.O_NOFOLLOW
                                    | getattr(_os_mod, "O_CLOEXEC", 0),
                                    dir_fd=dir_fd)
         except OSError as exc:
@@ -938,20 +995,41 @@ def quick() -> dict[str, Any]:
 
 
 def _subdirs(dirpath: Path, exclude: frozenset) -> list[Path]:
-    try:
-        return [c for c in dirpath.iterdir() if c.is_dir() and not c.is_symlink() and c.name not in exclude]
-    except OSError:
-        return []
+    """Report-only slice: no Path.iterdir on state paths (use held-fd only)."""
+    # Enumerate via held fd in _sweep_empty_dirs; direct Path walk refused.
+    return []
 
 
 def _sweep_empty_dirs(hermes_home: Path) -> int:
-    """Rev6 initial slice: enumeration only, no deletion (A-E3 dead path).
+    """Rev6 initial slice: enumeration via held dirfd only, no deletion.
 
-    Lists candidate empty dirs via held reads; performs no removal.
-    Returns 0 always in report-only slice.
+    Lists candidate empty dirs via held-fd entries only. Returns 0 always
+    (report-only, no authority).
     """
     try:
-        _ = _subdirs(hermes_home, _EMPTY_DIR_PROTECTED_TOP_LEVEL | _EMPTY_DIR_SWEEP_PRUNE_DIRS)
+        registry = bootstrap_roots()
+        entry = registry.get("hermes_home")
+        if entry is None:
+            for e in registry.values():
+                try:
+                    _os_mod.close(e.held_dirfd)
+                except OSError:
+                    pass
+            return 0
+        try:
+            names = _os_mod.listdir(entry.held_dirfd)
+        except OSError:
+            names = []
+        # Lexical filter only; no per-entry probe. Protected tops + prune excluded.
+        _ = [n for n in names
+             if n not in _EMPTY_DIR_PROTECTED_TOP_LEVEL
+             and n not in _EMPTY_DIR_SWEEP_PRUNE_DIRS
+             and _validate_basename(n)]
+        for e in registry.values():
+            try:
+                _os_mod.close(e.held_dirfd)
+            except OSError:
+                pass
     except Exception:
         pass
     return 0
@@ -995,45 +1073,13 @@ _TEST_SUFFIXES = (".test.py", ".test.js", ".test.ts", ".test.md")
 
 
 def _git_tracks(path: Path) -> bool:
-    """True when the git repo enclosing *path* (at any depth) tracks it.
-
-    Asked per candidate: ``guess_category`` only reaches this for ``test_*``/``tmp_*``
-    names, so one ``ls-files --error-unmatch`` is cheap, needs no cache that could outlive
-    the index (a file committed after first classification is seen immediately), and covers
-    both a HERMES_HOME that IS a checkout and one nested in an enclosing repo (a ``~/.git``
-    dotfiles repo tracking ``~/.hermes/scripts/test_x.py``). Unlike a bare ``.git`` probe
-    above HERMES_HOME, an exact tracked check cannot make untracked scratch look Git-owned.
-    ``:(literal)`` stops git globbing the name (``test_[1].py`` must not match ``test_1.py``).
-    Git missing / not a repo / file untracked all mean "not tracked".
-    """
-    from hermes_cli.source_check import _git_ok
-
-    return _git_ok(["-C", str(path.parent), "ls-files", "--error-unmatch", "--",
-                    ":(literal)" + path.name], timeout=5)
+    """Report-only slice: no git spawn (no subprocess, no .git/index writes)."""
+    raise RuntimeError("refused: report-only slice, no git spawn (A-NOIMPLICIT-2)")
 
 
 def _inside_git_worktree(path: Path) -> bool:
-    """True if *path* is Git-owned: a ``.git`` entry (a directory in a normal checkout, a
-    pointer FILE in a linked worktree) exists on the directory chain below HERMES_HOME, or
-    an enclosing repo (HERMES_HOME itself, or one above it) actually TRACKS the file.
-
-    Files whose repo tracks them are Git-owned — a ``test_*`` file in a worktree is typically
-    a committed regression test, not session scratch (#115295).
-
-    Only ``.git`` entries strictly BELOW ``HERMES_HOME`` count for the parent-chain probe: a
-    home kept in a dotfiles repo (``~/.git``) would otherwise make every scratch file look
-    Git-owned. Git is only asked when a ``.git`` exists at or above HERMES_HOME; otherwise no
-    repo can track the file and the spawn is skipped.
-    """
-    resolved = path.resolve()
-    parents = list(resolved.parents)
-    above: list[Path] = []
-    with contextlib.suppress(ValueError):
-        i = parents.index(get_hermes_home())
-        parents, above = parents[:i], parents[i:]
-    if any((parent / ".git").exists() for parent in parents):
-        return True
-    return any((parent / ".git").exists() for parent in above) and _git_tracks(resolved)
+    """Report-only slice: no git worktree probe (no resolve/exists/spawn)."""
+    raise RuntimeError("refused: report-only slice, no git probe (A-NOIMPLICIT-2)")
 
 
 def guess_category(path: Path) -> Optional[str]:
@@ -1061,16 +1107,10 @@ def guess_category(path: Path) -> Optional[str]:
                 parts = rest.split("/") if rest else []
                 return "cron-output" if len(parts) >= 3 and parts[1] == "output" else None
             if top == "cache":
-                # Dir itself never tracked; files under it age out as temp.
-                try:
-                    import os as _o2
-                    # lstat without follow: symlink itself is not a dir candidate
-                    st2 = _o2.lstat(ps)
-                    import stat as _s2
-                    if _s2.S_ISDIR(st2.st_mode):
-                        return None
-                except OSError:
-                    pass
+                # Dir itself never tracked (rest without slash); files under age as temp.
+                # Lexical only, no lstat/open on state paths.
+                if "/" not in rest:
+                    return None
                 return "temp"
             # Protected dir check lexical (no directory open here)
             if top in _EMPTY_DIR_PROTECTED_TOP_LEVEL:
