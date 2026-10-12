@@ -175,10 +175,12 @@ test('gitFor on the Windows host tuple allowlists only the guarded env it needs'
 
   try {
     const withHost = await import('./git-review-ops')
+
     const git = withHost.gitFor(process.cwd(), 'git') as unknown as {
       env?: unknown
       _executor?: { env?: Record<string, string> }
     }
+
     const env =
       (git._executor?.env as Record<string, string> | undefined) ??
       (git.env as Record<string, string> | undefined)
