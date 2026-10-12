@@ -70,34 +70,89 @@ def _agent_browser_ready() -> bool:
         return False
 
 
+def _configured_backend_key() -> str:
+    """Configured ``browser.backend`` key ("" = unset default, "off" = disabled)."""
+    try:
+        from tools.browser_use_cli import get_browser_backend
+        return get_browser_backend()
+    except Exception:
+        return ""
+
+
 def _browser_available() -> bool:
     """Is any local browser automation backend ready?
 
+    Honors explicit ``browser.backend: off`` (disabled → not available).
     Covers both the bundled BrowserUseCLI harness (default backend, runs on
     this interpreter) and the PM-owned agent-browser binary. Passive only:
-    never installs or executes anything.
+    never installs or executes anything (no ``pm.ensure``).
     """
+    try:
+        if _configured_backend_key() == "off":
+            return False
+    except Exception:
+        pass
     return _browser_use_ready() or _agent_browser_ready()
+
+
+def _harness_version_probe(timeout: float) -> tuple | None:
+    """Bounded real exec of the harness (``--version``), not a bare import.
+
+    A bare ``import browser_harness`` false-passes a broken install (missing
+    entrypoint, incompatible deps) with no configured-browser proof. Running
+    ``--version`` in a bounded subprocess proves the exact CLI the
+    ``browser_exec`` tool spawns is runnable, readonly, with no daemon start
+    and no ``pm.ensure`` mutation.
+    """
+    import subprocess
+
+    try:
+        from tools.browser_use_cli import _find_cli
+        cmd = _find_cli()
+    except Exception as exc:
+        return (False, f"browser-harness lookup failed: {exc}")
+    if cmd is None:
+        return None
+    try:
+        proc = subprocess.run([*cmd, "--version"], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=max(1.0, min(timeout, 15.0)), check=False)
+        if proc.returncode == 0 and proc.stdout.strip():
+            return (True, f"browser-harness runnable ({proc.stdout.strip()[:80]})")
+        return (False, f"browser-harness --version exited {proc.returncode}")
+    except subprocess.TimeoutExpired:
+        return (False, "browser-harness --version timed out")
+    except Exception as exc:
+        return (False, f"browser-harness probe failed: {exc}")
 
 
 def _probe_configured_backend(timeout: float) -> tuple | None:
     """Bounded readiness probe via the configured backend (no playwright needed).
 
     Returns ``(ok, detail)`` when a backend-specific probe ran, else ``None``
-    to fall through to the playwright launch path. Uses only bounded,
-    side-effect-free checks with cleanup: harness import + agent-browser
+    to fall through to the playwright launch path. Honors ``browser.backend``:
+    explicit ``off`` never probes (caller skips), explicit ``browser-use``
+    probes only the harness, otherwise default order (harness then
+    agent-browser). Uses only bounded, side-effect-free exec with cleanup and
+    never ``pm.ensure``: harness ``--version`` subprocess + agent-browser
     ``--version`` subprocess with timeout.
     """
     import subprocess
 
-    # BrowserUseCLI first: it is the default backend whenever the harness is
-    # importable, even with no agent-browser on PATH.
+    backend = _configured_backend_key()
+    if backend == "off":
+        return None
+    # Explicit browser-use: honor it, never fall back to agent-browser.
+    if backend == "browser-use":
+        result = _harness_version_probe(timeout)
+        if result is not None:
+            return result
+        return (False, "browser-use backend configured but harness CLI missing")
+    # Default (unset): harness first, then agent-browser.
     if _browser_use_ready():
-        try:
-            import browser_harness  # noqa: F401 -- readiness probe only
-            return (True, "browser-harness importable (BrowserUseCLI backend ready)")
-        except Exception as exc:
-            return (False, f"browser-harness broken: {exc}")
+        result = _harness_version_probe(timeout)
+        if result is not None:
+            return result
     # agent-browser binary + Chromium executable: bounded --version run proves
     # the bootstrap the browser tools actually exec is runnable.
     if _agent_browser_ready():

@@ -312,16 +312,95 @@ class TestBrowserAvailable:
 
 
 class TestBrowserBackendProbe:
-    """Configured-backend probe must not fail a ready backend for missing playwright."""
+    """Configured-backend probe honors backend and does real exec, no pm.ensure."""
 
-    def test_harness_ready_passes_without_playwright(self, monkeypatch):
+    def test_harness_ready_passes_without_playwright_via_real_version_exec(self, monkeypatch):
+        """Harness probe runs bounded --version subprocess (not bare import)."""
+        monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "")
         monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: True)
         monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
+        monkeypatch.setattr("tools.browser_use_cli._find_cli",
+                            lambda: ["python", "-m", "browser_harness.run"])
+        import subprocess as _sp
+        from types import SimpleNamespace as _NS
+        seen: dict = {}
+
+        def _fake_run(*a, **k):
+            seen["timeout"] = k.get("timeout")
+            seen["cmd"] = a[0] if a else k.get("args")
+            return _NS(returncode=0, stdout="0.1.13\n", stderr="")
+
+        monkeypatch.setattr(_sp, "run", _fake_run)
+        # Playwright must never be needed for a ready harness backend.
+        import builtins as _bi
+        real_import = _bi.__import__
+
+        def _no_playwright(name, *a, **k):
+            if name.startswith("playwright"):
+                raise ImportError("No module named playwright")
+            return real_import(name, *a, **k)
+
+        monkeypatch.setattr(_bi, "__import__", _no_playwright)
+        # No pm.ensure mutation even when probe runs.
+        import pm as _pm
+        monkeypatch.setattr(_pm, "ensure",
+                            lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not ensure")))
+        ok, detail = doctor_live._launch_browser_probe(5.0)
+        assert ok is True
+        assert "runnable" in detail
+        assert seen["timeout"] is not None and seen["timeout"] <= 15.0
+        assert "--version" in str(seen["cmd"])
+
+    def test_harness_import_alone_does_not_pass_when_version_fails(self, monkeypatch):
+        """Repro: bare import false-passed; real --version failure must fail."""
+        monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "")
+        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: True)
+        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
+        monkeypatch.setattr("tools.browser_use_cli._find_cli",
+                            lambda: ["python", "-m", "browser_harness.run"])
+        import subprocess as _sp
+        from types import SimpleNamespace as _NS
+        monkeypatch.setattr(_sp, "run", lambda *a, **k: _NS(returncode=1, stdout="", stderr="boom"))
         import sys as _sys
         monkeypatch.setitem(_sys.modules, "browser_harness", type(_sys)("browser_harness"))
         ok, detail = doctor_live._launch_browser_probe(5.0)
-        assert ok is True
-        assert "BrowserUseCLI" in detail
+        assert ok is False
+        assert "--version" in detail
+
+    def test_explicit_off_honors_backend_as_not_available(self, monkeypatch):
+        monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "off")
+        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: True)
+        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: True)
+        assert doctor_live._browser_available() is False
+        assert doctor_live._probe_configured_backend(5.0) is None
+
+    def test_explicit_browser_use_never_falls_back_to_agent_browser(self, monkeypatch, tmp_path):
+        """Explicit browser-use with missing harness fails, not agent-browser."""
+        monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "browser-use")
+        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: False)
+        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: True)
+        monkeypatch.setattr("tools.browser_use_cli._find_cli", lambda: None)
+        ok, detail = doctor_live._launch_browser_probe(5.0)
+        # Must fail for the configured backend, never silently probe another.
+        assert ok is False
+        assert "browser-use" in detail
+
+    def test_missing_backend_fails_not_passes(self, monkeypatch):
+        monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "")
+        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: False)
+        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
+        import builtins as _bi
+        real_import = _bi.__import__
+
+        def _no_playwright(name, *a, **k):
+            if name.startswith("playwright"):
+                raise ImportError("No module named playwright")
+            return real_import(name, *a, **k)
+
+        monkeypatch.setattr(_bi, "__import__", _no_playwright)
+        ok, detail = doctor_live._launch_browser_probe(5.0)
+        assert ok is False
+        assert "no browser backend ready" in detail
 
     def test_agent_browser_ready_probes_binary_bounded(self, monkeypatch, tmp_path):
         fake_bin = tmp_path / "agent-browser"
