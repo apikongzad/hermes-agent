@@ -1,6 +1,10 @@
-# DESIGN-FIRST rev5: report-only sweep, zero writes (no runtime change)
+# DESIGN-FIRST rev6: report-only sweep, zero writes (no runtime change)
 
 > **Status: DESIGN ONLY — no runtime implementation in this commit.**
+> Rev6 revises `b1514de3` (rev5) fixing the SINGLE remaining blocker
+> B-PREFLIGHT-FLAG ambiguous fallback-chain `None` at `:92-95` (now disjoint
+> `:92-93` vs `:94-95`), all other final-rev4 clusters accepted, with no
+> scope expansion and no whole-file rewrite.
 > Rev5 revises `5e63f729` (rev4) fixing the EXACT remaining contradictions
 > named below, with no scope expansion and no whole-file rewrite.
 > Rev4 left three narrow contradictions:
@@ -393,7 +397,7 @@ ready), but its label is the platform verdict, not `setup_needed`.
 | B-CRON-4 | `cron/scheduler_preflight.py:314-317` `skill_view` `except → continue` / `not success → continue` | unreadable/missing/unready skill → blocked diagnostic via `_SKILL_MISSING_FIELDS` labels (296-300) evaluated under B-READY-1; fall-through to `_build_job_prompt` skip handling is removed for the blocking path |
 | B-CRON-5 | `cron/scheduler_preflight.py:399-403` `_preflight_job_config` per-check `except → continue` | check raise → blocked diagnostic naming the check (`provider_key`/`skills`/`delivery`) |
 | B-CRON-6 | `cron/scheduler.py:1697-1725` `_preflight_or_block`, esp. `1719-1722` outer `except → _pf_reason=None` ("validator must never take down a runnable job") | validator error → blocked diagnostic; job does not dispatch |
-| B-PREFLIGHT-FLAG | `cron/scheduler_preflight.py:80-83` `_cron_preflight_enabled` (`cron.preflight` literally `False` disables) + `cron/scheduler.py:1712` gate + `cron/scheduler.py:2458` gate (`_empty_requested_mcp_toolsets`) | `cron.preflight:false` disables ONLY optional costly non-security hints (fallback-chain-present `None` at `:92-95` and rate-limited-`AuthError` deferral `None` at `:110-113` inside `_preflight_check_provider_key:86-122`). It MUST NOT bypass mandatory readiness and MUST NOT skip B-CRON-1/2 probe-error blocks. MANDATORY PARTS — EXACT list, no vague wording, ALWAYS run regardless of `_cron_preflight_enabled`, fail-closed on raise, full policy always fail: (1) skill readiness = `_preflight_check_skills` full B-READY-1 policy (`setup_needed` OR `readiness_status=="setup_needed"` OR `success is not True` OR `UNSUPPORTED` OR view exception/unreadable → blocked, per B-CRON-4); (2) provider-key readiness = `_preflight_check_provider_key` `AuthError` missing-credential verdict → blocked, PLUS B-CRON-1 fallback-probe error → blocked and B-CRON-2 non-auth resolve error → blocked; (3) delivery = `_preflight_check_delivery` unknown-platform verdict → blocked AND known-platform loader-fail verdict → blocked (gateway-config load exception with a known platform in the lane → blocked per B-CRON-3; `local`/`origin`/`all`/bot-chat lanes stay exempt with no config load); (4) MCP = `_empty_requested_mcp_toolsets` full policy (ANY requested server resolving to zero tools → blocked, including reconnecting — no warn-and-run-through). Implementation MUST ADD a NEW helper — e.g. `_cron_mandatory_readiness_guard(job, cfg) -> Optional[str]` wrapping EXACTLY (1)+(2)+(3)+(4) fail-closed on raise — and invoke it UNCONDITIONALLY at BOTH dispatch sites regardless of `_cron_preflight_enabled`: (i) inside `_preflight_or_block` (`scheduler.py:1710-1722`, before/around the flag gate), and (ii) inside `_resolve_cron_agent_setup` (`scheduler.py:2441-2462`, alongside `_empty_requested_mcp_toolsets` at `:2458-2461` which likewise runs its mandatory full policy regardless). An implementation where `false` dispatches a B-READY-1-unready skill/key/delivery/MCP-empty, or one that cites an imaginary "dispatch-time `_skill_readiness` gate already blocks" without the new call, fails review |
+| B-PREFLIGHT-FLAG | `cron/scheduler_preflight.py:80-83` `_cron_preflight_enabled` (`cron.preflight` literally `False` disables) + `cron/scheduler.py:1712` gate + `cron/scheduler.py:2458` gate (`_empty_requested_mcp_toolsets`) | `cron.preflight:false` disables ONLY optional costly non-security hints (rate-limited-`AuthError` deferral `None` at `:110-113` inside `_preflight_check_provider_key:86-122`, plus informational display after successful validation). It MUST NOT bypass mandatory readiness and MUST NOT skip B-CRON-1/2 probe-error blocks. Disjoint `_job_fallback_chain` policy — evaluation is ALWAYS mandatory: `:92-93` valid chain-present is NOT a blanket `return None`, it requires mandatory validation of fallback-provider readiness (allowed only if all 4 mandatory parts pass); `:94-95` probe exception/error → blocked diagnostic per B-CRON-1 regardless of `cron.preflight`; an optional hint may suppress only informational display after successful validation, NEVER skip evaluation or exceptions. MANDATORY PARTS — EXACT list, no vague wording, ALWAYS run regardless of `_cron_preflight_enabled`, fail-closed on raise, full policy always fail: (1) skill readiness = `_preflight_check_skills` full B-READY-1 policy (`setup_needed` OR `readiness_status=="setup_needed"` OR `success is not True` OR `UNSUPPORTED` OR view exception/unreadable → blocked, per B-CRON-4); (2) provider-key readiness = `_preflight_check_provider_key` `AuthError` missing-credential verdict → blocked, PLUS B-CRON-1 fallback-probe error → blocked and B-CRON-2 non-auth resolve error → blocked; (3) delivery = `_preflight_check_delivery` unknown-platform verdict → blocked AND known-platform loader-fail verdict → blocked (gateway-config load exception with a known platform in the lane → blocked per B-CRON-3; `local`/`origin`/`all`/bot-chat lanes stay exempt with no config load); (4) MCP = `_empty_requested_mcp_toolsets` full policy (ANY requested server resolving to zero tools → blocked, including reconnecting — no warn-and-run-through). Implementation MUST ADD a NEW helper — e.g. `_cron_mandatory_readiness_guard(job, cfg) -> Optional[str]` wrapping EXACTLY (1)+(2)+(3)+(4) fail-closed on raise — and invoke it UNCONDITIONALLY at BOTH dispatch sites regardless of `_cron_preflight_enabled`: (i) inside `_preflight_or_block` (`scheduler.py:1710-1722`, before/around the flag gate), and (ii) inside `_resolve_cron_agent_setup` (`scheduler.py:2441-2462`, alongside `_empty_requested_mcp_toolsets` at `:2458-2461` which likewise runs its mandatory full policy regardless). An implementation where `false` dispatches a B-READY-1-unready skill/key/delivery/MCP-empty, or one that cites an imaginary "dispatch-time `_skill_readiness` gate already blocks" without the new call, fails review |
 | B-VIEW-1 | `tools/skills_tool.py:613-641` view-time `pm.ensure` (read-only `skill_view` mutates host) | read-only view performs zero setup: no `pm.ensure`, no `pm.ensure_import`, no download; missing deps → `setup_needed` verdict + `deps_note` remedy, install only via explicit `hermes pm install` + reload. Same ban covers `skills_list` and plugin-serve paths |
 | B-ACT-1 | deployment/activation seam (skill load, plugin enable, cron dispatch, dependent-service enable) | activation requires B-READY-1 on the current view; every other status blocks with no side effect (no scheduling, no service enable, no tool registration for that skill) |
 
@@ -401,7 +405,10 @@ ready), but its label is the platform verdict, not `setup_needed`.
 `B-PM-1`, `B-PLUGIN-1`, `B-CRON-1`…`B-CRON-6`, `B-PREFLIGHT-FLAG`
 (both `1712` and `2458` exercised with `cron.preflight:false` + unready
 skill, asserting the NEW mandatory guard blocks while the optional
-provider probe skips), `B-VIEW-1`, `B-ACT-1` — each driven through the real
+provider probe skips; plus parameterized `cron.preflight:true/false` with
+`_job_fallback_chain` raise → blocked zero dispatch, valid configured
+fallback → validated then allowed iff all 4 mandatory pass, optional-hint
+omission changes display only), `B-VIEW-1`, `B-ACT-1` — each driven through the real
 entrypoint (`skill_view`/`_serve_plugin_skill`/`_preflight_check_skills`/
 `_preflight_job_config`/`_preflight_or_block`/`_resolve_cron_agent_setup`)
 with real faults (PATH without command, invalid `required_commands`,
@@ -661,6 +668,10 @@ satisfies nothing):**
   BOTH `1712` and `2458` with `cron.preflight:false`: the NEW mandatory
   guard blocks an unready skill while the optional provider probe skips —
   assert the new helper was called (not an imaginary early hint).
+  Parameterized `cron.preflight:true/false`: `_job_fallback_chain` raise →
+  blocked zero dispatch at both sites; valid configured fallback → validated
+  then allowed iff all 4 mandatory pass; optional-hint omission changes
+  display only, never evaluation or exceptions.
 - **C-BACKEND-IRR-1 — irrelevant-dep + outer-crash tests (zero-write/hooks
   and outer-crash pins untouched).** Browser-use
   PASS with Chromium/`playwright`/`agent-browser` absent (only harness
@@ -830,6 +841,21 @@ satisfies nothing):**
   backend-native bounded reaped, unrelated deps ignored, no version-pass in
   any paragraph/row (§7 + §§8–9 + SPEC-CONSISTENCY-1); zero-write/hooks and
   outer-crash pins untouched. It neither closes nor supersedes PR1.
+- Verdict on rev5 (`b1514de3`): accepted ALL other final-rev4 clusters;
+  SINGLE blocker B-PREFLIGHT-FLAG ambiguous fallback-chain `None` `:92-95`
+  (includes `:94-95` exception mandatory).
+- This rev6 (same branch/file, no runtime changes) fixes EXACTLY that single
+  blocker narrowly without whole-file rewrite: disjoint
+  `_job_fallback_chain` policy — evaluation ALWAYS mandatory, `:92-93`
+  valid chain-present requires mandatory validation of fallback-provider
+  readiness (not blanket `return None`), `:94-95` probe exception/error →
+  blocked per B-CRON-1 regardless of `cron.preflight`, optional hint
+  suppresses only informational display after successful validation (never
+  skips evaluation or exceptions); acceptance is parameterized
+  `cron.preflight:true/false` with `_job_fallback_chain` raise → blocked
+  zero dispatch, valid configured fallback → validated then allowed iff all
+  4 mandatory pass, optional-hint omission changes display only (§6 + §8).
+  It neither closes nor supersedes PR1.
 - Next (separate, after design sign-off): implementation branch + §§6–8 tests
   + fresh rereview. Mutation authority stays **nonexistent** until that review
   explicitly grants it — this file does not pre-grant it.
