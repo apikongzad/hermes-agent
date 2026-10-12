@@ -17897,8 +17897,9 @@ ipcMain.handle('hermes:selectPaths', async (_event, options: any = {}) => {
   return result.filePaths
 })
 
-ipcMain.handle('hermes:writeClipboard', (_event, text) => {
-  clipboard.writeText(String(text || ''))
+// Electron 44: clipboard.writeText is async (Promise<void>).
+ipcMain.handle('hermes:writeClipboard', async (_event, text) => {
+  await clipboard.writeText(String(text || ''))
 
   return true
 })
@@ -17923,6 +17924,8 @@ ipcMain.handle('hermes:selectSavePath', async (_event, options: any = {}) => {
 // navigator.clipboard.readText() throws "Document is not focused" whenever a
 // portaled overlay has focus, and there's no way to route a read through the
 // canvas. The main process has no such gate.
+// Electron 44: clipboard.readText is async (Promise<string>); ipcMain.handle
+// forwards the promise to the renderer, which already awaits it.
 ipcMain.handle('hermes:readClipboard', () => clipboard.readText())
 
 ipcMain.handle('hermes:saveGatewayFile', (_event, payload) => saveGatewayFile(payload))
@@ -18009,11 +18012,27 @@ ipcMain.handle('hermes:savePastedText', async (_event, payload) => {
   return writeComposerPaste(HERMES_HOME, text)
 })
 
+// Electron 44 removed the sync clipboard.readImage()/NativeImage path: read
+// image bytes via the async W3C-style clipboard.read() ClipboardItems.
 ipcMain.handle('hermes:saveClipboardImage', async () => {
-  const image = clipboard.readImage()
+  try {
+    for (const item of await clipboard.read()) {
+      for (const type of item.types) {
+        if (type.toLowerCase() === 'image/png' || type.toLowerCase().startsWith('image/')) {
+          const blob = await item.getType(type)
 
-  if (image && !image.isEmpty()) {
-    return writeComposerImage(image.toPNG(), '.png')
+          if (blob instanceof Blob) {
+            const png = Buffer.from(await blob.arrayBuffer())
+
+            if (png.length > 0) {
+              return writeComposerImage(png, '.png')
+            }
+          }
+        }
+      }
+    }
+  } catch {
+    // Fall through to the WSL fallback / empty below.
   }
 
   // WSL2/WSLg doesn't bridge clipboard *images* from the Windows host to the
