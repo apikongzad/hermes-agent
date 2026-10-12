@@ -252,22 +252,59 @@ def _parse_probe_result_event(stdout_text: str):
     return _res
 
 
+def _agent_browser_session_env(owned: str):
+    """Sanitized subprocess env for owned isolated session.
+
+    Contract pinned against installed agent-browser 0.26.0 ``--help``:
+    ``--session <name>`` is the isolated session (``AGENT_BROWSER_SESSION`` env,
+    default ``"default"``); ``--session-name`` is auto-save/restore of cookies
+    and localStorage (``AGENT_BROWSER_SESSION_NAME`` env) and is NOT isolation.
+    Every open/eval/close carries explicit ``--session <owned>`` argv AND
+    ``AGENT_BROWSER_SESSION=<owned>`` here, with ``AGENT_BROWSER_SESSION_NAME``
+    stripped so the probe never reads/writes autosave state.
+    """
+    import os as _os3
+    env = dict(_os3.environ)
+    env["AGENT_BROWSER_SESSION"] = owned
+    env.pop("AGENT_BROWSER_SESSION_NAME", None)
+    return env
+
+
+def _agent_browser_cmd(binary: str, owned: str, *rest: str) -> list:
+    """Argv builder: isolated ``--session <owned>`` always, never default.
+
+    Real 0.26.0 semantics enforced by RED fakes: ``--session-name`` is rejected
+    (autosave, not isolation), bare ``close`` (implicit default) is rejected,
+    ``--all`` (close every session) is never emitted. ``owned`` is always
+    ``doctor-live-<pid>-<hex>``, never ``""``/``"default"``.
+    """
+    if not owned or owned == "default" or not owned.startswith("doctor-live-"):
+        raise ValueError(f"refusing non-owned agent-browser session {owned!r}")
+    cmd = [binary, "--session", owned, *rest]
+    if "--session-name" in cmd or "--all" in cmd:
+        raise ValueError("forbidden agent-browser flag (session-name/--all)")
+    return cmd
+
+
 def _agent_browser_after_open(binary: str, owned: str, set_js: str, derive_js: str,
                               expected: str, t: float) -> tuple:
     """Entire after-open state: set + derive/read, owned close on ALL paths.
 
-    try/finally guarantees ``close`` runs for every failure mode (nonzero,
-    timeout, exception, mismatch). Bounded cleanup (min(t,5s)); cleanup
-    failure FAILs even when derived matched. Returns (ok, exit_or_close, detail).
+    try/finally guarantees ``close --session <owned>`` runs for every failure
+    mode (nonzero, timeout, exception, mismatch). Bounded cleanup (min(t,5s));
+    cleanup failure FAILs even when derived matched. Returns (ok, exit_or_close, detail).
+    Isolation per agent-browser 0.26.0: ``--session``/``AGENT_BROWSER_SESSION``,
+    never ``--session-name`` (autosave). Close is never bare/default, never --all.
     """
     import subprocess as _sp2
     _close_ok = True
     _probe_ok = False
     _probe_exit = 0
+    _senv = _agent_browser_session_env(owned)
     try:
         try:
             sproc = _run_bounded(
-                [binary, "--session-name", owned, "eval", set_js], timeout=t)
+                _agent_browser_cmd(binary, owned, "eval", set_js), timeout=t, env=_senv)
             if sproc.returncode != 0:
                 _probe_exit = sproc.returncode
                 return (False, _probe_exit, f"agent-browser set-challenge exited {sproc.returncode} (fail-closed)")
@@ -277,7 +314,7 @@ def _agent_browser_after_open(binary: str, owned: str, set_js: str, derive_js: s
             return (False, -1, f"agent-browser set-challenge failed: {exc} (fail-closed)")
         try:
             eproc = _run_bounded(
-                [binary, "--session-name", owned, "eval", derive_js], timeout=t)
+                _agent_browser_cmd(binary, owned, "eval", derive_js), timeout=t, env=_senv)
             eout = ((eproc.stdout or "") + (eproc.stderr or ""))[:4000]
             if eproc.returncode == 0 and eout.strip() == expected:
                 _probe_ok = True
@@ -290,7 +327,7 @@ def _agent_browser_after_open(binary: str, owned: str, set_js: str, derive_js: s
             return (False, -1, f"agent-browser eval failed: {exc} (fail-closed)")
     finally:
         try:
-            cproc = _run_bounded([binary, "--session-name", owned, "close"], timeout=min(t, 5.0))
+            cproc = _run_bounded(_agent_browser_cmd(binary, owned, "close"), timeout=min(t, 5.0), env=_senv)
             if cproc.returncode != 0:
                 _close_ok = False
         except _sp2.TimeoutExpired:
@@ -424,12 +461,15 @@ def _launch_browser_probe(timeout: float) -> tuple:
             return (False, "agent-browser help inspect timed out (fail-closed)")
         except Exception as exc:
             return (False, f"agent-browser help inspect failed: {exc} (fail-closed)")
-        # Real launch via ACTUAL CLI owned session ONLY (no Python-playwright).
+        # Real launch via ACTUAL CLI owned ISOLATED session ONLY (no Python-playwright).
+        # Contract agent-browser 0.26.0: --session/AGENT_BROWSER_SESSION is isolation;
+        # --session-name/AGENT_BROWSER_SESSION_NAME is autosave, never a substitute.
         # Challenge/derived: set challenge via one eval, derive distinct answer
         # in-browser via SEPARATE eval (DOM crypto.subtle SHA-256 over stored
         # challenge), exact match on independently-expected derived. Entire
         # after-open state is within try/finally so owned session closes on ALL
         # failure paths (timeout/exception/nonzero); bounded cleanup failure FAILs.
+        # Close is always --session <owned>, never bare/default, never --all.
         import hashlib as _hashlib2
         import secrets as _secrets2
         challenge = _secrets2.token_hex(16)
@@ -444,9 +484,10 @@ def _launch_browser_probe(timeout: float) -> tuple:
         )
         if expected in _set_js or expected in _derive_js or challenge == expected:
             return (False, "agent-browser oracle construction failed (fail-closed)")
+        _open_env = _agent_browser_session_env(owned)
         # about:blank open (outside owned-session try: no session yet to close).
         try:
-            oproc = _run_bounded([binary, "--session-name", owned, "open", "about:blank"], timeout=t)
+            oproc = _run_bounded(_agent_browser_cmd(binary, owned, "open", "about:blank"), timeout=t, env=_open_env)
             if oproc.returncode != 0:
                 return (False, f"agent-browser open about:blank exited {oproc.returncode} (fail-closed)")
         except subprocess.TimeoutExpired:
