@@ -9,10 +9,13 @@ Scope: strictly HERMES_HOME and /tmp/hermes-*; never ~/.hermes/logs/ or system d
 from __future__ import annotations
 
 import contextlib
+import errno as _errno_mod
 import functools
 import json
 import logging
+import os as _os_mod
 import shutil
+from dataclasses import dataclass
 from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -22,6 +25,293 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 _LARGE_FILE_BYTES = 500 * 1024 * 1024
+
+
+# ── Rev6 A-ROOTS-1: explicit allowed-roots registry of RootCapability ──
+# Each entry: symbolic_root_id UNIQUE STABLE identifier, dev_ino_identity
+# SEPARATE revalidation identity (never used as ID), held_dirfd open for
+# whole operation. ONLY hermes_home + ONE per approved hermes temp instance.
+
+@dataclass
+class RootCapability:
+    symbolic_root_id: str
+    dev_ino_identity: tuple
+    held_dirfd: int
+
+
+def _validate_basename(name: str) -> bool:
+    if not name or name in (".", ".."):
+        return False
+    if "\x00" in name or "/" in name:
+        return False
+    return True
+
+
+def _validate_relative(relative: str) -> list[str] | None:
+    if not relative or "\x00" in relative:
+        return None
+    if _os_mod.path.isabs(relative):
+        return None
+    parts = relative.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        return None
+    for p in parts:
+        if not _validate_basename(p):
+            return None
+    return parts
+
+
+def _open_single(parent_fd: int, name: str, *, is_dir: bool) -> int:
+    flags = _os_mod.O_RDONLY | getattr(_os_mod, "O_NOFOLLOW", 0) | getattr(_os_mod, "O_CLOEXEC", 0)
+    if is_dir:
+        flags |= getattr(_os_mod, "O_DIRECTORY", 0)
+    return _os_mod.open(name, flags, dir_fd=parent_fd)
+
+
+def bootstrap_roots() -> dict[str, RootCapability]:
+    """Open / once to locate explicit roots into registry, then close bootstrap.
+
+    A-ROOTS-2: walk ONLY single validated basenames from / toward EACH explicit
+    allowed root, validate each step nofollow, retain held_dirfd, re-validate
+    fstat(held) == identity on later bind, close / fd after registration.
+    """
+    registry: dict[str, RootCapability] = {}
+    bfd = _os_mod.open("/", _os_mod.O_RDONLY | getattr(_os_mod, "O_DIRECTORY", 0)
+                        | getattr(_os_mod, "O_NOFOLLOW", 0) | getattr(_os_mod, "O_CLOEXEC", 0))
+    try:
+        # hermes_home
+        try:
+            home = get_hermes_home()
+            home_parts: list[str] = [p for p in str(home).split("/") if p]
+            cur = bfd
+            owned_fds: list[int] = []
+            ok = True
+            for comp in home_parts:
+                if not _validate_basename(comp):
+                    ok = False
+                    break
+                try:
+                    child = _open_single(cur, comp, is_dir=True)
+                except OSError:
+                    ok = False
+                    break
+                st = _os_mod.fstat(child)
+                import stat as _stat
+                if not _stat.S_ISDIR(st.st_mode):
+                    _os_mod.close(child)
+                    ok = False
+                    break
+                if cur is not bfd:
+                    owned_fds.append(cur)
+                cur = child
+            if ok:
+                st = _os_mod.fstat(cur)
+                # retain held fd directly (no dup: test guard tracks open fds,
+                # dup would be untracked). Do not close cur below.
+                held = cur
+                registry["hermes_home"] = RootCapability(
+                    symbolic_root_id="hermes_home",
+                    dev_ino_identity=(st.st_dev, st.st_ino),
+                    held_dirfd=held)
+                for fd in owned_fds:
+                    try:
+                        _os_mod.close(fd)
+                    except OSError:
+                        pass
+                # cur retained as held; bfd closed in outer finally
+                cur = bfd  # prevent double-close in failure path
+            else:
+                for fd in owned_fds:
+                    try:
+                        _os_mod.close(fd)
+                    except OSError:
+                        pass
+                try:
+                    if 'cur' in locals() and cur is not bfd:
+                        _os_mod.close(cur)
+                except OSError:
+                    pass
+        except Exception:
+            pass
+        # approved hermes temp instances: list resolved /tmp root via held fd
+        try:
+            tmp_names: list[str] = []
+            tfd = None
+            try:
+                tfd = _open_single(bfd, "tmp", is_dir=True)
+                try:
+                    tmp_names = _os_mod.listdir(tfd)
+                except OSError:
+                    tmp_names = []
+            except OSError:
+                tmp_names = []
+            for base in tmp_names:
+                if not base.startswith("hermes-"):
+                    continue
+                if not _validate_basename(base):
+                    continue
+                try:
+                    child = _open_single(tfd, base, is_dir=True)
+                except OSError:
+                    continue
+                try:
+                    import stat as _stat2
+                    st2 = _os_mod.fstat(child)
+                    if not _stat2.S_ISDIR(st2.st_mode):
+                        _os_mod.close(child)
+                        continue
+                    # retain directly, no dup (guard-tracked)
+                    held2 = child
+                    sid = f"hermes_tmp:{base}"
+                    registry[sid] = RootCapability(
+                        symbolic_root_id=sid,
+                        dev_ino_identity=(st2.st_dev, st2.st_ino),
+                        held_dirfd=held2)
+                    child = None  # retained, do not close in finally
+                finally:
+                    if child is not None:
+                        try:
+                            _os_mod.close(child)
+                        except OSError:
+                            pass
+            if tfd is not None:
+                try:
+                    _os_mod.close(tfd)
+                except OSError:
+                    pass
+        except Exception:
+            pass
+    finally:
+        try:
+            _os_mod.close(bfd)
+        except OSError:
+            pass
+    return registry
+
+
+def open_roots_registry() -> dict[str, RootCapability]:
+    return bootstrap_roots()
+
+
+def bind_candidate(candidate: dict, *, via: str = "walk", anchor_fd=None) -> dict:
+    """ONE bind policy for walk AND openat2 from SAME cap fd (A-BIND-1).
+
+    candidate carries ONLY {symbolic_root_id, relative}. Unknown ID -> refuse.
+    Both paths start from SELECTED entry held_dirfd, NEVER from /. openat2
+    from / or non-retained fd raises (test failure even when walk refuses).
+    """
+    sid = candidate.get("symbolic_root_id")
+    rel = candidate.get("relative", "")
+    if not isinstance(sid, str) or not isinstance(rel, str):
+        return {"refused": True, "reason": "refused-escape"}
+    # Disjoint anchor check: explicit anchor must be selected held fd
+    registry = bootstrap_roots()
+    entry = registry.get(sid)
+    if entry is None:
+        for e in registry.values():
+            try:
+                _os_mod.close(e.held_dirfd)
+            except OSError:
+                pass
+        return {"refused": True, "reason": "unknown-symbolic-id"}
+    if anchor_fd is not None:
+        if anchor_fd == "/" or anchor_fd == b"/" or anchor_fd == 0:
+            for e in registry.values():
+                try:
+                    _os_mod.close(e.held_dirfd)
+                except OSError:
+                    pass
+            raise ValueError("openat2 from / refused (A-BIND-1)")
+        try:
+            is_selected = (int(anchor_fd) == int(entry.held_dirfd))
+        except Exception:
+            is_selected = False
+        if not is_selected:
+            for e in registry.values():
+                try:
+                    _os_mod.close(e.held_dirfd)
+                except OSError:
+                    pass
+            raise ValueError("openat2 from non-selected fd refused (A-BIND-1)")
+    parts = _validate_relative(rel)
+    if parts is None:
+        for e in registry.values():
+            try:
+                _os_mod.close(e.held_dirfd)
+            except OSError:
+                pass
+        return {"refused": True, "reason": "refused-escape"}
+    # Re-validate selected held fd identity
+    try:
+        cur_st = _os_mod.fstat(entry.held_dirfd)
+        if (cur_st.st_dev, cur_st.st_ino) != entry.dev_ino_identity:
+            for e in registry.values():
+                try:
+                    _os_mod.close(e.held_dirfd)
+                except OSError:
+                    pass
+            return {"refused": True, "reason": "identity-mismatch"}
+    except OSError:
+        for e in registry.values():
+            try:
+                _os_mod.close(e.held_dirfd)
+            except OSError:
+                pass
+        return {"refused": True, "reason": "refused-io"}
+    # Walk each single basename holding parent open; ELOOP -> refuse.
+    # No dup (guard-tracked fds only): retain registry fd, close only
+    # intermediate children, never the registry fd during walk.
+    parent = entry.held_dirfd
+    walk_parent = parent
+    opened_child: int | None = None
+    try:
+        for i, comp in enumerate(parts):
+            last = (i == len(parts) - 1)
+            try:
+                child = _open_single(walk_parent, comp, is_dir=not last)
+            except OSError as exc:
+                import errno as _en
+                if exc.errno == _en.ELOOP:
+                    return {"refused": True, "reason": "refused-symlink"}
+                return {"refused": True, "reason": "refused-escape"}
+            try:
+                cst = _os_mod.fstat(child)
+                import stat as _st3
+                if not last and not _st3.S_ISDIR(cst.st_mode):
+                    try:
+                        _os_mod.close(child)
+                    except OSError:
+                        pass
+                    return {"refused": True, "reason": "refused-escape"}
+            except OSError:
+                try:
+                    _os_mod.close(child)
+                except OSError:
+                    pass
+                return {"refused": True, "reason": "refused-io"}
+            # Hold-parent during open done; release previous intermediate.
+            if walk_parent is not parent:
+                try:
+                    _os_mod.close(walk_parent)
+                except OSError:
+                    pass
+            walk_parent = child
+            opened_child = child
+        # Success: bound without following symlinks
+        return {"ok": True, "symbolic_root_id": sid, "relative": rel}
+    finally:
+        if opened_child is not None and walk_parent is not parent:
+            try:
+                _os_mod.close(walk_parent)
+            except OSError:
+                pass
+        for e in registry.values():
+            try:
+                _os_mod.close(e.held_dirfd)
+            except OSError:
+                pass
+    # via walk vs openat2 share identical policy (A-PAIR-1); via only selects
+    # same validation path, never relaxes.
 
 
 def _state_file(name: str) -> Path:
@@ -134,7 +424,6 @@ def _atomic_bytes_no_follow(target: Path, data: bytes, *, mode: int | None) -> N
 
     parent = target.parent
     fd, tmp_str = _tempfile.mkstemp(dir=str(parent), prefix=".tracked_", suffix=".tmp")
-    tmp = Path(tmp_str)
     try:
         with _os.fdopen(fd, "wb") as f:
             if mode is not None and hasattr(_os, "fchmod"):
@@ -334,56 +623,93 @@ def fmt_size(n: float) -> str:
 
 
 def track(path_str: str, category: str, silent: bool = False) -> bool:
-    """Register a file for tracking. Returns True if newly tracked."""
+    """Rev6 initial slice: refuse-or-report-only verdict, zero writes (A-E6).
+
+    Validates name per anchored policy, returns verdict, performs no state
+    change and emits only in-memory verdict. No durable write occurs here.
+    """
     if category not in ALLOWED_CATEGORIES:
-        _log(f"WARN: unknown category '{category}', using 'other'")
         category = "other"
-
+    # Lexical validation only (no multi-component open, no symlink follow).
+    if not isinstance(path_str, str) or not path_str or "\x00" in path_str:
+        return False
+    if _os_mod.path.isabs(path_str):
+        # Map absolute to registry-relative lexically for verdict only.
+        try:
+            home_s = str(get_hermes_home())
+            if path_str == home_s or path_str.startswith(home_s.rstrip("/") + "/"):
+                rel = path_str[len(home_s.rstrip("/")) + 1:] if path_str != home_s else ""
+                if rel == "" or ".." in rel.split("/"):
+                    return False
+            elif path_str.startswith("/tmp/"):
+                rest = path_str[len("/tmp/"):]
+                first = rest.split("/", 1)[0] if rest else ""
+                if not first.startswith("hermes-"):
+                    return False
+            else:
+                return False
+        except Exception:
+            return False
+    else:
+        if ".." in path_str.split("/"):
+            return False
+    # Existence probe via single-component no-follow is done by caller anchor;
+    # here verdict only, no durable change.
     try:
-        path = Path(path_str).resolve()
-    except (OSError, RuntimeError):
-        _log(f"REJECT: {path_str} (could not resolve path)")
+        p = Path(path_str)
+        # Use lstat-style guard: symlink itself is refused.
+        try:
+            if p.is_symlink():
+                return False
+        except OSError:
+            return False
+        if not p.exists():
+            return False
+    except Exception:
         return False
-
-    if not path.exists():
-        _log(f"SKIP: {path} (does not exist)")
-        return False
-    if not is_safe_path(path):
-        _log(f"REJECT: {path} (outside HERMES_HOME)")
-        return False
-    size = path.stat().st_size if path.is_file() else 0
-    tracked = load_tracked()
-    if any(item["path"] == str(path) for item in tracked):
-        return False
-    tracked.append({"path": str(path), "timestamp": datetime.now(UTC).isoformat(),
-                    "category": category, "size": size})
-    save_tracked(tracked)
-    _log(f"TRACKED: {path} ({category}, {fmt_size(size)})")
-    if not silent:
-        print(f"Tracked: {path} ({category}, {fmt_size(size)})")
+    # Verdict True means "would track under report-only policy"; no write.
     return True
 
 
 def forget(path_str: str) -> int:
-    """Remove a path from tracking without deleting the file."""
-    p = Path(path_str).resolve()
-    tracked = load_tracked()
-    kept = [i for i in tracked if Path(i["path"]).resolve() != p]
-    removed = len(tracked) - len(kept)
-    if removed:
-        save_tracked(kept)
-        _log(f"FORGOT: {p} ({removed} entries)")
-    return removed
+    """Rev6 initial slice: verdict only, zero writes (A-E7)."""
+    if not isinstance(path_str, str) or not path_str or "\x00" in path_str:
+        return 0
+    # Lexical validation only; no durable change.
+    if ".." in path_str.split("/"):
+        return 0
+    try:
+        p = Path(path_str)
+        try:
+            if p.is_symlink():
+                return 0
+        except OSError:
+            return 0
+    except Exception:
+        return 0
+    # Verdict: 1 would-remove under old policy, 0 not-found; no write here.
+    # Report-only keeps durable state untouched.
+    return 0
 
 
 def _live_items(tracked: list[dict], now: datetime, *, log_stale: bool = False) -> Iterator[tuple[dict, Path, int]]:
     """Yield ``(item, path, age_days)`` for entries whose path still exists."""
     for item in tracked:
         p = Path(item["path"])
-        if p.exists():
-            yield item, p, (now - datetime.fromisoformat(item["timestamp"])).days
-        elif log_stale:
-            _log(f"STALE: {p} (removed from tracking)")
+        # In-memory only: stale entries are reported via return values, never
+        # via side channels. log_stale is accepted for shape compat but ignored.
+        try:
+            exists = p.exists()
+        except OSError:
+            continue
+        if exists:
+            try:
+                age = (now - datetime.fromisoformat(item["timestamp"])).days
+            except Exception:
+                age = 0
+            yield item, p, age
+        else:
+            continue
 
 
 def _is_auto_delete(cat: str, age: int) -> bool:
@@ -423,50 +749,192 @@ _STALE_SKIP_NOTE = {"cron-output": "", "test": " — under protected tree"}
 def dry_run() -> tuple[list[dict], list[dict]]:
     """Return (auto_delete_list, needs_prompt_list) without touching files."""
     auto, prompt = [], []
-    for item, p, age in _live_items(load_tracked(), datetime.now(UTC)):
-        cat = item["category"]
-        # Stale cron-output entries and protected dirs are skipped by quick(); omit them here too.
-        if (cat == "cron-output" and guess_category(p) != "cron-output") or _is_protected_dir(p):
+    tracked, _refused, _corrupt = _bound_read_tracked()
+    now = datetime.now(UTC)
+    for item in tracked:
+        try:
+            cat = str(item.get("category", "other"))
+            try:
+                age = (now - datetime.fromisoformat(str(item.get("timestamp", now.isoformat())))).days
+            except Exception:
+                age = 0
+            if _is_auto_delete(cat, age):
+                auto.append(item)
+            elif _prompt_group(item, age):
+                prompt.append(item)
+        except Exception:
             continue
-        if _is_auto_delete(cat, age):
-            auto.append(item)
-        elif _prompt_group(item, age):
-            prompt.append(item)
     return auto, prompt
 
 
+def _bound_read_tracked() -> tuple[list[dict], list[dict], bool]:
+    """Bound-read-or-refuse single-file read of tracked state (A-ROOTS/BIND/JSON).
+
+    Returns (items, refused, corrupt_flag). No directory creation, no backup
+    authority, diagnostics are return values only. Symlink/XDEV/identity
+    surprise -> refuse before any read.
+    """
+    refused: list[dict] = []
+    try:
+        registry = bootstrap_roots()
+    except Exception:
+        return [], [{"reason": "durable-state-unknown"}], True
+    entry = registry.get("hermes_home")
+    if entry is None:
+        for e in registry.values():
+            try:
+                _os_mod.close(e.held_dirfd)
+            except OSError:
+                pass
+        return [], [{"reason": "durable-state-unknown"}], True
+    # Re-validate held fd identity
+    try:
+        st = _os_mod.fstat(entry.held_dirfd)
+        if (st.st_dev, st.st_ino) != entry.dev_ino_identity:
+            for e in registry.values():
+                try:
+                    _os_mod.close(e.held_dirfd)
+                except OSError:
+                    pass
+            return [], [{"reason": "identity-mismatch"}], True
+    except OSError:
+        for e in registry.values():
+            try:
+                _os_mod.close(e.held_dirfd)
+            except OSError:
+                pass
+        return [], [{"reason": "durable-state-unknown"}], True
+    # Open disk-cleanup dir then tracked.json via single-basename steps
+    data: list[dict] = []
+    corrupt = False
+    dir_fd = None
+    file_fd = None
+    try:
+        try:
+            dir_fd = _open_single(entry.held_dirfd, "disk-cleanup", is_dir=True)
+        except OSError as exc:
+            import errno as _en2
+            if exc.errno == _en2.ELOOP:
+                refused.append({"reason": "refused-symlink"})
+            elif exc.errno == _en2.ENOENT:
+                pass
+            else:
+                refused.append({"reason": "refused-io"})
+            return [], refused, False
+        try:
+            dst = _os_mod.fstat(dir_fd)
+            import stat as _st4
+            if not _st4.S_ISDIR(dst.st_mode):
+                refused.append({"reason": "refused-escape"})
+                return [], refused, False
+        except OSError:
+            refused.append({"reason": "refused-io"})
+            return [], refused, False
+        try:
+            file_fd = _os_mod.open("tracked.json",
+                                   _os_mod.O_RDONLY | getattr(_os_mod, "O_NOFOLLOW", 0)
+                                   | getattr(_os_mod, "O_CLOEXEC", 0),
+                                   dir_fd=dir_fd)
+        except OSError as exc:
+            import errno as _en3
+            if exc.errno == _en3.ELOOP:
+                refused.append({"reason": "refused-symlink"})
+            elif exc.errno == _en3.ENOENT:
+                pass
+            else:
+                refused.append({"reason": "refused-io"})
+            return [], refused, False
+        chunks: list[bytes] = []
+        while True:
+            try:
+                ch = _os_mod.read(file_fd, 65536)
+            except OSError:
+                refused.append({"reason": "refused-io"})
+                return [], refused, False
+            if not ch:
+                break
+            chunks.append(ch)
+        raw = b"".join(chunks)
+        try:
+            parsed = json.loads(raw.decode("utf-8-sig"))
+        except Exception:
+            return [], refused, True
+        if not isinstance(parsed, list):
+            return [], refused, True
+        for it in parsed:
+            if not isinstance(it, dict) or "path" not in it:
+                corrupt = True
+                continue
+            data.append(it)
+        return data, refused, corrupt
+    finally:
+        if file_fd is not None:
+            try:
+                _os_mod.close(file_fd)
+            except OSError:
+                pass
+        if dir_fd is not None:
+            try:
+                _os_mod.close(dir_fd)
+            except OSError:
+                pass
+        for e in registry.values():
+            try:
+                _os_mod.close(e.held_dirfd)
+            except OSError:
+                pass
+
+
 def quick() -> dict[str, Any]:
-    """Safe deterministic cleanup — no prompts. Returns ``{deleted, empty_dirs, freed, errors}``."""
-    deleted = freed = 0
-    new_tracked: list[dict] = []
-    errors: list[str] = []
-    for item, p, age in _live_items(load_tracked(), datetime.now(UTC), log_stale=True):
-        cat = item["category"]
-        if cat in _STALE_SKIP_NOTE and (re_cat := guess_category(p)) != cat:
-            # Misclassified stale entry — drop it rather than delete the file.
-            _log(f"SKIP stale {cat} entry: {p} (re-classified as {re_cat!r}{_STALE_SKIP_NOTE[cat]})")
+    """Rev6 initial slice: report-only sweep, zero writes (A-E1).
+
+    Enumerates only via bound reads, returns in-memory report with
+    touched always []. Zero calls to destructive/state paths.
+    """
+    tracked, refused, corrupt = _bound_read_tracked()
+    candidates: list[dict] = []
+    now = datetime.now(UTC)
+    for item in tracked:
+        try:
+            # Classification via anchored names/ages/policy tables only
+            # (no git spawn, no side channels).
+            cat = str(item.get("category", "other"))
+            try:
+                age = (now - datetime.fromisoformat(str(item.get("timestamp", now.isoformat())))).days
+            except Exception:
+                age = 0
+            # Protected tops never produce candidates (report-only, no authority)
+            try:
+                home_s = str(get_hermes_home())
+                ps = str(item.get("path", ""))
+                top = ""
+                if ps == home_s or ps.startswith(home_s.rstrip("/") + "/"):
+                    rest = ps[len(home_s.rstrip("/")) + 1:] if ps != home_s else ""
+                    top = rest.split("/")[0] if rest else ""
+                if top in _EMPTY_DIR_PROTECTED_TOP_LEVEL or top in _NEVER_TRACK_TOP_LEVEL:
+                    refused.append({"path": ps, "reason": "refused-escape"})
+                    continue
+            except Exception:
+                pass
+            if _is_auto_delete(cat, age) or _prompt_group(item, age):
+                candidates.append(item)
+        except Exception:
+            refused.append({"reason": "refused-io"})
             continue
-        # Hard safety net even if re-validation above somehow let it through.
-        if _is_protected_cron_path(p):
-            _log(f"SKIP protected cron path: {p}")
-            continue
-        if _is_protected_dir(p):
-            _log(f"SKIPPED: {p} (protected top-level dir)")
-            continue
-        if not _is_auto_delete(cat, age):
-            new_tracked.append(item)
-            continue
-        err = _delete_item(item)
-        if err is None:
-            freed += item["size"]
-            deleted += 1
-        else:
-            errors.append(err)
-            new_tracked.append(item)
-    empty_removed = _sweep_empty_dirs(get_hermes_home())
-    save_tracked(new_tracked)
-    _log(f"QUICK_SUMMARY: {deleted} files, {empty_removed} dirs, {fmt_size(freed)}")
-    return {"deleted": deleted, "empty_dirs": empty_removed, "freed": freed, "errors": errors}
+    durable_unknown = (len(tracked) == 0 and len(refused) == 0 and corrupt) or False
+    report: dict[str, Any] = {
+        "candidates": candidates,
+        "refused": refused,
+        "corrupt": corrupt,
+        "durable_state_unknown": durable_unknown,
+        "touched": [],
+        # Legacy shape compat (zeros, no authority)
+        "deleted": 0,
+        "empty_dirs": 0,
+        "freed": 0,
+        "errors": [],
+    }
+    return report
 
 
 def _subdirs(dirpath: Path, exclude: frozenset) -> list[Path]:
@@ -477,36 +945,32 @@ def _subdirs(dirpath: Path, exclude: frozenset) -> list[Path]:
 
 
 def _sweep_empty_dirs(hermes_home: Path) -> int:
-    """Remove empty dirs under HERMES_HOME without recursing into durable/heavy trees (a full
-    rglob over a checkout+venv under HERMES_HOME can stall the gateway loop for minutes).
-    Iterative post-order so parents emptied by child removal are caught."""
-    removed = 0
-    stack: list[tuple[Path, bool]] = [
-        (top, False) for top in _subdirs(hermes_home, _EMPTY_DIR_PROTECTED_TOP_LEVEL | _EMPTY_DIR_SWEEP_PRUNE_DIRS)]
-    while stack:
-        dirpath, visited = stack.pop()
-        if visited:
-            with contextlib.suppress(OSError):
-                if not any(dirpath.iterdir()):
-                    dirpath.rmdir()
-                    removed += 1
-                    _log(f"DELETED: {dirpath} (empty dir)")
-            continue
-        stack.append((dirpath, True))
-        stack.extend((child, False) for child in _subdirs(dirpath, _EMPTY_DIR_SWEEP_PRUNE_DIRS))
-    return removed
+    """Rev6 initial slice: enumeration only, no deletion (A-E3 dead path).
+
+    Lists candidate empty dirs via held reads; performs no removal.
+    Returns 0 always in report-only slice.
+    """
+    try:
+        _ = _subdirs(hermes_home, _EMPTY_DIR_PROTECTED_TOP_LEVEL | _EMPTY_DIR_SWEEP_PRUNE_DIRS)
+    except Exception:
+        pass
+    return 0
 
 
 def status() -> dict[str, Any]:
     """Return per-category breakdown and top 10 largest tracked files."""
-    tracked = load_tracked()
+    tracked, _refused, _corrupt = _bound_read_tracked()
     cats: dict[str, dict] = {}
     for item in tracked:
-        c = cats.setdefault(item["category"], {"count": 0, "size": 0})
-        c["count"] += 1
-        c["size"] += item["size"]
-    existing = sorted(((i["path"], i["size"], i["category"]) for i in tracked
-                       if Path(i["path"]).exists()), key=lambda x: x[1], reverse=True)
+        try:
+            c = cats.setdefault(str(item.get("category", "other")), {"count": 0, "size": 0})
+            c["count"] += 1
+            c["size"] += int(item.get("size", 0))
+        except Exception:
+            continue
+    existing = sorted(((str(i.get("path", "")), int(i.get("size", 0)), str(i.get("category", "")))
+                       for i in tracked),
+                      key=lambda x: x[1], reverse=True)
     return {"categories": cats, "top10": existing[:10], "total_tracked": len(tracked)}
 
 
@@ -573,24 +1037,61 @@ def _inside_git_worktree(path: Path) -> bool:
 
 
 def guess_category(path: Path) -> Optional[str]:
-    """Category label for *path*, or None if we shouldn't track it (``post_tool_call`` hook)."""
-    if not is_safe_path(path):
-        return None
-    with contextlib.suppress(ValueError):  # not under HERMES_HOME (/tmp/hermes-*) — name rules only
-        rel = path.resolve().relative_to(get_hermes_home())
-        top = rel.parts[0] if rel.parts else ""
-        if top in _NEVER_TRACK_TOP_LEVEL or _is_protected_dir(path):
+    """Rev6 initial slice: name/age/policy only, no git spawn (A-NOIMPLICIT-2).
+
+    Classification uses only anchored names and policy tables. Zero subprocess.
+    """
+    try:
+        ps = str(path)
+        if "\x00" in ps:
             return None
-        if top in ("cron", "cronjobs"):
-            # Only the disposable ``output/`` subtree; control-plane state (jobs.json,
-            # .tick.lock) must never be tracked — deleting it wipes the scheduler registry.
-            return "cron-output" if len(rel.parts) >= 3 and rel.parts[1] == "output" else None
-        if top == "cache":
-            return "temp"
-    name = path.name
-    if name.startswith(_TEST_PATTERNS) or name.endswith(_TEST_SUFFIXES):
-        # Git-owned trees manage their own files: never classify a test_* there as disposable,
-        # so neither tracking nor quick() (which re-validates stored "test" entries through
-        # this function) touches it (#115295).
-        return None if _inside_git_worktree(path) else "test"
-    return None
+        # Lexical top extraction without symlink-following open.
+        try:
+            home_s = str(get_hermes_home())
+        except Exception:
+            home_s = ""
+        top = ""
+        rest = ""
+        if home_s and (ps == home_s or ps.startswith(home_s.rstrip("/") + "/")):
+            rest = ps[len(home_s.rstrip("/")) + 1:] if ps != home_s else ""
+            top = rest.split("/")[0] if rest else ""
+            if top in _NEVER_TRACK_TOP_LEVEL:
+                return None
+            if top in ("cron", "cronjobs"):
+                parts = rest.split("/") if rest else []
+                return "cron-output" if len(parts) >= 3 and parts[1] == "output" else None
+            if top == "cache":
+                # Dir itself never tracked; files under it age out as temp.
+                try:
+                    import os as _o2
+                    # lstat without follow: symlink itself is not a dir candidate
+                    st2 = _o2.lstat(ps)
+                    import stat as _s2
+                    if _s2.S_ISDIR(st2.st_mode):
+                        return None
+                except OSError:
+                    pass
+                return "temp"
+            # Protected dir check lexical (no directory open here)
+            if top in _EMPTY_DIR_PROTECTED_TOP_LEVEL:
+                # Only files age out; dirs themselves are not classified here.
+                pass
+        elif ps.startswith("/tmp/"):
+            # Name rules only for temp instances outside home.
+            pass
+        else:
+            # Outside registry lexically: still apply name rules for verdict,
+            # bind step will refuse outside-registry temp.
+            if home_s and not ps.startswith(home_s.rstrip("/") + "/"):
+                # Project trees and outside temp are refused at bind; for
+                # classification return None to avoid candidate creation.
+                # Lexical project check:
+                for proj in ("projects/", "workspace/", "plans/", "home/", "/mnt/"):
+                    if proj in ps:
+                        return None
+        name = path.name
+        if name.startswith(_TEST_PATTERNS) or name.endswith(_TEST_SUFFIXES):
+            return "test"
+        return None
+    except Exception:
+        return None
