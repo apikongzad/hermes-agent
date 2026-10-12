@@ -57,12 +57,16 @@ function runGh(args, cwd, ghBin): Promise<{ ok: boolean; stdout: string; stderr:
 }
 
 // Guarded env keys simple-git v4 strips or rejects unless allowlisted. Mirrors
-// `@simple-git/argv-parser` GitEnvKeys plus the `git` prefix rule: every
-// `GIT_*` key plus known-vulnerable non-prefixed keys such as EDITOR / VISUAL /
-// PAGER. Host values for these are never renderer input; the Windows no-console
-// path forwards only the additions it needs (HERMES_GIT_ARGV0 is unguarded,
-// GIT_TERMINAL_PROMPT is allowlisted) so arbitrary host GIT_*/EDITOR values
-// cannot turn an explicit `.env()` into an allowEnvironment throw.
+// `@simple-git/argv-parser` GitEnvKeys plus the `GIT_` prefix rule: every
+// `GIT_*` key (exact `GIT_` prefix, not a bare `git` prefix) plus
+// known-vulnerable non-prefixed keys such as EDITOR / VISUAL / PAGER. A bare
+// `startsWith('git')` wrongly strips `GITHUB_TOKEN`/`GH_TOKEN` (`github_*`
+// starts with `git`), which are not git config keys and must be forwarded.
+// Host values for guarded keys are never renderer input; the Windows
+// no-console path forwards only the additions it needs (HERMES_GIT_ARGV0 is
+// unguarded, GIT_TERMINAL_PROMPT is allowlisted) so arbitrary host
+// GIT_*/EDITOR values cannot turn an explicit `.env()` into an
+// allowEnvironment throw.
 const SIMPLE_GIT_GUARDED_ENV = new Set([
   'editor',
   'git_askpass',
@@ -86,10 +90,10 @@ const SIMPLE_GIT_GUARDED_ENV = new Set([
   'visual'
 ])
 
-function isSimpleGitGuardedEnv(key: string): boolean {
+export function isSimpleGitGuardedEnv(key: string): boolean {
   const normalized = key.toLowerCase().trim()
 
-  return normalized.startsWith('git_') || normalized.startsWith('git') || SIMPLE_GIT_GUARDED_ENV.has(normalized)
+  return normalized.startsWith('git_') || SIMPLE_GIT_GUARDED_ENV.has(normalized)
 }
 
 // simple-git v4: an explicit `.env()` replaces the ambient environment for the

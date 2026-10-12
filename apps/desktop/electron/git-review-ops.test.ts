@@ -200,6 +200,81 @@ test('gitFor on the Windows host tuple allowlists only the guarded env it needs'
   }
 })
 
+test('isSimpleGitGuardedEnv uses exact GIT_ prefix, preserving GITHUB_TOKEN', async () => {
+  vi.resetModules()
+
+  try {
+    const { isSimpleGitGuardedEnv } = await import('./git-review-ops')
+
+    // Guarded: every GIT_* plus exact GitEnvKeys non-prefixed.
+    assert.equal(isSimpleGitGuardedEnv('GIT_SSH'), true)
+    assert.equal(isSimpleGitGuardedEnv('git_ssh_command'), true)
+    assert.equal(isSimpleGitGuardedEnv('GIT_DIR'), true)
+    assert.equal(isSimpleGitGuardedEnv('EDITOR'), true)
+    assert.equal(isSimpleGitGuardedEnv('VISUAL'), true)
+    assert.equal(isSimpleGitGuardedEnv('PAGER'), true)
+    // Not guarded: CI/provider tokens that merely start with "git" letters.
+    assert.equal(isSimpleGitGuardedEnv('GITHUB_TOKEN'), false)
+    assert.equal(isSimpleGitGuardedEnv('GH_TOKEN'), false)
+    assert.equal(isSimpleGitGuardedEnv('GITLAB_TOKEN'), false)
+    assert.equal(isSimpleGitGuardedEnv('GITTER'), false)
+  } finally {
+    vi.resetModules()
+  }
+})
+
+test('gitFor on Windows forwards GITHUB_TOKEN while still stripping guarded GIT_*', async () => {
+  const priorGithub = process.env.GITHUB_TOKEN
+  const priorGh = process.env.GH_TOKEN
+  process.env.GITHUB_TOKEN = 'ghp-probe-token'
+  process.env.GH_TOKEN = 'gh-probe-token'
+  process.env.GIT_SSH = '/tmp/evil-ssh'
+
+  vi.resetModules()
+  vi.doMock('./no-console-git', async importOriginal => {
+    const actual = await importOriginal<typeof NoConsoleGit>()
+
+    return {
+      ...actual,
+      windowsGitHost: () => ({
+        isWindows: true,
+        pythonBin: String.raw`C:\Tools\python.exe`,
+        scriptPath: String.raw`C:\Hermes\hermes-no-console-git.py`
+      })
+    }
+  })
+
+  try {
+    const withHost = await import('./git-review-ops')
+
+    const git = withHost.gitFor(process.cwd(), 'git') as unknown as {
+      _executor?: { env?: Record<string, string> }
+    }
+    const env = git._executor?.env as Record<string, string> | undefined
+
+    assert.ok(env)
+    assert.equal(env.GITHUB_TOKEN, 'ghp-probe-token')
+    assert.equal(env.GH_TOKEN, 'gh-probe-token')
+    assert.equal(env.GIT_SSH, undefined)
+  } finally {
+    if (priorGithub === undefined) {
+      delete process.env.GITHUB_TOKEN
+    } else {
+      process.env.GITHUB_TOKEN = priorGithub
+    }
+
+    if (priorGh === undefined) {
+      delete process.env.GH_TOKEN
+    } else {
+      process.env.GH_TOKEN = priorGh
+    }
+
+    delete process.env.GIT_SSH
+    vi.doUnmock('./no-console-git')
+    vi.resetModules()
+  }
+})
+
 test('resolveRenamePath: simple rename resolves to the new path', () => {
   assert.equal(resolveRenamePath('old.ts => new.ts'), 'new.ts')
 })
