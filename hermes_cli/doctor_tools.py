@@ -424,6 +424,13 @@ def _audit_one(npm_bin: str, npm_dir, label: str, audit_extra: list[str], issues
     the finding reappears. The durable remedy in every case is a lockfile bump
     on main (update `package-lock.json` and ship it); the doctor therefore never
     prescribes a local mutating fix command. See #116774.
+
+    Scope notes: the root row uses ``--workspaces=false`` (root build tooling
+    only; the ``apps/*`` Electron/glob is never resolved, see #38772) and the
+    ``web``/``ui-tui`` rows use ``--workspace`` (their hoisted deps resolve via
+    the root ``node_modules``, so the fix lands in the root override/lockfile,
+    not the workspace manifest). The agent-browser runtime itself is a PM-owned
+    native executable with 0 npm deps — ``npm audit`` never covers it.
     """
     import json
     from hermes_constants import with_hermes_node_path
@@ -436,17 +443,25 @@ def _audit_one(npm_bin: str, npm_dir, label: str, audit_extra: list[str], issues
         counts = audit_data.get("metadata", {}).get("vulnerabilities", {})
         critical, high, moderate = (counts.get(k, 0) for k in ("critical", "high", "moderate"))
         total = critical + high + moderate
+        # Root (--workspaces=false) and --workspace rows are all build-time
+        # tooling; only the standalone bridge row (no extra args) audits a
+        # runtime service tree. The old predicate treated the root row as
+        # runtime because it checked only for "--workspace".
+        is_build_tooling = bool(audit_extra)
         workspace_scoped = bool(audit_extra) and audit_extra[0] == "--workspace"
         if total == 0:
             check_ok(f"{label} deps", "(no known vulnerabilities)")
         elif critical > 0 or high > 0:
-            detail = "build-time tooling" if workspace_scoped else "runtime dependency tree"
+            detail = "build-time tooling" if is_build_tooling else "runtime dependency tree"
             remedy = ("fix is an upstream lockfile bump — a local manual fix does not persist"
                       " (the next `hermes update` reinstalls from the committed lockfile)")
             check_warn(f"{label} deps", f"({critical} critical, {high} high, {moderate} moderate — {remedy})")
             if workspace_scoped:
-                check_info("  ^ build-time tooling (not runtime); if manual npm remediation "
-                           "errors with an arborist crash it's a known npm bug — clears via a lockfile bump")
+                check_info("  ^ build-time tooling (hoisted via root node_modules; not runtime); if manual npm remediation "
+                           "errors with an arborist crash it's a known npm bug — clears via a root lockfile/override bump")
+            elif is_build_tooling:
+                check_info("  ^ build-time tooling (root --workspaces=false; agent-browser runtime is native with 0 npm deps — not covered here); "
+                           "report/pin the fix in package-lock.json — see #116774")
             else:
                 check_info(f"  ^ {detail}; report/pin the fix in package-lock.json — see #116774")
             issues.append(f"{label} has {total} npm {_plural(total)}")
@@ -458,11 +473,14 @@ def _audit_one(npm_bin: str, npm_dir, label: str, audit_extra: list[str], issues
 
 @doctor_check()
 def _check_npm_audit(should_fix: bool, f: Finding) -> None:
-    """npm audit per Node package tree (root, web/ui-tui workspaces, WhatsApp bridge).
+    """npm audit per Node package tree (root build tooling, web/ui-tui workspaces, WhatsApp bridge).
 
     PROJECT_ROOT is audited with --workspaces=false so the apps/* glob (Electron, node-pty, ...) is never
-    resolved for a routine check; web and ui-tui via --workspace. The WhatsApp bridge may live under a writable
-    HERMES_HOME mirror rather than the (possibly read-only) Docker install tree, hence the shared resolver.
+    resolved for a routine check; web and ui-tui via --workspace (hoisted via root node_modules).
+    The agent-browser browser runtime is a PM-owned native executable with 0 npm deps, so no npm-audit
+    row covers it — the root row is build tooling, not browser runtime. The WhatsApp bridge may live
+    under a writable HERMES_HOME mirror rather than the (possibly read-only) Docker install tree,
+    hence the shared resolver.
     """
     from hermes_cli.doctor import PROJECT_ROOT
     staged = _pm_tool_path("npm")
@@ -480,7 +498,7 @@ def _check_npm_audit(should_fix: bool, f: Finding) -> None:
         except Exception:
             whatsapp_bridge_dir = PROJECT_ROOT / "scripts" / "whatsapp-bridge"
         for npm_dir, label, audit_extra in (
-            (PROJECT_ROOT, "Browser tools (agent-browser)", ["--workspaces=false"]),
+            (PROJECT_ROOT, "root build tooling (--workspaces=false)", ["--workspaces=false"]),
             (PROJECT_ROOT, "web workspace", ["--workspace", "web"]),
             (PROJECT_ROOT, "ui-tui workspace", ["--workspace", "ui-tui"]),
             (whatsapp_bridge_dir, "WhatsApp bridge", []),
