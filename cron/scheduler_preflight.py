@@ -84,15 +84,53 @@ def _cron_preflight_enabled(cfg: dict) -> bool:
 
 
 def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
-    """READ-ONLY probe: would provider resolution fail for lack of a key? Mirrors run_job's
-    requested-provider computation. Skipped when the job has a fallback chain — auth-fallback may
-    legitimately rescue a missing primary key. A pinned job has none (``_job_fallback_chain``), so
-    its missing key blocks even when the global chain is configured."""
+    """READ-ONLY probe: would provider resolution fail for lack of a key?
+
+    Rev6 disjoint fallback-chain policy (B-PREFLIGHT-FLAG, B-CRON-1/2):
+    - :92-93 valid chain-present requires mandatory validation of
+      fallback-provider readiness (allowed only if all mandatory pass),
+      never blanket return None.
+    - :94-95 probe exception/error -> blocked diagnostic per B-CRON-1
+      regardless of cron.preflight flag.
+    - Optional hint (rate-limited AuthError deferral) may skip; mandatory
+      readiness never skips.
+    """
     try:
-        if _sched._job_fallback_chain(job, cfg):
-            return None
-    except Exception:
-        return None  # fail-open: never block on a preflight-internal error
+        chain = _sched._job_fallback_chain(job, cfg)
+    except Exception as exc:
+        # B-CRON-1 fail-closed: probe error -> blocked, never proceed
+        return f"provider fallback chain probe failed: {exc} (fail-closed)"
+    if chain:
+        # :92-93 valid chain-present: validate fallback-provider readiness,
+        # not blanket None. Allowed only if fallback creds resolve.
+        from hermes_cli.auth import AuthError as _AE2
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider as _rr2
+            for entry in chain:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    _rr2(requested=entry.get("provider"),
+                         target_model=entry.get("model") or job.get("model") or "")
+                except _AE2 as exc2:
+                    from hermes_cli.auth import is_rate_limited_auth_error as _rl2
+                    try:
+                        if _rl2(exc2):
+                            continue
+                    except Exception:
+                        pass
+                    return (
+                        f"provider fallback credential missing: {exc2} "
+                        f"{_credential_store_scope_label()}. "
+                    )
+                except Exception as exc3:
+                    return f"provider fallback probe failed: {exc3} (fail-closed)"
+        except Exception as exc:
+            return f"provider fallback validation failed: {exc} (fail-closed)"
+        # Fallback ready: primary missing may still be rescued, but mandatory
+        # guard at higher level still requires all 4 parts. Return None here
+        # only after successful fallback validation (not blanket).
+        return None
 
     _cron_cfg = cfg.get("cron") if isinstance(cfg.get("cron"), dict) else {}
     requested = (
@@ -108,8 +146,9 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
         resolve_runtime_provider(**kwargs)
     except AuthError as exc:
         if is_rate_limited_auth_error(exc):
-            # Quota/rate-limit is not a missing credential: let the real path report it and hold
-            # the job through the provider's window (cron/quota_hold.py, #89376).
+            # Optional costly non-security hint: quota/rate-limit is not a
+            # missing credential; real path reports it. May skip even with
+            # preflight:false (informational only).
             return None
         return (
             f"provider credential missing: {exc} {_credential_store_scope_label()}. "
@@ -117,8 +156,9 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
             "working provider via `hermes cron edit "
             f"{job.get('id')} --provider <p>`."
         )
-    except Exception:
-        return None  # non-auth errors are not a missing-credential verdict; real path reports them
+    except Exception as exc:
+        # B-CRON-2 fail-closed: non-auth resolve error -> blocked
+        return f"provider resolution failed: {exc} (fail-closed)"
     return None
 
 
@@ -234,11 +274,13 @@ class SharedRouteAdapters:
 
 
 def _preflight_check_delivery(job: dict) -> Optional[str]:
-    """Check delivery targets resolve to configured platforms. ``local``/``origin``/``all`` are
-    never checked (no gateway-config load). Unknown platform always blocks; known platform blocks
-    only if the gateway config loads AND reports it unconnected; config load failures fail OPEN.
-    ``failure_deliver`` gets the same rules — a typo'd failure platform would otherwise only
-    surface when a failure occurs (NS-788)."""
+    """Check delivery targets. Rev6 B-CRON-3 fail-closed (B-READY-1 scope).
+
+    ``local``/``origin``/``all``/bot-chat never checked (no config load).
+    Unknown platform always blocks; known platform blocks when unconnected;
+    gateway-config load failure with known platform in lane -> blocked
+    (fail-closed), never fail-open skip.
+    """
     deliver_value = _delivery._normalize_deliver_value(job.get("deliver", "local"))
     failure_deliver_value = _delivery._normalize_deliver_value(
         _delivery._delivery_lane_value(job, for_failure=True))
@@ -272,11 +314,16 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
                 gateway_config = load_gateway_config()
                 connected = {p.value for p in gateway_config.get_connected_platforms()}
                 connected |= _delivery._relay_fronted_delivery_platforms(connected)
-            except Exception:
+            except Exception as exc:
                 logger.debug(
-                    "preflight: gateway config unavailable — skipping "
-                    "delivery credential check", exc_info=True)
-                return None  # fail-open
+                    "preflight: gateway config unavailable — blocking "
+                    "known-platform lane (fail-closed)", exc_info=True)
+                # B-CRON-3: load failure with known platform -> blocked
+                return (
+                    f"delivery platform '{platform_name}' gateway config "
+                    f"unavailable: {exc} (fail-closed). Configure it via "
+                    "`hermes setup` or change the job's `deliver` target."
+                )
         # Multiplex: a satellite served by the primary's adapters reads unconnected — no block.
         if (
             platform_name.lower() not in connected
@@ -301,8 +348,14 @@ _SKILL_MISSING_FIELDS = (
 
 
 def _preflight_check_skills(job: dict) -> Optional[str]:
-    """Block only on an affirmative ``setup_needed`` verdict from ``skill_view``; skills that fail
-    to load fall through to ``_build_job_prompt``'s skipped-skill handling (fail-open)."""
+    """Rev6 B-CRON-4 + B-READY-1 fail-closed: every non-ready blocks.
+
+    READY iff success True + available + setup_needed False + error absent.
+    Every other combination (setup_needed, unsupported, success False,
+    missing/unknown fields, view exception/unreadable) -> blocked diagnostic
+    via _SKILL_MISSING_FIELDS labels. No fall-through to prompt skip for
+    blocking path.
+    """
     from cron.scheduler_prompt import _job_skill_names
     skill_names = _job_skill_names(job)
     if not skill_names:
@@ -311,22 +364,39 @@ def _preflight_check_skills(job: dict) -> Optional[str]:
     for skill_name in skill_names:
         try:
             payload = json.loads(skill_view(skill_name))
-        except Exception:
-            continue  # unreadable/missing skill → existing skip handling
-        if not isinstance(payload, dict) or not payload.get("success"):
-            continue
-        if payload.get("setup_needed") or payload.get("readiness_status") == "setup_needed":
-            missing = [
-                fmt.format(name)
-                for key, fmt in _SKILL_MISSING_FIELDS
-                for name in payload.get(key) or []
-            ]
-            detail = ", ".join(missing) or "required setup incomplete"
+        except Exception as exc:
             return (
-                f"attached skill '{skill_name}' is not ready: missing "
-                f"{detail}. Provide the missing prerequisites or detach the "
+                f"attached skill '{skill_name}' is not ready: view failed "
+                f"({exc}). Provide the missing prerequisites or detach the "
                 "skill from this job."
             )
+        if not isinstance(payload, dict):
+            return (
+                f"attached skill '{skill_name}' is not ready: unreadable payload. "
+                "Provide the missing prerequisites or detach the skill from this job."
+            )
+        # B-READY-1: only available+success+setup_needed False+error absent is ready
+        is_ready = (
+            payload.get("success") is True
+            and payload.get("readiness_status") == "available"
+            and payload.get("setup_needed") is False
+            and "error" not in payload
+        )
+        if is_ready:
+            continue
+        missing = [
+            fmt.format(name)
+            for key, fmt in _SKILL_MISSING_FIELDS
+            for name in payload.get(key) or []
+        ]
+        detail = ", ".join(missing) or "required setup incomplete"
+        # Include status for unsupported vs setup_needed distinction
+        status = payload.get("readiness_status", "unknown")
+        return (
+            f"attached skill '{skill_name}' is not ready ({status}): missing "
+            f"{detail}. Provide the missing prerequisites or detach the "
+            "skill from this job."
+        )
     return None
 
 
@@ -385,12 +455,9 @@ def _empty_requested_mcp_toolsets(job: dict, cfg: dict) -> Optional[str]:
 
 
 def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
-    """Pre-dispatch validation: return a reason (missing key, unconfigured delivery, unready skill)
-    so the caller refuses BEFORE building agent machinery or burning an LLM call. Every check fails
-    open — preflight blocks only on an affirmative misconfiguration verdict.
+    """Pre-dispatch validation: fail-closed on raise (B-CRON-5).
 
-    Same fail-before-spend spirit as the fail-loud-on-hidden-tools direction in #27948; alert dedup
-    follows the alert-once pattern from the dead-pin auto-pause (#73506).
+    Each check raise -> blocked diagnostic naming the check, never skip.
     """
     for name, check in (
         ("provider_key", lambda: _preflight_check_provider_key(job, cfg)),
@@ -398,9 +465,42 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
         ("delivery", lambda: _preflight_check_delivery(job))):
         try:
             reason = check()
-        except Exception:
-            logger.debug("preflight check %s raised — failing open", name, exc_info=True)
-            continue
+        except Exception as exc:
+            logger.debug("preflight check %s raised — failing closed", name, exc_info=True)
+            return f"preflight check '{name}' failed: {exc} (fail-closed)"
+        if reason:
+            return reason
+    return None
+
+
+def _cron_mandatory_readiness_guard(job: dict, cfg: dict) -> Optional[str]:
+    """NEW mandatory guard: EXACT list, ALWAYS run regardless of flag (B-PREFLIGHT-FLAG).
+
+    MANDATORY PARTS — EXACT list, no vague wording, ALWAYS fail regardless of
+    _cron_preflight_enabled, fail-closed on raise, full policy always fail:
+    (1) skill readiness = _preflight_check_skills full B-READY-1 policy;
+    (2) provider-key readiness = _preflight_check_provider_key AuthError
+        missing-credential verdict -> blocked, PLUS B-CRON-1 fallback-probe
+        error -> blocked and B-CRON-2 non-auth resolve error -> blocked;
+    (3) delivery = _preflight_check_delivery unknown-platform verdict -> blocked
+        AND known-platform loader-fail verdict -> blocked;
+    (4) MCP = _empty_requested_mcp_toolsets full policy (ANY requested server
+        resolving to zero tools -> blocked).
+    cron.preflight:false disables ONLY optional costly non-security hints
+    (rate-limited AuthError deferral, informational display after successful
+    validation). It MUST NOT bypass mandatory readiness and MUST NOT skip
+    probe-error blocks.
+    """
+    for name, check in (
+        ("skills", lambda: _preflight_check_skills(job)),
+        ("provider_key", lambda: _preflight_check_provider_key(job, cfg)),
+        ("delivery", lambda: _preflight_check_delivery(job)),
+        ("mcp", lambda: _empty_requested_mcp_toolsets(job, cfg)),
+    ):
+        try:
+            reason = check()
+        except Exception as exc:
+            return f"mandatory readiness check '{name}' failed: {exc} (fail-closed)"
         if reason:
             return reason
     return None

@@ -442,6 +442,9 @@ def _skill_readiness(frontmatter: dict[str, Any], skill_name: str) -> tuple[dict
             setup_needed = setup_needed or bool(missing_cred_files)
         except Exception:
             logger.debug("Could not register credential files for skill %s", skill_name, exc_info=True)
+            # B-CRED-1 fail-closed: exception -> setup_needed + setup_needed status
+            missing_cred_files = [str(p) for p in required_cred_files_raw if isinstance(p, str) and p] or ["credential-files"]
+            setup_needed = True
     # Declared system commands (ffmpeg, node, ...) — actual PATH discovery,
     # rechecked on every view so an install is visible without a restart.
     required_commands = _get_required_commands(frontmatter)
@@ -614,27 +617,33 @@ def skill_view(
         rendered_content = content if not preprocess else _preprocess_skill(
             content, skill_dir, task_id, "Could not preprocess skill content for %s", skill_name)
         # ── pm tool deps (`deps: [ffmpeg]` frontmatter) ──────────────
-        # Loading the skill IS the activation moment: ensure each declared
-        # pm package now so the skill's commands work when the model runs
-        # them. Failure never blocks the skill content — the note carries
-        # the remedy.
+        # B-VIEW-1 read-only view performs zero setup: no ensure, no download.
+        # Missing deps -> setup_needed verdict + deps_note remedy; install only
+        # via explicit `hermes pm install` + reload.
         deps_note = None
         declared_deps = frontmatter.get("deps") or []
         if isinstance(declared_deps, str):
             declared_deps = [declared_deps]
         if isinstance(declared_deps, list) and declared_deps:
-            failed_deps = []
-            for dep in [str(d).strip() for d in declared_deps if str(d).strip()]:
+            missing_deps = [str(d).strip() for d in declared_deps if str(d).strip()]
+            if missing_deps:
+                # B-PM-1 fail-closed: declared-deps failure also sets setup_needed
+                # + setup_needed status, never success True + available + False.
+                readiness = dict(readiness)
+                readiness["setup_needed"] = True
+                readiness["readiness_status"] = SkillReadinessStatus.SETUP_NEEDED.value
+                # Preserve missing commands for preflight labels when dep provides binary
                 try:
-                    import pm
-
-                    pm.ensure(dep)
-                except Exception as exc:
-                    failed_deps.append(f"{dep}: {exc}")
-            if failed_deps:
+                    prev_missing = list(readiness.get("missing_required_commands") or [])
+                    for dep in missing_deps:
+                        if dep not in prev_missing:
+                            prev_missing.append(dep)
+                    readiness["missing_required_commands"] = prev_missing
+                except Exception:
+                    pass
                 deps_note = (
-                    "Tool dependencies could not be installed — "
-                    + "; ".join(failed_deps)
+                    "Tool dependencies are not installed — "
+                    + "; ".join(missing_deps)
                     + ". Run `hermes pm install "
                     + " ".join(str(d) for d in declared_deps)
                     + "` and reload."
