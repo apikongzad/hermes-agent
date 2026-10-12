@@ -1,11 +1,23 @@
-# DESIGN-FIRST rev3: report-only sweep, zero writes (no runtime change)
+# DESIGN-FIRST rev4: report-only sweep, zero writes (no runtime change)
 
 > **Status: DESIGN ONLY — no runtime implementation in this commit.**
-> Rev3 revises `f1e7b5c7` (rev2) after review returned **NO-GO for generic prose**.
-> Rev2 described authorities and oracles without naming the exact functions,
-> lines, flags, and verdict cells an implementer must change. Rev3 is the
-> implementable contract: every mutation site, anchor step, fail-open line,
-> and oracle cell is enumerated with `file:line` read at rev `f1e7b5c7`.
+> Rev4 revises `6128da1` (rev3) fixing the EXACT remaining contradictions
+> named below, with no scope expansion.
+> Rev3 enumerated entrypoints/lines but left three contradictions:
+> (A) two anchor policies (`/`-anchored walk vs `openat2` from
+> inherited-or-`/` allowing `/`-relative escape to project/`/mnt`/non-`hermes-`
+> temp even when lexically valid); (B) invented `blocked-*` readiness vocabulary
+> plus an imaginary "early-hint vs dispatch-time gates still block" claim with
+> no new helper and no pinned `1712`/`2458` split; (C) a generic 5×6 matrix
+> that judged each backend by the other backend's deps (browser-use by
+> Chromium, agent-browser by Python playwright), allowed `--version` reasoning,
+> and pinned only `_run_one` while leaving `maybe_run_live_checks:326-327`
+> `check_warn` unpinned.
+> Rev4 is the implementable contract: one allowed-root policy for both bind
+> paths (§3), actual `available`/`setup_needed`/`unsupported` enum + ready
+> predicate + new mandatory guard at both dispatch sites (§6), and a
+> backend-specific prerequisite oracle with no version-pass and an explicit
+> `326-327 → check_fail` pin (§7).
 > Per order: **design only, on the design branch, commit docs only, no
 > runtime code or host changes.**
 >
@@ -14,10 +26,10 @@
 >   implementation lands and is re-reviewed. This commit does **not**
 >   supersede, close, or fix PR1.
 > - **Rereviewed commits:** `46ad80b1` (FAILED, HIGH TOCTOU), `8761fcfb`
->   (NO-GO R1–R7), `f1e7b5c7` (**NO-GO**, this revision's basis: generic
->   `--apply`-only framing, unspecified anchor origin, unspecified
->   entrypoints/hooks/slash, hammer-only tests with skip-on-no-tracer,
->   unnamed B/C lines, version-OR-launch oracle, empty matrix).
+>   (NO-GO R1–R7), `f1e7b5c7` (**NO-GO**, generic `--apply`-only framing),
+>   `6128da1` (**NO-GO**, this revision's basis: dual anchor policies,
+>   invented readiness enum + imaginary early-hint, generic 5×6 with
+>   cross-backend deps + version-pass residue + unpinned `326-327`).
 > - **What this commit does:** revises this markdown file only. No `.py`/`.ts`
 >   edits, no test edits, no config/lockfile edits, no `utils` edits, no
 >   commands against live state, no secrets or log dumps.
@@ -55,7 +67,7 @@ items without separate sign-off.
 
 ---
 
-## 1. Why rev2 was NO-GO (each closed by the cited rev3 section, proved by diff+tests+review, never by prose)
+## 1. Why rev2 was NO-GO (each closed by the cited rev3 section and retained in rev4, proved by diff+tests+review, never by prose)
 
 - **R1 — entrypoints unnamed.** Rev2 said "sweep" and a nonexistent
   `--apply` flag. It never enumerated `quick`, `_delete_item`,
@@ -87,16 +99,16 @@ items without separate sign-off.
 
 ---
 
-## 2. Design A: exact mutation entrypoints and required rev3 wiring
+## 2. Design A: exact mutation entrypoints and required rev4 wiring
 
-All paths read at `f1e7b5c7`. The initial slice wires **every** row to
+All paths read at `6128da1`. The initial slice wires **every** row to
 refusal/report-only. Leaving any row live fails review. There is **no**
 `--apply`/`--force`/`--delete`/`--commit` flag in
 `plugins/disk-cleanup/disk_cleanup.py` (596 lines) or
 `plugins/disk-cleanup/__init__.py` (236 lines) — acceptance MUST exercise the
 real rows below, never an invented flag.
 
-| ID | Entrypoint (file:line) | Current mutation (must be removed/disabled in initial slice) | Rev3 wiring |
+| ID | Entrypoint (file:line) | Current mutation (must be removed/disabled in initial slice) | Rev4 wiring |
 |---|---|---|---|
 | A-E1 | `disk_cleanup.py:438-469` `quick()` | calls `_delete_item` (459), `_sweep_empty_dirs` (466), `save_tracked` (467), `_log` (447,451,454,468) | enumerate only via §3 bound reads; return in-memory `{candidates, refused, corrupt, durable_state_unknown, touched: []}`; zero calls to E2–E7; `touched` always `[]` |
 | A-E2 | `disk_cleanup.py:403-415` `_delete_item(item)` | `p.unlink()` (408), `shutil.rmtree(p)` (410), `_log` (412,414) | MUST NOT be reachable from `quick`, hooks, or slash in initial slice; any reachable `unlink`/`rmtree` fails §9; keep function only if dead or deleted — never called |
@@ -141,26 +153,66 @@ exact function/hook/slash named (see §8). A test exercising only a nonexistent
 
 ## 3. Read anchor (normative — applies to every read, including report-only)
 
-**A-ANCHOR-1 — origin.** The anchor fd originates ONLY from (a) an inherited
-trusted fd passed by the caller, or (b) a `/` dirfd (`os.open("/", O_DIRECTORY
-| O_NOFOLLOW | O_CLOEXEC)`) followed by walking **single validated basenames**.
-No opening `$HERMES_HOME`, `disk-cleanup/`, `tracked.json`, or any candidate
-by a multi-component pathname. No `open(path)`, `Path(path).open()`,
-`Path.exists()/stat()/read_text()` on state paths.
+Rev3 contradiction fixed here: rev3 defined TWO policies — a `/`-anchored
+single-basename walk (A-ANCHOR-1/2) AND an `openat2(anchor_fd, path)` that
+still accepted the inherited-or-`/` fd with a "validated relative chain"
+(A-ANCHOR-3). An implementer following rev3 literally could bind
+`openat2("/", "mnt/x")` or `openat2("/", "projects/y")` with lexically-valid
+components and pass review. Rev4 defines ONE policy below. `/` is a
+bootstrap locator only, never an operation anchor.
 
-**A-ANCHOR-2 — single-component walk.** Each descent step opens exactly one
-validated basename with `openat(parent_fd, name, O_RDONLY | O_DIRECTORY |
-O_NOFOLLOW | O_CLOEXEC)` (files: without `O_DIRECTORY` but still
-`O_NOFOLLOW`), then `fstat(child)` (`S_ISDIR`/`S_ISREG` as appropriate) while
-**holding the parent fd open**. Never release-then-reopen. `O_NOFOLLOW` on
-every step; `ELOOP` → refuse (`A-REFUSE-1`).
+**A-ROOTS-1 — explicit allowed roots (from old `is_safe_path`,
+`disk_cleanup.py:32-56`).** The ONLY roots the bootstrap may select are:
 
-**A-ANCHOR-3 — preferred `openat2`.** Where available, `openat2(anchor_fd,
-path, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` (plus `RESOLVE_NO_XDEV` where
-supported) may bind one validated relative chain in one kernel-checked step.
-It does NOT relax A-ANCHOR-1/2: the `anchor_fd` is still the inherited-or-`/`
-fd, each basename in `path` is still validated per A-JSON-1, and any symlink/
-XDEV/escape → refuse.
+- `R_HERMES_HOME`: `$HERMES_HOME` (covers the report-only state
+  `$HERMES_HOME/disk-cleanup/tracked.json` + allowed ephemeral cache/temp
+  owned by this plugin under `$HERMES_HOME`; `get_hermes_home()` is the
+  locator input, never a JSON string);
+- `R_HERMES_TMP`: `/tmp/hermes-*` (first path component under the resolved
+  `/tmp` root starts with `hermes-`; the `/tmp→/private/tmp` alias is
+  resolved once at bootstrap by comparing resolved roots, never per-open).
+
+Everything else is refused EVEN WHEN LEXICALLY VALID (no absolute, no `..`,
+no empty, no NUL is not enough): project trees (`projects/`, `workspace/`,
+`plans/`, `home/`), `/mnt/*`, `/tmp` non-`hermes-*`, outside-`R_HERMES_TMP`
+temp, and any absolute path outside the selected root. There is no third
+root and no per-call root invention.
+
+**A-ROOTS-2 — bootstrap `/` only to locate, then retain selected-root FD +
+fixed rootID.** Open `/` once (`os.open("/", O_DIRECTORY | O_NOFOLLOW |
+O_CLOEXEC)`) and walk ONLY single validated basenames from `/` toward the
+explicit allowed root named above (each step `openat(parent_fd, name,
+O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)` + `fstat` + hold-parent).
+On arrival `fstat` the selected root and record `rootID = (st_dev, st_ino)`.
+Retain the selected-root FD open for the whole operation. Every later bind
+re-validates `fstat(selectedRootFD) == rootID`; mismatch → refuse
+(`A-REFUSE-1`). The `/` FD is closed after selection and MUST NOT be used
+as an operation anchor. No opening `$HERMES_HOME`, `disk-cleanup/`,
+`tracked.json`, or any candidate by a multi-component pathname. No
+`open(path)`, `Path(path).open()`, `Path.exists()/stat()/read_text()` on
+state paths.
+
+**A-BIND-1 — ONE bind policy for component-walk AND `openat2`.**
+`tracked.json` carries ONLY `{rootID, relative}`: `rootID` names
+`R_HERMES_HOME` or `R_HERMES_TMP`, `relative` is validated components (reject
+absolute via `os.path.isabs`, reject `..`, reject empty, reject NUL; each
+basename validated before use). Both bind paths start from
+`selectedRootFD`, NEVER from `/`:
+
+- (a) component-walk: each descent step opens exactly one validated basename
+  with `openat(selectedRootFD-or-held-child, name, O_RDONLY | O_DIRECTORY |
+  O_NOFOLLOW | O_CLOEXEC)` (files: without `O_DIRECTORY` but still
+  `O_NOFOLLOW`), then `fstat(child)` (`S_ISDIR`/`S_ISREG` as appropriate)
+  while **holding the parent fd open**. Never release-then-reopen.
+  `ELOOP` → refuse.
+- (b) `openat2`: `openat2(selectedRootFD, relative, RESOLVE_BENEATH |
+  RESOLVE_NO_SYMLINKS)` (plus `RESOLVE_NO_XDEV` where supported) in one
+  kernel-checked step with the SAME per-basename validation and the SAME
+  `rootID` + refuse table as (a). `openat2` starting from `/`, from an
+  unretained fd, or with an unchecked chain fails §9.
+
+(a) and (b) are interchangeable implementations of the same policy, paired
+in acceptance (§8 A-PAIR-1). Neither relaxes the other.
 
 **A-ANCHOR-4 — bans (each fails §9 if present on state paths outside
 fixtures asserting absence).** `Path.resolve()` / `os.path.realpath()` /
@@ -168,24 +220,31 @@ fixtures asserting absence).** `Path.resolve()` / `os.path.realpath()` /
 39,53,72,107,194,197,203,207,308,325,343,369,371,383,570,580`); multi-component
 `os.open(str(p))` / `open()` (current `88,109,136` pattern + `65,201,209`);
 `Path("/tmp").resolve()` alias relaxation + `relative_to(hermes_home)` +
-`parts[0].startswith("hermes-")` (current `32-56` `is_safe_path`); `mkdir(
+`parts[0].startswith("hermes-")` as a per-open check (current `32-56`
+`is_safe_path` — replaced by A-ROOTS-1/2 bootstrap + rootID); `mkdir(
 parents=True)` unbound-chain creation (current `63,193,239`); pathname
-`dir_fsync` (`77-92` reopen by name); `readlink`-driven repair; silent
-Windows downgrade to pathname behavior (refuse fail-closed where
-`O_DIRECTORY`/`O_NOFOLLOW`/`openat2` absent).
+`dir_fsync` (`77-92` reopen by name); `readlink`-driven repair; `openat2`
+from `/` or from a non-retained fd; silent Windows downgrade to pathname
+behavior (refuse fail-closed where `O_DIRECTORY`/`O_NOFOLLOW`/`openat2`
+absent).
 
 **A-REFUSE-1 — reject uncertain.** `ELOOP`, `st_dev`/`st_ino`/mode/ownership
-surprise, non-directory, mount/XDEV escape, I/O error, or any error where safe
-binding cannot be proven → fail-closed refuse before any read. Symlink at any
-ingress component (preexisting or swapped in) → refuse. Never path-reopen,
-never `Path.resolve()` retry, never `exists()` fallback.
+surprise, non-directory, mount/XDEV escape, I/O error, `rootID` mismatch,
+or any error where safe binding cannot be proven → fail-closed refuse
+before any read. Symlink at any ingress component (preexisting or swapped
+in) → refuse. Never path-reopen, never `Path.resolve()` retry, never
+`exists()` fallback.
 
-**A-JSON-1 — `tracked.json` names are untrusted input.** Each `path` string in
-the JSON array is validated: reject absolute (`os.path.isabs`), reject `..`
-components, reject empty, reject NUL, then bind each via A-ANCHOR-2/3
-(`openat2 RESOLVE_BENEATH|NO_SYMLINKS` or exact held-component path). No
+**A-JSON-1 — `tracked.json` names are untrusted input.** Each `path` string
+in the JSON array is converted to `{rootID, relative}` and validated per
+A-BIND-1 (reject absolute, reject `..`, reject empty, reject NUL), then
+bound via (a) exact held-component path or (b) `openat2` from
+`selectedRootFD` with `RESOLVE_BENEATH|NO_SYMLINKS`. A candidate that does
+not name `R_HERMES_HOME`/`R_HERMES_TMP` (project, `/mnt/*`, `/tmp`
+non-`hermes-*`, outside temp) is refused even when lexically valid. No
 candidate string is ever `open()`ed/`stat()`ed/`unlink()`ed by name. Schema
-validation is classification input only (§4).
+validation is classification input only (§4). Report-only grants no
+deletion authority (§4 A-NONE-1).
 
 ---
 
@@ -242,109 +301,176 @@ the initial slice fails review.
 
 ## 6. Design B: readiness fail-closed at exact lines
 
-Normative: only `ready` activates. Every other verdict
-(`blocked-missing-cmd`, `blocked-refused`, `blocked-error`,
-`blocked-timeout`, `blocked-unconfigured`, `blocked-unknown`) blocks skill
-load, plugin enable, cron dispatch, and dependent-service enablement,
-uniformly across CLI/gateway/TUI/Desktop/cron. `TerminalPolicyRefusal`/
-`TerminalPolicyUnavailable` is a denial signal → blocked, never allow/skip.
-"Unconfigured"/"unknown" never activates. Per-view recheck (no latched ready).
+Rev3 contradiction fixed here: rev3 invented a new readiness vocabulary
+(`blocked-missing-cmd`, `blocked-refused`, …) as if it were
+`readiness_status`, and claimed `cron.preflight:false` "disables only the
+early hint" while unnamed "dispatch-time gates still block" — no such
+always-on gate exists. Rev4 uses the ACTUAL enum, defines ONE ready
+predicate, keeps `blocked_config` as a cron diagnostic (not a readiness
+value), and requires a NEW mandatory helper invoked regardless of the flag
+at BOTH dispatch sites.
 
-| ID | Fail-open line (read at current HEAD) | Required fail-closed wiring |
+**B-ENUM-1 — actual enum, no new values.** The only `readiness_status`
+values are `tools/skills_tool_setup.py:19-22` `SkillReadinessStatus`:
+`AVAILABLE="available"`, `SETUP_NEEDED="setup_needed"`,
+`UNSUPPORTED="unsupported"`. Produced at `tools/skills_tool.py:450`
+(`SETUP_NEEDED if setup_needed else AVAILABLE`) and `:590` /
+`tools/skills_tool_plugin.py:140-141` (`UNSUPPORTED` for platform mismatch).
+No `blocked-error`/`blocked-missing-cmd`/other `readiness_status` value is
+introduced. `success` (`skill_view` `:644`, `_fail` = `success:False` via
+`tools/skills_tool_plugin.py:29-30`, `tool_error(success=False)` via
+`tools/registry.py:1022-1025`), `setup_needed` / `setup_skipped`
+(`:455`), and `error` are separate fields — never folded into the enum.
+
+**B-READY-1 — ready predicate (activation).** A skill is READY iff ALL hold
+on the CURRENT view payload: `success is True` AND
+`readiness_status == "available"` AND `setup_needed is False` AND `error`
+absent. Every other combination blocks skill load, plugin enable, cron
+dispatch, and dependent-service enablement, uniformly across
+CLI/gateway/TUI/Desktop/cron. `UNSUPPORTED` never activates (platform
+mismatch, `:590`). `SETUP_NEEDED` never activates (missing env/commands/
+cred-files, `:426-449`). `success:False` (disabled, unreadable, `_fail`,
+`tool_error`) never activates. Missing/unknown fields → not ready
+(fail-closed). Per-view recheck (no latched ready).
+`TerminalPolicyRefusal`/`TerminalPolicyUnavailable` is a denial signal →
+not ready, never allow/skip.
+
+**B-DIAG-1 — `blocked-error` is a cron diagnostic for `setup_needed`,
+not a readiness value and not activatable.** When the skill payload reports
+`setup_needed` (including exception paths below that MUST set
+`setup_needed=True` + `readiness_status="setup_needed"`), cron maps it to a
+`[blocked_config]` diagnostic reason (`cron/scheduler_preflight.py:24-25`
+`BLOCKED_CONFIG_MARKER`, emitted by `cron/scheduler.py:1728-1752`
+`_blocked_config_result`) naming the missing items via
+`_SKILL_MISSING_FIELDS` (`scheduler_preflight.py:296-300`). The diagnostic
+blocks dispatch; it never makes the skill activatable and never appears as
+`readiness_status`. `UNSUPPORTED` maps to the same blocked diagnostic (never
+ready), but its label is the platform verdict, not `setup_needed`.
+
+| ID | Fail-open line (read at current HEAD) | Required fail-closed wiring (actual-enum vocabulary) |
 |---|---|---|
-| B-CRED-1 | `tools/skills_tool.py:439-444` `register_credential_files` wrapped in `try/except → debug` leaving `missing_cred_files=[]`, `setup_needed` unchanged | exception → `blocked-error` (setup_needed=True, `readiness_status=setup_needed`); activation blocked; surfaced in preflight `missing_credential_files` label |
-| B-PM-1 | `tools/skills_tool.py:616-641` `pm.ensure(dep)` fail → `deps_note` string only, result still `success:True` + `AVAILABLE` | declared-`deps` failure → `blocked-error` (or `blocked-missing-cmd` when the dep provides a `required_commands` binary); content MUST NOT report `success:True`+`AVAILABLE` while deps failed |
-| B-PLUGIN-1 | `tools/skills_tool_plugin.py:161-172` `except Exception → AVAILABLE/setup_needed:False/setup_skipped:False` | exception → `blocked-error` with the same vocabulary as local skills; shared `_skill_readiness` path, one verdict table |
-| B-CRON-1 | `cron/scheduler_preflight.py:91-95` `_job_fallback_chain` probe `except → None` | probe error → `blocked-error` (never "no fallback chain, proceed") |
-| B-CRON-2 | `cron/scheduler_preflight.py:120-121` non-`AuthError` `except → None` | non-auth resolve error → `blocked-error` (real path does not get to reinterpret it as runnable) |
-| B-CRON-3 | `cron/scheduler_preflight.py:275-279` gateway-config load `except → None` (fail-open skip) | load failure → `blocked-error`; `local`/`origin`/`all`/bot-chat lanes stay exempt, known-platform lanes block |
-| B-CRON-4 | `cron/scheduler_preflight.py:314-317` `skill_view` `except → continue` / `not success → continue` | unreadable/missing/unready skill → `blocked-error` via `_SKILL_MISSING_FIELDS` labels (296-300); fall-through to `_build_job_prompt` skip handling is removed for the blocking path |
-| B-CRON-5 | `cron/scheduler_preflight.py:399-403` `_preflight_job_config` per-check `except → continue` | check raise → `blocked-error` naming the check (`provider_key`/`skills`/`delivery`) |
-| B-CRON-6 | `cron/scheduler.py:1697-1725` `_preflight_or_block`, esp. `1719-1722` outer `except → _pf_reason=None` ("validator must never take down a runnable job") | validator error → `blocked-error`; job does not dispatch |
-| B-PREFLIGHT-FLAG | `cron/scheduler_preflight.py:80-83` `_cron_preflight_enabled` (`cron.preflight:false` disables all) + `cron/scheduler.py:1712` gate | `cron.preflight:false` MUST NOT bypass readiness: it disables only the *early* pre-dispatch hint; dispatch-time `_skill_readiness` + provider-key + delivery gates still block. An implementation where `false` dispatches an unready skill/key/delivery fails review |
-| B-VIEW-1 | `tools/skills_tool.py:613-641` view-time `pm.ensure` (read-only `skill_view` mutates host) | read-only view performs zero setup: no `pm.ensure`, no `pm.ensure_import`, no download; missing deps → `blocked-*` verdict + `deps_note` remedy, install only via explicit `hermes pm install` + reload. Same ban covers `skills_list` and plugin-serve paths |
-| B-ACT-1 | deployment/activation seam (skill load, plugin enable, cron dispatch, dependent-service enable) | activation requires `readiness_status==available` + `setup_needed==False` on the current view; every other status blocks with no side effect (no scheduling, no service enable, no tool registration for that skill) |
+| B-CRED-1 | `tools/skills_tool.py:439-444` `register_credential_files` wrapped in `try/except → debug` leaving `missing_cred_files=[]`, `setup_needed` unchanged | exception → `setup_needed=True`, `readiness_status="setup_needed"` (B-ENUM-1), activation blocked per B-READY-1; surfaced in preflight `missing_credential_files` label via B-DIAG-1 |
+| B-PM-1 | `tools/skills_tool.py:616-641` `pm.ensure(dep)` fail → `deps_note` string only, result still `success:True` + `readiness_status="available"` | declared-`deps` failure MUST also set `setup_needed=True` + `readiness_status="setup_needed"` (or `blocked-missing-cmd`-equivalent TEXT in `deps_note` + blocked diagnostic when the dep provides a `required_commands` binary); content MUST NOT report `success:True`+`"available"`+`setup_needed:False` while deps failed |
+| B-PLUGIN-1 | `tools/skills_tool_plugin.py:161-172` `except Exception → readiness_status="available"/setup_needed:False/setup_skipped:False` | exception → `setup_needed=True` + `readiness_status="setup_needed"` with the same vocabulary as local skills; shared `_skill_readiness` path (`:162-163`), one verdict table (B-ENUM-1) |
+| B-CRON-1 | `cron/scheduler_preflight.py:91-95` `_job_fallback_chain` probe `except → None` | probe error → blocked diagnostic naming the check (fail-closed); never "no fallback chain, proceed" |
+| B-CRON-2 | `cron/scheduler_preflight.py:120-121` non-`AuthError` `except → None` | non-auth resolve error → blocked diagnostic (real path does not get to reinterpret it as runnable) |
+| B-CRON-3 | `cron/scheduler_preflight.py:275-279` gateway-config load `except → None` (fail-open skip) | load failure → blocked diagnostic for known-platform lanes; `local`/`origin`/`all`/bot-chat lanes stay exempt (no config load) |
+| B-CRON-4 | `cron/scheduler_preflight.py:314-317` `skill_view` `except → continue` / `not success → continue` | unreadable/missing/unready skill → blocked diagnostic via `_SKILL_MISSING_FIELDS` labels (296-300) evaluated under B-READY-1; fall-through to `_build_job_prompt` skip handling is removed for the blocking path |
+| B-CRON-5 | `cron/scheduler_preflight.py:399-403` `_preflight_job_config` per-check `except → continue` | check raise → blocked diagnostic naming the check (`provider_key`/`skills`/`delivery`) |
+| B-CRON-6 | `cron/scheduler.py:1697-1725` `_preflight_or_block`, esp. `1719-1722` outer `except → _pf_reason=None` ("validator must never take down a runnable job") | validator error → blocked diagnostic; job does not dispatch |
+| B-PREFLIGHT-FLAG | `cron/scheduler_preflight.py:80-83` `_cron_preflight_enabled` (`cron.preflight` literally `False` disables) + `cron/scheduler.py:1712` gate + `cron/scheduler.py:2458` gate (`_empty_requested_mcp_toolsets`) | `cron.preflight:false` disables ONLY the OPTIONAL provider-key probe (`_preflight_check_provider_key`, `:86-122`, transient/auth-fallback sensitive). It MUST NOT bypass mandatory readiness. Implementation MUST ADD a NEW helper — e.g. `_cron_mandatory_readiness_guard(job, cfg) -> Optional[str]` wrapping the B-READY-1 skill check (`_preflight_check_skills`) + mandatory delivery check (`_preflight_check_delivery` unknown-platform part) fail-closed on raise — and invoke it UNCONDITIONALLY at BOTH dispatch sites regardless of `_cron_preflight_enabled`: (i) inside `_preflight_or_block` (`scheduler.py:1710-1722`, before/around the flag gate), and (ii) inside `_resolve_cron_agent_setup` (`scheduler.py:2441-2462`, alongside `_empty_requested_mcp_toolsets` at `:2458-2461` which is likewise gated today and must also run its mandatory part regardless). An implementation where `false` dispatches a B-READY-1-unready skill/key/delivery, or one that cites an imaginary "dispatch-time `_skill_readiness` gate already blocks" without the new call, fails review |
+| B-VIEW-1 | `tools/skills_tool.py:613-641` view-time `pm.ensure` (read-only `skill_view` mutates host) | read-only view performs zero setup: no `pm.ensure`, no `pm.ensure_import`, no download; missing deps → `setup_needed` verdict + `deps_note` remedy, install only via explicit `hermes pm install` + reload. Same ban covers `skills_list` and plugin-serve paths |
+| B-ACT-1 | deployment/activation seam (skill load, plugin enable, cron dispatch, dependent-service enable) | activation requires B-READY-1 on the current view; every other status blocks with no side effect (no scheduling, no service enable, no tool registration for that skill) |
 
-**Acceptance IDs:** `B-CRED-1`, `B-PM-1`, `B-PLUGIN-1`, `B-CRON-1`…`B-CRON-6`,
-`B-PREFLIGHT-FLAG`, `B-VIEW-1`, `B-ACT-1` — each driven through the real
+**Acceptance IDs:** `B-ENUM-1`, `B-READY-1`, `B-DIAG-1`, `B-CRED-1`,
+`B-PM-1`, `B-PLUGIN-1`, `B-CRON-1`…`B-CRON-6`, `B-PREFLIGHT-FLAG`
+(both `1712` and `2458` exercised with `cron.preflight:false` + unready
+skill, asserting the NEW mandatory guard blocks while the optional
+provider probe skips), `B-VIEW-1`, `B-ACT-1` — each driven through the real
 entrypoint (`skill_view`/`_serve_plugin_skill`/`_preflight_check_skills`/
-`_preflight_job_config`/`_preflight_or_block`) with real faults (PATH without
-command, invalid `required_commands`, refusal scope, raising probe, timeout,
-unconfigured store, unknown backend, `cron.preflight:false`), asserting blocked
-verdicts + zero activation/scheduling/service-enable side effects. Helper-only
-or patched-ready tests satisfy nothing.
+`_preflight_job_config`/`_preflight_or_block`/`_resolve_cron_agent_setup`)
+with real faults (PATH without command, invalid `required_commands`,
+refusal scope, raising probe, timeout, unconfigured store, unknown backend,
+`cron.preflight:false`), asserting actual-enum verdicts + `success` +
+`setup_needed` + zero activation/scheduling/service-enable side effects.
+Helper-only or patched-ready tests satisfy nothing.
 
 ---
 
 ## 7. Design C: `doctor --live` real per-backend oracle
 
-Failure mode: version-string/bare-import/PATH-presence/other-backend success
-producing PASS, unknown→skip, `--live` mutating host, static/live/fix conflated.
+Rev3 contradiction fixed here: rev3's generic 5×6 matrix judged each backend
+by the OTHER backend's deps (browser-use by Chromium, agent-browser by
+Python playwright), left `--version` as a PASS-adjacent probe, let unset
+pass via the non-launched backend, and pinned only `_run_one:274-284` while
+leaving the outer `maybe_run_live_checks:326-327` `check_warn` unpinned.
+Rev4 REPLACES the 5×6 with the ordered backend-specific decision below.
+Failure mode remains: version-string/bare-import/PATH-presence/other-backend
+success producing PASS, unknown→skip, `--live` mutating host,
+static/live/fix conflated.
+
+**C-DECIDE-1 — ordered decision (config → selection → selected-backend
+prerequisites → launch; irrelevant deps ignored).**
+
+1. Config parse failure → `fail`. `get_browser_backend()`
+   (`tools/browser_use_cli.py:219-223`, reads `_read_browser_cfg()`
+   `:194-202`; YAML-1.1 unquoted `off` as `False` → `"off"`, else
+   lowercased `str`, `""` = unset) raising or returning a malformed
+   non-string → `fail` (fail-closed), never unset-default. Doctor's
+   `_configured_backend_key()` (`hermes_cli/doctor_live.py:73-79`)
+   `except → ""` becomes `except → fail` (probe error).
+2. Selection via the EXACT resolver: `off` → `skip` (never enables
+   dependents); explicit `"browser-use"` / `"agent-browser"` → that backend
+   only (no fallback); unset `""` → the EXPLICIT default-selection
+   algorithm grounded in `is_browser_use_cli_mode()`
+   (`tools/browser_use_cli.py:251-259`: explicit key wins, else legacy
+   cloud config or `_find_cli() is not None` selects browser-use, else the
+   built-in/agent-browser path) — the same order `_probe_configured_backend`
+   (`hermes_cli/doctor_live.py:129-178`) implements (harness first, then
+   agent-browser). Unset has no second resolver; citing a different default
+   order fails review. Unknown string → `fail` (fail-closed), never `skip`.
+3. Selected backend's ACTUAL required deps only; irrelevant deps IGNORED
+   (never fail, never pass):
+   - `browser-use` selected → requires ONLY the configured backend's own
+     `browser_harness` operation: `_find_cli()`
+     (`tools/browser_use_cli.py:292-297`, `[sys.executable, "-m",
+     "browser_harness.run"]` when `importlib.util.find_spec(
+     "browser_harness")` resolves) runnable via the launch oracle below.
+     Chromium-executable missing (`hermes_cli/browser_runtime.py:10-16`),
+     Python `playwright` missing, `agent-browser` binary missing are
+     IRRELEVANT → ignored.
+   - `agent-browser` selected → requires ONLY `_find_agent_browser(
+     validate=False)` (`tools/browser_tool_install.py:60-91`, PM exact
+     binary then PATH/Homebrew, never exec/install) PLUS
+     `chromium_executable()` (`hermes_cli/browser_runtime.py:10-16`, PM
+     `chromium` or `AGENT_BROWSER_EXECUTABLE_PATH` override) runnable via
+     the launch oracle below. Python `playwright` importable/missing and
+     `browser_harness` present/missing are IRRELEVANT → ignored.
+     **Agent-browser does NOT require Python playwright** (rev3 col (e) was
+     wrong); **browser-use does NOT require local Chromium** (rev3 col (d)
+     was wrong).
+4. PASS requires the actual LAUNCH oracle (C-ORACLE-2) for the SELECTED
+   backend only. A pass from the non-selected backend is `fail` per
+   C-ORACLE-1. `skip` is reserved for `off` and genuinely-none-configured
+   unset (absent key, no backend runnable, no error beyond absence — e.g.
+   local-audio provider); never for configured-but-broken, missing-dep-for-
+   configured, or unset-where-the-default-oracle-errored (→ `fail` with
+   remediation).
 
 **C-ORACLE-1 — REMOVE every version-OR-launch disjunct.** No `pass` from a
 version string, bare `import playwright`/`browser_harness`, `shutil.which`/
 `_find_cli() is not None` (`tools/browser_use_cli.py:292-297`)/
 `_find_agent_browser(validate=False)` (`tools/browser_tool_install.py:60-91`)/
 `chromium_executable() is not None` (`hermes_cli/browser_runtime.py:10-16`)
-PATH hit, or a probe of a *different* backend than configured. Current
+PATH hit, or a probe of a *different* backend than selected. Current
 disjuncts that MUST NOT confer PASS: `hermes_cli/doctor_live.py:55-61`
 `_browser_use_ready`, `64-70` `_agent_browser_ready`, `82-95`
-`_browser_available` (`or`), `98-126` `_harness_version_probe` standalone PASS,
-`129-178` `_probe_configured_backend` version-subprocess PASS, `181-207`
-`_launch_browser_probe` fallback-to-other-backend. A `--version` exec is at
-most a bounded liveness pre-check; **PASS requires the launch oracle below
-for the configured backend only.**
+`_browser_available` (`or`), `98-126` `_harness_version_probe` standalone
+PASS, `129-178` `_probe_configured_backend` version-subprocess PASS,
+`181-207` `_launch_browser_probe` fallback-to-other-backend. A `--version`
+exec is at most a bounded liveness pre-check inside the launch oracle; **a
+version string alone NEVER confers PASS.**
 
-**C-ORACLE-2 — launch oracle (the only PASS path).** Launch the exact
-binary/entrypoint the tool spawns for the *configured* backend, open
-`about:blank`, evaluate a known-DOM assertion, close, reap. Bounded:
+**C-ORACLE-2 — launch oracle (the only PASS path).** Launch the EXACT
+binary/entrypoint the tool spawns for the SELECTED backend (predetermined:
+`[sys.executable, "-m", "browser_harness.run"]` for browser-use;
+`_find_agent_browser` binary + `chromium_executable()` for agent-browser),
+open `about:blank`, evaluate a KNOWN-DOM assertion, close, reap. Bounded:
 `1s ≤ timeout ≤ 15s` (clamp `doctor.live_probe_timeout`,
-`hermes_cli/doctor_live.py:293-296`), output cap 80–4k chars, `capture_output`,
-`check=False`, explicit `wait`/reap, `close()` in `finally` (no zombies, no
-lingering browser/daemon, no `pm.ensure`). Playwright fallback path
-(`hermes_cli/doctor_live.py:194-207`) survives ONLY as the unset-default
-backend's own oracle when no configured-backend probe applies — never as a
-pass for an explicitly-configured `browser-use`/agent-browser backend.
+`hermes_cli/doctor_live.py:293-296`), output cap 80–4k chars,
+`capture_output`, `check=False`, explicit `wait`/reap, `close()` in
+`finally` (no zombies, no lingering browser/daemon, no `pm.ensure`). The
+playwright launch path (`hermes_cli/doctor_live.py:194-207`) survives ONLY
+as the agent-browser-selected backend's own launch mechanism when that
+backend drives via playwright — never as a pass for an explicitly-configured
+`browser-use` backend and never because "playwright imports".
 
-**C-BACKEND-1 — configured backend decisive; exception is broken.**
-Read `browser.backend` via `get_browser_backend()`
-(`tools/browser_use_cli.py:219-223`). `off` → `skip` (never enables
-dependents). Unset `""` → probe in documented default order, PASS requires
-that backend's own C-ORACLE-2. Explicit `browser-use` MUST NOT fall back to
-agent-browser and vice versa. **Unknown string → `broken` (fail-closed),
-never `skip`.** `_configured_backend_key()` `except → ""`
-(`hermes_cli/doctor_live.py:73-79`) becomes `except → broken` (probe error,
-fail). Configured-but-broken (binary missing, `--version` non-zero/timeout,
-Chromium missing, harness missing, unexpected output) → `broken`, never
-`unconfigured`.
-
-**C-MATRIX-1 — actual 5×6 matrix (rows = `browser.backend`, cols = host
-condition; cells = expected `pass|fail|skip`).** `skip` is reserved for
-`off`/truly-unconfigured (absent config key, no backend selected, local-audio
-provider) — never for configured-but-broken or missing-dep-for-configured.
-`fail` = `broken` (errors fail-closed, never `warn`/`pass`/`skip`).
-
-| backend \ condition | (a) backend binary missing | (b) `--version` non-zero | (c) `--version` timeout | (d) Chromium executable missing | (e) playwright missing (only) | (f) other-backend-only healthy |
-|---|---|---|---|---|---|---|
-| `off` | skip | skip | skip | skip | skip | skip |
-| `browser-use` | fail | fail | fail | fail¹ | fail | fail |
-| `agent-browser` | fail | fail | fail | fail | fail² | fail |
-| unset (`""`) | skip³ | fail⁴ | fail⁴ | skip³ | skip³ | pass⁵ |
-| unknown string | fail | fail | fail | fail | fail | fail |
-
-¹ `browser-use` does not need local Chromium for its own oracle, but a
-configured `browser-use` whose harness entrypoint is missing/broken is still
-`fail` — the Chromium column for that row records the harness-Chromium
-variant where applicable, never a pass via agent-browser's Chromium.
-² agent-browser without Chromium is `fail` even if playwright imports.
-³ unset with nothing runnable and no error beyond absence → `skip
-(not configured)`; any attempted oracle that errors → `fail`, never silent
-pass.
-⁴ unset where the default-order oracle ran and errored → `fail` with
-remediation (not `skip`).
-⁵ unset passes ONLY when the default-order backend's own C-ORACLE-2 passes
-for the backend actually launched; a pass from the non-launched backend is
-`fail` per C-ORACLE-1.
+**C-BACKEND-1 — selected backend decisive; exception is broken.**
+Configured-but-broken (binary missing, `--version` non-zero/timeout,
+Chromium missing for agent-browser, harness missing for browser-use,
+unexpected output, resolver/config exception) → `fail` (`broken`),
+fail-closed, never `unconfigured`/`skip`. Unknown string → `fail`, never
+`skip`. `off` → `skip`.
 
 Audio/keyed probes keep their existing contract (`_KEYED_PROBES 21-24`,
 `_AUDIO_PROBES 27-31`, `_keyed_probe 225-231`, `_probe_audio 241-256`):
@@ -358,9 +484,18 @@ non-downloading.** `doctor --live` (`hermes_cli/doctor.py:189-192`
 after `DOCTOR_CHECKS 112-129`, `hermes_cli/doctor_live.py:287-328`)
 never calls `pm.ensure`/`ensure_import`, never downloads Chromium/browsers,
 never mutates browser state, never enables dependent services. Static `doctor`
-(no `--live`) performs no live probes. `maybe_run_live_checks` crash →
-`fail` (via `_run_one` catch-all `274-284`), never silent `skip`. Mock the
-install seam to explode in tests; any call fails the test.
+(no `--live`) performs no live probes.
+
+**C-CRASH-1 — pin BOTH crash sites (not only `_run_one`).**
+`_run_one` (`hermes_cli/doctor_live.py:274-284`) per-probe catch-all →
+`fail` is retained. ADDITIONALLY the outer
+`maybe_run_live_checks:326-327` catch-all (`except Exception` → currently
+`check_warn("Live backend probes crashed", …)` + `return None`, swallowing
+the crash into exit-0 via `hermes_cli/doctor.py:190-194`
+`warn_on_error` + `run_doctor` return) MUST become `check_fail` + append to
+`issues` (so `run_doctor` returns nonzero) — explicitly pin `:326-327`,
+not only `:274-284`. Any implementation leaving `check_warn`/`return None`
+at `:326-327` fails review.
 
 **C-FIX-1 — `doctor fix` is separate, human-approved, scoped.** Only
 `hermes doctor --fix` (`should_fix`, e.g. `hermes_cli/doctor_tools.py:320-343`
@@ -370,12 +505,19 @@ install seam to explode in tests; any call fails the test.
 unless explicitly passed. No anticipatory permission: documenting a fix does
 not authorize a probe to fix.
 
-**Acceptance IDs:** `C-ORACLE-1/2`, `C-BACKEND-1`, `C-MATRIX-1` (all 30 cells
-asserted with real `browser.backend` values + real faults), `C-LIVE-1`,
-`C-FIX-1` — asserting exact `pass|fail|skip` per cell, zero
-`pm.ensure`/download/service-enable/file-write on any `--live` path, bounded
-budgets + child reap, and static-vs-live-vs-fix distinction. Single-stub
-"all backends pass" tests satisfy nothing.
+**Acceptance IDs:** `C-DECIDE-1` (ordered steps asserted with real
+`browser.backend` values incl. `False`-as-`off`, malformed, unknown),
+`C-ORACLE-1/2` (no version/import/PATH/other-backend PASS; launch-only
+PASS with known-DOM eval + bounded reap), `C-BACKEND-1`
+(backend-specific prereqs; irrelevant-missing-dep tests: browser-use PASS
+with Chromium/playwright/agent-browser absent; agent-browser PASS with
+harness/playwright absent and FAIL without Chromium), `C-LIVE-1`,
+`C-CRASH-1` (outer `:326-327` crash → `check_fail` + `issues` + nonzero
+exit, plus per-probe `_run_one` crashes → `fail`), `C-FIX-1` — asserting
+exact `pass|fail|skip` per backend-specific prerequisite, zero
+`pm.ensure`/download/service-enable/file-write on any `--live` path,
+bounded budgets + child reap, and static-vs-live-vs-fix distinction.
+Single-stub "all backends pass" tests satisfy nothing.
 
 ---
 
@@ -422,9 +564,37 @@ satisfies nothing):**
   skips. The profile explicitly asserts **zero git spawns including no
   `.git/index` writes** (A-NOIMPLICIT-2).
 - **A-ESCAPE-1 — protected-root escapes refused.** Symlinked state dir,
-  `/mnt/*`, `/tmp` non-`hermes-*`, project-tree, and absolute/`..` JSON-name
-  candidates are all refused + reported, none written, even when JSON
-  validates.
+  `/mnt/*`, `/tmp` non-`hermes-*`, project-tree (`projects/`, `workspace/`,
+  `plans/`, `home/`), and absolute/`..`/empty/NUL JSON-name candidates are
+  all refused + reported, none written, even when JSON validates. Each case
+  asserted under BOTH bind paths (a) component-walk and (b) `openat2` from
+  the same `selectedRootFD` + `rootID` (A-PAIR-1): `openat2` from `/` or
+  from a non-retained fd is a test failure even when the walk refuses.
+- **A-PAIR-1 — component-walk and `openat2` share one policy.** Every
+  A-BARRIER/A-ESCAPE case runs twice (same `{rootID, relative}`, same
+  concurrent-swap barrier, same multi-condition setup: symlink + XDEV +
+  `rootID`-mismatch attempts under real threads) — once via (a), once via
+  (b) — asserting identical refuse/report and identical `rootID` pin. A test
+  passing one path only satisfies nothing.
+- **B-ENUM-FLAG-1 — actual enum + flag + actual entrypoints.** Drive
+  `skill_view` / `_serve_plugin_skill` / `_preflight_check_skills` /
+  `_preflight_job_config` / `_preflight_or_block` (`scheduler.py:1697-1725`)
+  / `_resolve_cron_agent_setup` (`scheduler.py:2423-2462`) with payloads
+  carrying the ACTUAL enum (`available`/`setup_needed`/`unsupported`) +
+  `success` + `setup_needed` + `error`: READY only per B-READY-1; every
+  other combination → `[blocked_config]` diagnostic, zero activation. Drive
+  BOTH `1712` and `2458` with `cron.preflight:false`: the NEW mandatory
+  guard blocks an unready skill while the optional provider probe skips —
+  assert the new helper was called (not an imaginary early hint).
+- **C-BACKEND-IRR-1 — irrelevant-dep + outer-crash tests.** Browser-use
+  PASS with Chromium/`playwright`/`agent-browser` absent (only harness
+  launch oracle); agent-browser PASS with harness/`playwright` absent and
+  FAIL without Chromium (never because of `playwright`); explicit-backend
+  pass via the other backend → FAIL; unset-healthy-other-backend fallback
+  → FAIL (skip only genuinely-none-configured). Outer
+  `maybe_run_live_checks:326-327` crash (raise inside `run_live_checks`)
+  → `check_fail` + `issues` append + nonzero `run_doctor` exit; per-probe
+  `_run_one` crash → `fail`. `check_warn` at `:326-327` fails the test.
 - **Flakiness guard:** bounded iterations; ANY escape or ANY write fails.
   No statistical pass.
 
@@ -438,26 +608,37 @@ satisfies nothing):**
    `shutil.*`, `fsync`, `cleanup.log`, `quarantine`, `atomic_replace`,
    `atomic_json_write`, `_log(`, `_git_ok`, `ls-files` on slice paths returns
    only fixtures asserting absence.
-2. (A-ANCHOR-1…A-JSON-1) Ingress from inherited-or-`/` fd, single validated
-   basenames each `O_NOFOLLOW`, `openat2 RESOLVE_BENEATH|NO_SYMLINKS` or exact
-   held-component path; no multi-component open, no `realpath`/`resolve`, no
-   `/tmp` alias relaxation; JSON names validated (no absolute, no `..`);
-   uncertain/symlink/XDEV → refuse; no path reopen/retry.
+2. (A-ROOTS-1/2, A-BIND-1, A-JSON-1) Bootstrap `/` only to locate explicit
+   `R_HERMES_HOME`/`R_HERMES_TMP`; retained `selectedRootFD` + fixed
+   `rootID`; component-walk AND `openat2` start from `selectedRootFD` (never
+   `/`) with same validation; project/`/mnt`/outside-`hermes-`temp refused
+   even when lexically valid; JSON only `{rootID, relative}` (no absolute,
+   no `..`); uncertain/symlink/XDEV/`rootID`-mismatch → refuse; no path
+   reopen/retry; report-only grants no deletion authority.
 3. (A-AUTH-1/2, A-NONE-1) Schema-valid/metadata never authorize; no unlink
    protocol/tables as policy; `touched == []` asserted per entrypoint.
 4. (A-NOIMPLICIT-1/2) No `_log`, no git spawn (incl. no index writes) on slice
    paths; `log_stale` in-memory only.
-5. (A-ZERO-1, A-BARRIER-1…6, A-TRACER-1, A-ESCAPE-1) Zero-write census per exact
-   hook/slash even on failure; deterministic barriers per boundary; tracer
-   absent → FAIL; read-only syscall profile incl. no-git-index-writes held.
-6. (B-CRED-1, B-PM-1, B-PLUGIN-1, B-CRON-1…6, B-PREFLIGHT-FLAG, B-VIEW-1,
-   B-ACT-1) No `except→AVAILABLE`/`continue`/`None` carve-out; `cron.preflight:
-   false` cannot dispatch unready; view performs zero setup; activation only
-   on `ready`; real-entrypoint tests, no patched-ready stubs.
-7. (C-ORACLE-1/2, C-BACKEND-1, C-MATRIX-1, C-LIVE-1, C-FIX-1) No
-   version/import/PATH/other-backend PASS; unknown→`broken`; `except→broken`;
-   all 30 matrix cells asserted; `--live` entire static path non-downloading,
-   no `ensure`; `fix` separate human-approved scope.
+5. (A-ZERO-1, A-BARRIER-1…6, A-TRACER-1, A-ESCAPE-1, A-PAIR-1) Zero-write census per exact
+   hook/slash even on failure; deterministic barriers per boundary on BOTH
+   bind paths under multi-concurrent swaps; tracer absent → FAIL; read-only
+   syscall profile incl. no-git-index-writes held.
+6. (B-ENUM-1, B-READY-1, B-DIAG-1, B-CRED-1, B-PM-1, B-PLUGIN-1, B-CRON-1…6, B-PREFLIGHT-FLAG, B-VIEW-1,
+   B-ACT-1, B-ENUM-FLAG-1) Actual `available`/`setup_needed`/`unsupported`
+   only, ready = `available`+`success`+`setup_needed:false`+error-absent, no
+   new enum; `blocked_config` diagnostic only for `setup_needed`/unready (not
+   activatable); no `except→AVAILABLE`/`continue`/`None` carve-out; NEW
+   mandatory guard invoked regardless of flag at BOTH `1712` and `2458`
+   (optional provider probe alone may skip); view performs zero setup;
+   real-entrypoint tests, no patched-ready stubs.
+7. (C-DECIDE-1, C-ORACLE-1/2, C-BACKEND-1, C-LIVE-1, C-CRASH-1, C-FIX-1, C-BACKEND-IRR-1) No
+   version/import/PATH/other-backend PASS; ordered config→selection→
+   selected-backend-prereqs→launch with irrelevant deps ignored
+   (browser-use = harness only, agent-browser = binary+Chromium, never
+   Python `playwright` for agent-browser); unset uses the explicit
+   `is_browser_use_cli_mode` default order; unknown/`except`→`fail`;
+   outer `:326-327` → `check_fail`+`issues`+nonzero (not only `_run_one`);
+   `--live` non-downloading, no `ensure`; `fix` separate human-approved scope.
 8. `utils.*` atomic helpers untouched (diff empty).
 9. Out-of-scope dependency/desktop items absent from the implementation diff
    (or split PRs).
@@ -487,6 +668,33 @@ satisfies nothing):**
   (§6), and the launch-only oracle with `except→broken`, full 5×6 matrix,
   static-path non-download, and separate `fix` scope (§7). It neither closes
   nor supersedes PR1.
+  Verdict on rev3: **NO-GO** (remaining contradictions: dual anchor policies
+  with `/`-anchored `openat2` escape; invented `blocked-*` readiness enum +
+  imaginary early-hint without a new helper or `1712`/`2458` split; generic
+  5×6 with cross-backend deps + version-pass residue + unpinned `326-327`).
+- This rev4 (same branch/file, no runtime changes) fixes EXACTLY those three:
+  (A) one allowed-root policy — bootstrap `/` only to locate explicit
+  `R_HERMES_HOME`/`R_HERMES_TMP` (old `is_safe_path:32-56`), retain
+  `selectedRootFD` + fixed `rootID`, JSON only `{rootID, relative}`,
+  component-walk and `openat2` both start from `selectedRootFD` (never `/`),
+  project/`/mnt`/outside-`hermes-`temp refused even when lexically valid,
+  report-only with no deletion authority (§3); (B) actual
+  `available`/`setup_needed`/`unsupported` enum (`skills_tool_setup.py:19-22`)
+  + ready = `available`+`success`+`setup_needed:false`+error-absent, no new
+  enum, `blocked_config` diagnostic only for `setup_needed`/unready, NEW
+  mandatory guard (e.g. `_cron_mandatory_readiness_guard`) invoked
+  regardless of `_cron_preflight_enabled:80-83` at BOTH `scheduler.py:1712`
+  and `:2458`, optional provider probe alone may skip (§6); (C) ordered
+  backend-specific oracle replacing the 5×6 — config-fail→fail, exact
+  `get_browser_backend:219-223` selection, `is_browser_use_cli_mode:251-259`
+  default order for unset, selected-backend actual deps with irrelevant deps
+  ignored (browser-use = harness only, agent-browser = binary+Chromium,
+  never Python `playwright`), launch-only PASS (predetermined binary,
+  known-DOM eval, bounded cleanup, no version-pass), skip only
+  genuinely-none-configured, outer `:326-327` → `check_fail`+`issues`+
+  nonzero explicitly pinned (§7); paired (a)/(b) + enum/flag-entrypoint +
+  irrelevant-dep + outer-crash acceptance (§8). It neither closes nor
+  supersedes PR1.
 - Next (separate, after design sign-off): implementation branch + §§6–8 tests
   + fresh rereview. Mutation authority stays **nonexistent** until that review
   explicitly grants it — this file does not pre-grant it.
