@@ -479,3 +479,96 @@ class TestBundleContextBanner:
         assert "bar" in sibling_line
         assert "baz" in sibling_line
         assert "foo" not in sibling_line
+
+
+class TestPluginSkillReadinessGate:
+    """Plugin skills share the local readiness gate (no silent AVAILABLE)."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins as plugins_mod
+        from hermes_cli.plugins import PluginManager
+
+        self.pm = PluginManager()
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", self.pm)
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", empty)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+
+    def _reg(self, tmp_path, content, plugin="myplugin", name="foo"):
+        d = tmp_path / "plugins" / plugin / "skills" / name
+        d.mkdir(parents=True, exist_ok=True)
+        md = d / "SKILL.md"
+        md.write_text(content)
+        self.pm._plugin_skills[f"{plugin}:{name}"] = {
+            "path": md, "plugin": plugin, "bare_name": name, "description": "",
+        }
+
+    def test_missing_command_blocks_with_setup_needed(self, tmp_path, monkeypatch):
+        from tools.skills_tool import skill_view
+
+        self._reg(tmp_path, "---\nname: foo\ndescription: d\nrequired_commands: [definitely-missing-xyz]\n---\nBody.\n")
+        monkeypatch.setattr("shutil.which", lambda cmd: None)
+        result = json.loads(skill_view("myplugin:foo"))
+        assert result["success"] is True
+        assert result["readiness_status"] == "setup_needed"
+        assert result["setup_needed"] is True
+        assert "definitely-missing-xyz" in result["missing_required_commands"]
+
+    def test_present_command_leaves_available(self, tmp_path, monkeypatch):
+        from tools.skills_tool import skill_view
+
+        self._reg(tmp_path, "---\nname: foo\ndescription: d\nrequired_commands: [node]\n---\nBody.\n")
+        monkeypatch.setattr("shutil.which", lambda cmd: f"/usr/bin/{cmd}")
+        result = json.loads(skill_view("myplugin:foo"))
+        assert result["readiness_status"] == "available"
+        assert result["setup_needed"] is False
+
+    def test_remote_note_based_on_actual_backend(self, tmp_path, monkeypatch):
+        from tools.skills_tool import skill_view
+
+        self._reg(tmp_path, "---\nname: foo\ndescription: d\nrequired_commands: [definitely-missing-xyz]\n---\nBody.\n")
+        monkeypatch.setattr("shutil.which", lambda cmd: None)
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        result = json.loads(skill_view("myplugin:foo"))
+        assert result["setup_needed"] is True
+        assert "DOCKER" in result.get("setup_note", "")
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        result2 = json.loads(skill_view("myplugin:foo"))
+        assert "DOCKER" not in result2.get("setup_note", "")
+
+
+class TestRequiredCommandsValidation:
+    """required_commands must be list[str] safe basenames, fail-closed."""
+
+    def test_unsafe_entries_are_missing_failclosed(self, tmp_path, monkeypatch):
+        from tools.skills_tool import skill_view
+        from unittest.mock import patch
+
+        monkeypatch.setattr("shutil.which", lambda cmd: f"/usr/bin/{cmd}")
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            d = tmp_path / "evil"
+            d.mkdir()
+            (d / "SKILL.md").write_text(
+                "---\nname: evil\ndescription: d\nrequired_commands: [/tmp/evil, 'foo;bar', '../bin', 'a b']\n---\nBody.\n")
+            result = json.loads(skill_view("evil"))
+        assert result["setup_needed"] is True
+        assert result["readiness_status"] == "setup_needed"
+        # All unsafe entries reported missing, never passed to which as paths.
+        assert set(result["missing_required_commands"]) == {"/tmp/evil", "foo;bar", "../bin", "a b"}
+
+    def test_malformed_top_level_fails_closed(self, tmp_path):
+        from unittest.mock import patch
+
+        from tools.skills_tool import skill_view
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            d = tmp_path / "odd"
+            d.mkdir()
+            (d / "SKILL.md").write_text(
+                "---\nname: odd\ndescription: d\nrequired_commands: 123\n---\nBody.\n")
+            result = json.loads(skill_view("odd"))
+        assert result["setup_needed"] is True
+        assert result["readiness_status"] == "setup_needed"
