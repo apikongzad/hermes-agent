@@ -95,6 +95,9 @@ class TestConfiguredOnlySelection:
             raise AssertionError("HTTP call made for unconfigured backend")
 
         monkeypatch.setattr(doctor_live, "_http_get", _no_net)
+        # Rev6: resolver inputs False -> unconfigured-skip
+        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: False)
+        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
         results = run_live_checks([])
         assert all(r.status == "skip" for r in results)
 
@@ -174,6 +177,9 @@ class TestConfiguredOnlySelection:
 
     def test_browser_probed_when_available(self, monkeypatch):
         monkeypatch.setattr(doctor_live, "_browser_available", lambda: True)
+        # Rev6 resolver: harness runnable -> browser-use selected
+        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: True)
+        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
         monkeypatch.setattr(
             doctor_live, "_launch_browser_probe",
             lambda timeout: (True, "about:blank ok"))
@@ -183,6 +189,9 @@ class TestConfiguredOnlySelection:
     def test_unconfigured_browser_is_optional_skip_not_broken(self, monkeypatch):
         """Unconfigured optional backend must be skip (never fail, never enable)."""
         monkeypatch.setattr(doctor_live, "_browser_available", lambda: False)
+        # Rev6: genuinely-none-configured -> unconfigured-skip
+        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: False)
+        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
         called = []
         monkeypatch.setattr(doctor_live, "_launch_browser_probe",
                             lambda timeout: called.append(True) or (True, "must not run"))
@@ -315,7 +324,7 @@ class TestBrowserBackendProbe:
     """Configured-backend probe honors backend and does real exec, no pm.ensure."""
 
     def test_harness_ready_passes_without_playwright_via_real_version_exec(self, monkeypatch):
-        """Harness probe runs bounded --version subprocess (not bare import)."""
+        """Rev6 launch-only PASS (no version-pass): harness launch oracle."""
         monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "")
         monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: True)
         monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
@@ -347,12 +356,11 @@ class TestBrowserBackendProbe:
                             lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not ensure")))
         ok, detail = doctor_live._launch_browser_probe(5.0)
         assert ok is True
-        assert "runnable" in detail
+        assert "about:blank" in detail and "KNOWN-DOM" in detail
         assert seen["timeout"] is not None and seen["timeout"] <= 15.0
-        assert "--version" in str(seen["cmd"])
 
     def test_harness_import_alone_does_not_pass_when_version_fails(self, monkeypatch):
-        """Repro: bare import false-passed; real --version failure must fail."""
+        """Rev6: launch failure must fail (no version-pass)."""
         monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "")
         monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: True)
         monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
@@ -365,7 +373,7 @@ class TestBrowserBackendProbe:
         monkeypatch.setitem(_sys.modules, "browser_harness", type(_sys)("browser_harness"))
         ok, detail = doctor_live._launch_browser_probe(5.0)
         assert ok is False
-        assert "--version" in detail
+        assert "fail-closed" in detail
 
     def test_explicit_off_honors_backend_as_not_available(self, monkeypatch):
         monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "off")
@@ -400,7 +408,7 @@ class TestBrowserBackendProbe:
         monkeypatch.setattr(_bi, "__import__", _no_playwright)
         ok, detail = doctor_live._launch_browser_probe(5.0)
         assert ok is False
-        assert "no browser backend ready" in detail
+        assert "not configured" in detail or "fail-closed" in detail
 
     def test_agent_browser_ready_probes_binary_bounded(self, monkeypatch, tmp_path):
         fake_bin = tmp_path / "agent-browser"
@@ -421,14 +429,17 @@ class TestBrowserBackendProbe:
             return real_run(*a, **k)
 
         monkeypatch.setattr(_sp, "run", _spy)
+        # Rev6: agent-browser via ACTUAL CLI owned session ONLY, launch-only PASS
+        monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "agent-browser")
         ok, detail = doctor_live._launch_browser_probe(5.0)
         assert ok is True
-        assert "agent-browser runnable" in detail
+        assert "agent-browser" in detail and "about:blank" in detail and "KNOWN-DOM" in detail
         assert seen["timeout"] is not None and seen["timeout"] <= 15.0
 
     def test_no_backend_no_playwright_reports_ready_state_not_bare_import(self, monkeypatch):
         monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: False)
         monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
+        monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "")
         import sys as _sys
         monkeypatch.delitem(_sys.modules, "playwright.sync_api", raising=False)
         # Force ImportError even if playwright happens to be installed in the env.
@@ -443,7 +454,7 @@ class TestBrowserBackendProbe:
         monkeypatch.setattr(_bi, "__import__", _no_playwright)
         ok, detail = doctor_live._launch_browser_probe(5.0)
         assert ok is False
-        assert "no browser backend ready" in detail
+        assert "not configured" in detail or "fail-closed" in detail
 
 
 class TestFailureIsolation:

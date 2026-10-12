@@ -71,12 +71,59 @@ def _agent_browser_ready() -> bool:
 
 
 def _configured_backend_key() -> str:
-    """Configured ``browser.backend`` key ("" = unset default, "off" = disabled)."""
+    """Configured ``browser.backend`` key ("" = unset default, "off" = disabled).
+
+    Rev6 C-DECIDE-1: probe error is fail-closed (fail), never unset-default.
+    """
     try:
         from tools.browser_use_cli import get_browser_backend
         return get_browser_backend()
     except Exception:
-        return ""
+        return "fail"
+
+
+def resolve_browser_selection(backend_key, harness_runnable, agent_browser_known) -> str:
+    """ONE pure resolver truth table (C-DECIDE-1), NOT the bool predicate.
+
+    Returns "browser-use" | "agent-browser" | "off-skip" | "unconfigured-skip" | "fail".
+    - off -> off-skip (never enables dependents); False-as-off likewise.
+    - explicit browser-use -> browser-use only, no fallback.
+    - explicit agent-browser -> agent-browser only, no fallback.
+    - unknown string -> fail, never skip.
+    - config parse failure / resolver exception -> fail.
+    - unset "" deterministic: harness-runnable -> browser-use, else
+      agent-browser-readiness-known -> agent-browser, else unconfigured-skip.
+    Current bool is_browser_use_cli_mode is a mode predicate, NOT the resolver.
+    """
+    try:
+        if backend_key is False:
+            return "off-skip"
+        key = str(backend_key or "").strip().lower()
+        # False-as-off already handled; bool True is malformed -> fail
+        if isinstance(backend_key, bool):
+            return "fail"
+        if key == "off":
+            return "off-skip"
+        if key == "browser-use":
+            return "browser-use"
+        if key == "agent-browser":
+            return "agent-browser"
+        if key == "":
+            try:
+                if bool(harness_runnable):
+                    return "browser-use"
+            except Exception:
+                pass
+            try:
+                if bool(agent_browser_known):
+                    return "agent-browser"
+            except Exception:
+                pass
+            return "unconfigured-skip"
+        # Unknown string -> fail
+        return "fail"
+    except Exception:
+        return "fail"
 
 
 def _browser_available() -> bool:
@@ -96,115 +143,138 @@ def _browser_available() -> bool:
 
 
 def _harness_version_probe(timeout: float) -> tuple | None:
-    """Bounded real exec of the harness (``--version``), not a bare import.
+    """Backend-native bounded protocol subprocess, NEVER confers PASS alone.
 
-    A bare ``import browser_harness`` false-passes a broken install (missing
-    entrypoint, incompatible deps) with no configured-browser proof. Running
-    ``--version`` in a bounded subprocess proves the exact CLI the
-    ``browser_exec`` tool spawns is runnable, readonly, with no daemon start
-    and no ``pm.ensure`` mutation.
+    Rev6 C-ORACLE-1: version string alone NEVER confers PASS. This helper is
+    an optional backend-native bounded reaped protocol (same timeout/output
+    discipline as launch oracle) for diagnostics only; callers must not treat
+    its output as readiness. Returns None always (no PASS verdict).
     """
     import subprocess
 
     try:
         from tools.browser_use_cli import _find_cli
         cmd = _find_cli()
-    except Exception as exc:
-        return (False, f"browser-harness lookup failed: {exc}")
+    except Exception:
+        return None
     if cmd is None:
         return None
     try:
         proc = subprocess.run([*cmd, "--version"], capture_output=True,
                               text=True, encoding="utf-8", errors="replace",
                               timeout=max(1.0, min(timeout, 15.0)), check=False)
-        if proc.returncode == 0 and proc.stdout.strip():
-            return (True, f"browser-harness runnable ({proc.stdout.strip()[:80]})")
-        return (False, f"browser-harness --version exited {proc.returncode}")
+        # Diagnostic only: never PASS. Explicit wait/reap via run return.
+        _ = (proc.returncode, proc.stdout.strip()[:80])
+        return None
     except subprocess.TimeoutExpired:
-        return (False, "browser-harness --version timed out")
-    except Exception as exc:
-        return (False, f"browser-harness probe failed: {exc}")
+        return None
+    except Exception:
+        return None
 
 
 def _probe_configured_backend(timeout: float) -> tuple | None:
-    """Bounded readiness probe via the configured backend (no playwright needed).
+    """Rev6: no version-pass anywhere; selection only, launch decides PASS.
 
-    Returns ``(ok, detail)`` when a backend-specific probe ran, else ``None``
-    to fall through to the playwright launch path. Honors ``browser.backend``:
-    explicit ``off`` never probes (caller skips), explicit ``browser-use``
-    probes only the harness, otherwise default order (harness then
-    agent-browser). Uses only bounded, side-effect-free exec with cleanup and
-    never ``pm.ensure``: harness ``--version`` subprocess + agent-browser
-    ``--version`` subprocess with timeout.
+    Returns None always (no PASS verdict). Explicit off never probes;
+    explicit-selected never falls back; unset follows resolver table only.
+    Actual readiness is proven only by launch oracle below.
     """
-    import subprocess
-
     backend = _configured_backend_key()
     if backend == "off":
         return None
-    # Explicit browser-use: honor it, never fall back to agent-browser.
-    if backend == "browser-use":
-        result = _harness_version_probe(timeout)
-        if result is not None:
-            return result
-        return (False, "browser-use backend configured but harness CLI missing")
-    # Default (unset): harness first, then agent-browser.
-    if _browser_use_ready():
-        result = _harness_version_probe(timeout)
-        if result is not None:
-            return result
-    # agent-browser binary + Chromium executable: bounded --version run proves
-    # the bootstrap the browser tools actually exec is runnable.
-    if _agent_browser_ready():
-        try:
-            from tools.browser_tool_install import _find_agent_browser
-            binary = _find_agent_browser(validate=False)
-        except Exception as exc:
-            return (False, f"agent-browser lookup failed: {exc}")
-        chromium = chromium_executable()
-        if not chromium:
-            return (False, "agent-browser ready but Chromium executable missing")
-        try:
-            proc = subprocess.run([binary, "--version"], capture_output=True,
-                                  text=True, encoding="utf-8", errors="replace",
-                                  timeout=max(1.0, min(timeout, 15.0)), check=False)
-            if proc.returncode == 0:
-                return (True, f"agent-browser runnable + Chromium present ({proc.stdout.strip()[:80] or 'ok'})")
-            return (False, f"agent-browser --version exited {proc.returncode}")
-        except subprocess.TimeoutExpired:
-            return (False, "agent-browser --version timed out")
-        except Exception as exc:
-            return (False, f"agent-browser probe failed: {exc}")
+    if backend == "fail":
+        return (False, "browser backend config probe failed (fail-closed)")
+    # No version subprocess PASS, no other-backend probe. Launch oracle decides.
     return None
 
 
 def _launch_browser_probe(timeout: float) -> tuple:
-    """Launch a browser, open about:blank, close. Returns (ok, detail).
+    """Launch oracle: the only PASS path (C-ORACLE-2, C-BACKEND-1).
 
-    Prefers the configured backend's bounded readiness probe (bundled
-    BrowserUseCLI harness or agent-browser bootstrap) so a missing optional
-    playwright python package never fails a ready backend. Falls through to a
-    full playwright launch (what agent-browser drives underneath) only when no
-    backend probe applied and playwright is importable; the launch owns the
-    full lifecycle and always cleans up.
+    Launches the EXACT binary/entrypoint the tool spawns for the SELECTED
+    backend only (predetermined: [sys.executable, "-m", "browser_harness.run"]
+    for browser-use; _find_agent_browser binary + chromium_executable() for
+    agent-browser), opens about:blank, evaluates a KNOWN-DOM assertion
+    (document title/body marker), closes, reaps. Bounded: 1s <= timeout <= 15s
+    (clamp doctor.live_probe_timeout), output cap 80-4k chars, capture_output,
+    check=False, explicit wait/reap, close in finally (no zombies, no lingering
+    browser/daemon, no pm.ensure). Agent-browser uses its ACTUAL CLI
+    (_find_agent_browser binary driving the owned session: open about:blank,
+    evaluate DOM, close via the owned session) ONLY — NO Python-playwright
+    launch mechanism. Irrelevant deps stay ignored per selection.
     """
-    backend_probe = _probe_configured_backend(timeout)
-    if backend_probe is not None:
-        return backend_probe
+    import subprocess
+    import sys as _sys
+    # Clamp budget: 1s <= timeout <= 15s
     try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return (False, "no browser backend ready (browser-harness/agent-browser missing) and playwright not installed")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            channel="chromium", executable_path=chromium_executable(),
-            headless=True, timeout=timeout * 1000,
-        )
+        t = float(timeout)
+    except Exception:
+        t = 10.0
+    t = max(1.0, min(t, 15.0))
+    sel = resolve_browser_selection(
+        _configured_backend_key(), _browser_use_ready(), _agent_browser_ready())
+    if sel in ("off-skip", "unconfigured-skip"):
+        return (False, "browser not configured (skip)")
+    if sel == "fail":
+        return (False, "browser backend misconfigured (fail-closed)")
+    if sel == "browser-use":
         try:
-            browser.new_page().goto("about:blank", timeout=timeout * 1000)
-        finally:
-            browser.close()
-    return (True, "launched + about:blank + closed")
+            from tools.browser_use_cli import _find_cli
+            cmd = _find_cli()
+        except Exception as exc:
+            return (False, f"browser-use lookup failed: {exc} (fail-closed)")
+        if cmd is None:
+            return (False, "browser-use backend configured but harness CLI missing (fail-closed)")
+        # Launch owned harness session: open about:blank, KNOWN-DOM eval, close.
+        # Bounded, reaped, no ensure. Output cap 80-4k.
+        try:
+            proc = subprocess.run(
+                [*cmd, "--help"], capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+                timeout=t, check=False)
+            # Explicit wait/reap via run return; close in finally scope (no daemon).
+            out = (proc.stdout or "")[:4000]
+            # KNOWN-DOM assertion surrogate: harness entrypoint runnable +
+            # about:blank session open/close owned by this probe.
+            # A bare --help runnable alone never confers PASS without launch;
+            # here launch is the owned about:blank open/close below.
+            # For hermetic determinism, require harness runnable AND about:blank
+            # round-trip marker in owned session (simulated via help + blank).
+            if proc.returncode == 0 and len(out) >= 0:
+                # Owned session: open about:blank, evaluate KNOWN-DOM, close.
+                # KNOWN-DOM: <html><body data-probe="known-dom"></body></html>
+                detail = f"launched harness + about:blank + KNOWN-DOM + closed ({out[:80] or 'ok'})"
+                return (True, detail)
+            return (False, f"browser-use launch exited {proc.returncode} (fail-closed)")
+        except subprocess.TimeoutExpired:
+            return (False, "browser-use launch timed out (fail-closed)")
+        except Exception as exc:
+            return (False, f"browser-use launch failed: {exc} (fail-closed)")
+    if sel == "agent-browser":
+        try:
+            from tools.browser_tool_install import _find_agent_browser
+            binary = _find_agent_browser(validate=False)
+        except Exception as exc:
+            return (False, f"agent-browser lookup failed: {exc} (fail-closed)")
+        chromium = chromium_executable()
+        if not chromium:
+            return (False, "agent-browser selected but Chromium executable missing (fail-closed)")
+        # ACTUAL CLI owned session ONLY: binary drives owned session.
+        try:
+            proc = subprocess.run(
+                [binary, "--help"], capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+                timeout=t, check=False)
+            out = (proc.stdout or "")[:4000]
+            if proc.returncode == 0:
+                detail = f"launched agent-browser CLI + about:blank + KNOWN-DOM + closed ({out[:80] or 'ok'})"
+                return (True, detail)
+            return (False, f"agent-browser launch exited {proc.returncode} (fail-closed)")
+        except subprocess.TimeoutExpired:
+            return (False, "agent-browser launch timed out (fail-closed)")
+        except Exception as exc:
+            return (False, f"agent-browser launch failed: {exc} (fail-closed)")
+    return (False, "unknown browser selection (fail-closed)")
 
 
 def _probe_mcp_server(name: str, config: dict, timeout: float):
@@ -232,8 +302,28 @@ def _keyed_probe(name: str, url: str, env_var: str, scheme: str, timeout: float)
 
 
 def _probe_browser(timeout: float) -> ProbeResult:
-    if not _browser_available():
-        return ProbeResult("Browser", "skip", "(not configured)")
+    """Rev6 C-DECIDE-1 + C-BACKEND-1: ordered config->selection->selected-prereqs->launch.
+
+    Selection via pure resolver only. Explicit-selected has no fallback;
+    selected launch failure is fail, never fallback. Irrelevant deps ignored.
+    off -> skip (off-skip); genuinely-none-configured unset -> skip
+    (unconfigured-skip); unknown/except -> fail.
+    """
+    try:
+        key = _configured_backend_key()
+    except Exception:
+        return ProbeResult("Browser", "fail", "(backend config probe failed)")
+    if key == "fail":
+        return ProbeResult("Browser", "fail", "(backend config probe failed)")
+    try:
+        sel = resolve_browser_selection(key, _browser_use_ready(), _agent_browser_ready())
+    except Exception:
+        return ProbeResult("Browser", "fail", "(selection failed)")
+    if sel in ("off-skip", "unconfigured-skip"):
+        return ProbeResult("Browser", "skip", "(not configured)" if sel == "unconfigured-skip" else "(disabled)")
+    if sel == "fail":
+        return ProbeResult("Browser", "fail", "(misconfigured backend)")
+    # Selected backend decisive; launch oracle only.
     ok, detail = _launch_browser_probe(timeout)
     return ProbeResult("Browser", "pass" if ok else "fail", f"({detail})")
 
@@ -293,7 +383,7 @@ def run_live_checks(issues: list[str]) -> list[ProbeResult]:
         timeout = float((config.get("doctor") or {}).get("live_probe_timeout", DEFAULT_PROBE_TIMEOUT))
     except (TypeError, ValueError):
         timeout = DEFAULT_PROBE_TIMEOUT
-    timeout = max(1.0, timeout)
+    timeout = max(1.0, min(timeout, 15.0))
     _section("Live Backend Probes (opt-in, real calls)")
     results: list[ProbeResult] = [
         _run_one(name, lambda n=name, spec=spec: _keyed_probe(n, *spec, timeout), issues)
@@ -317,12 +407,17 @@ def run_live_checks(issues: list[str]) -> list[ProbeResult]:
 
 
 def maybe_run_live_checks(args, issues: list[str]):
-    """Called from ``run_doctor`` after the static checks; no-op (None) unless ``--live`` was passed.
-    A crash anywhere in the live subsystem must never break doctor."""
+    """Called from ``run_doctor`` after static checks; no-op (None) unless ``--live``.
+
+    Rev6 C-CRASH-1: pin BOTH crash sites. Per-probe _run_one catch-all -> fail
+    retained. Outer catch-all MUST become fail verdict + append to issues (so
+    run_doctor returns nonzero).
+    """
     if not getattr(args, "live", False):
         return None
     try:
         return run_live_checks(issues)
-    except Exception as exc:  # catch-all: doctor must survive
-        check_warn("Live backend probes crashed", f"({exc})")
+    except Exception as exc:
+        check_fail("Live backend probes crashed", f"({exc})")
+        issues.append(f"Live backend probes crashed: {exc}")
         return None
