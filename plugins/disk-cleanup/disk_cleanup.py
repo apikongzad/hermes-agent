@@ -66,10 +66,134 @@ def _log(message: str) -> None:
             f.write(f"[{ts}] {message}\n")
 
 
+def _is_link_no_follow(p: Path) -> bool:
+    """True when *p* itself is a symlink (lstat, never follows)."""
+    try:
+        return p.is_symlink()
+    except OSError:
+        return False
+
+
+def _strict_fsync_dir(dir_path: Path) -> None:
+    """fsync *dir_path* with errors propagating (durability, not best-effort).
+
+    Separated seam for injected dir-fsync tests. No suppression: a failed
+    directory fsync means the just-renamed entry may not survive power loss,
+    so the caller must see the error.
+    """
+    import os as _os
+
+    if _os.name == "nt":
+        return
+    fd = _os.open(str(dir_path), _os.O_RDONLY | getattr(_os, "O_DIRECTORY", 0))
+    try:
+        _os.fsync(fd)
+    finally:
+        _os.close(fd)
+
+
+def _read_bytes_no_follow(p: Path) -> bytes:
+    """Read *p* without following a trailing symlink (O_NOFOLLOW).
+
+    Raises OSError with errno ELOOP when *p* itself is a symlink at open
+    time — TOCTOU-safe: a regular file swapped for a link between an
+    ``is_symlink`` check and the open is still refused.
+    """
+    import errno as _errno
+    import os as _os
+
+    flags = _os.O_RDONLY | getattr(_os, "O_NOFOLLOW", 0)
+    # O_NOFOLLOW is a no-op on platforms without it; keep the lstat guard.
+    if _is_link_no_follow(p):
+        raise OSError(_errno.ELOOP, f"refusing symlink: {p}")
+    fd = _os.open(str(p), flags)
+    try:
+        chunks: list[bytes] = []
+        while True:
+            chunk = _os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        _os.close(fd)
+
+
+def _atomic_bytes_no_follow(target: Path, data: bytes, *, mode: int | None) -> None:
+    """Write *data* to *target* via unique O_EXCL temp + file fsync + os.replace.
+
+    ``os.replace`` replaces a symlink *itself* (old ``Path.replace``
+    semantics), never the symlink target — a ``tracked.json`` link pointing
+    outside state stays outside-untouched and becomes a regular file. Temp
+    is unique ``mkstemp`` (no ``.json.tmp`` collision), file fsync errors
+    propagate, parent dir fsync is strict via :func:`_strict_fsync_dir`,
+    and the temp is removed on any failure including ``BaseException``.
+    """
+    import os as _os
+    import tempfile as _tempfile
+
+    parent = target.parent
+    fd, tmp_str = _tempfile.mkstemp(dir=str(parent), prefix=".tracked_", suffix=".tmp")
+    tmp = Path(tmp_str)
+    try:
+        with _os.fdopen(fd, "wb") as f:
+            if mode is not None and hasattr(_os, "fchmod"):
+                _os.fchmod(f.fileno(), mode)
+            f.write(data)
+            f.flush()
+            _os.fsync(f.fileno())
+        _os.replace(tmp_str, str(target))
+        _strict_fsync_dir(parent)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            _os.unlink(tmp_str)
+        raise
+
+
+def _mode_of_regular_file(p: Path) -> int | None:
+    """Permission bits of *p* when it is a regular file, else ``None``.
+
+    Never follows a symlink for the decision: a link returns ``None`` so the
+    replacement gets the default new-file mode instead of the target's.
+    """
+    import stat as _stat
+
+    try:
+        if _is_link_no_follow(p):
+            return None
+        return _stat.S_IMODE(p.stat().st_mode)
+    except OSError:
+        return None
+
+
+def _default_new_mode() -> int | None:
+    """What ``open(path, "w")`` would give a new file (``0o666 & ~umask``)."""
+    import os as _os
+
+    if _os.name != "posix":
+        return None
+    try:
+        cur = _os.umask(0o077)
+        _os.umask(cur)
+    except OSError:
+        return None
+    return 0o666 & ~cur
+
+
 def load_tracked() -> list[dict[str, Any]]:
-    """Load tracked.json.  Restores from ``.bak`` on corruption."""
+    """Load tracked.json.  Restores from ``.bak`` on corruption.
+
+    Symlink fail-closed: a ``tracked.json`` or ``.bak`` that is itself a
+    symlink is never followed (an outside file could otherwise inject
+    tracked paths that :func:`quick` would delete). Such state reads as
+    empty with an audit-log line; :func:`save_tracked` replaces the link
+    itself on the next write.
+    """
     tf = _state_file("tracked.json")
     tf.parent.mkdir(parents=True, exist_ok=True)
+    if _is_link_no_follow(tf):
+        _log("WARN: tracked.json is symlink — refusing to follow, starting fresh")
+        return []
     if not tf.exists():
         return []
 
@@ -77,6 +201,9 @@ def load_tracked() -> list[dict[str, Any]]:
         return json.loads(tf.read_text(encoding="utf-8-sig"))
     except (json.JSONDecodeError, ValueError):
         bak = tf.with_suffix(".json.bak")
+        if _is_link_no_follow(bak):
+            _log("WARN: tracked.json.bak is symlink — refusing to follow, starting fresh")
+            return []
         if bak.exists():
             try:
                 data = json.loads(bak.read_text(encoding="utf-8-sig"))
@@ -89,24 +216,53 @@ def load_tracked() -> list[dict[str, Any]]:
 
 
 def save_tracked(tracked: list[dict[str, Any]]) -> None:
-    """Durable atomic write via shared ``utils.atomic_json_write`` + ``.bak``.
+    """Durable symlink-safe atomic write with atomic ``.bak``.
 
-    Uses a unique ``mkstemp`` staging file (no ``.json.tmp`` collision under
-    concurrent writers), file fsync + directory fsync (``fsync_dir=True``) so a
-    just-renamed file survives power loss, and ``BaseException`` temp cleanup.
-    The ``.bak`` sibling preserves last-known-good state for ``load_tracked``'s
-    corruption restore: it is copied from the pre-write file best-effort (a
-    backup failure logs and still attempts the atomic write; an atomic-write
-    failure propagates with the original file untouched and no temp orphan).
+    Local to disk-cleanup (shared ``utils.atomic_replace`` intentionally
+    follows a symlink to preserve its other callers — not used here, so the
+    shared helper is not weakened globally).
+
+    - Unique ``mkstemp`` staging (O_CREAT|O_EXCL, no ``.json.tmp`` collision).
+    - ``tracked.json`` write replaces a symlink *itself* via ``os.replace``
+      (old ``Path.replace`` semantics); outside target never touched. A
+      symlink source is never read for backup (O_NOFOLLOW / lstat guard).
+    - ``.bak`` is written atomically via temp + ``os.replace`` (never
+      ``shutil.copy2`` truncate-in-place, never follows a ``.bak`` link).
+    - File fsync and parent dir fsync errors propagate (strict durability);
+      backup failures propagate and abort before overwriting live state, so
+      the original file stays untouched with no temp orphan.
+    - Residual TOCTOU (parent-dir swap between ``mkdir`` and ``mkstemp``,
+      mode stat vs replace) is accepted by design — closing it needs an
+      O_TMPFILE / renameat2 design, not endless patching here.
     """
-    from utils import atomic_json_write
-
     tf = _state_file("tracked.json")
     tf.parent.mkdir(parents=True, exist_ok=True)
-    if tf.exists():
-        with contextlib.suppress(OSError):
-            shutil.copy2(tf, tf.with_suffix(".json.bak"))
-    atomic_json_write(tf, tracked, fsync_dir=True)
+    bak = tf.with_suffix(".json.bak")
+    payload = json.dumps(tracked, indent=2).encode("utf-8")
+
+    # Backup first so a backup failure aborts before live state is touched.
+    if _is_link_no_follow(tf):
+        _log("WARN: tracked.json is symlink — replacing link itself, skipping backup of link target")
+    elif tf.exists():
+        try:
+            src_bytes = _read_bytes_no_follow(tf)
+        except OSError as exc:
+            import errno as _errno
+
+            if exc.errno == _errno.ELOOP:
+                _log("WARN: tracked.json became symlink — replacing link itself, skipping backup")
+            else:
+                raise
+        else:
+            bak_mode = _mode_of_regular_file(tf)
+            # Atomic backup: temp + fsync + replace-onto-bak (replaces a
+            # .bak symlink itself, never truncates/follows its target).
+            _atomic_bytes_no_follow(bak, src_bytes, mode=bak_mode)
+
+    live_mode = _mode_of_regular_file(tf)
+    if live_mode is None and not tf.exists():
+        live_mode = _default_new_mode()
+    _atomic_bytes_no_follow(tf, payload, mode=live_mode)
 
 
 ALLOWED_CATEGORIES = {

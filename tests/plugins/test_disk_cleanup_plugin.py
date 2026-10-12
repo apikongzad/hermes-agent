@@ -712,27 +712,46 @@ class TestBundledDiscovery:
 
 
 class TestSaveTrackedDurability:
-    """save_tracked must use shared atomic_json_write (unique staging, file+dir
-    fsync, temp cleanup) and preserve .bak for load_tracked restore."""
+    """save_tracked is symlink-safe, unique-tmp, strict-fsync, atomic-.bak.
 
-    def test_uses_shared_atomic_write_with_dir_fsync(self, _isolate_env, monkeypatch):
+    Local to disk-cleanup: shared ``utils.atomic_replace`` follows a symlink
+    (writes outside state), so it is intentionally NOT used here. The helper
+    replaces a ``tracked.json`` link itself (old ``Path.replace`` semantics),
+    never follows a ``.bak`` link (temp + ``os.replace``), uses unique
+    ``mkstemp`` (O_EXCL), propagates file + dir fsync errors, and fails a
+    backup before touching live state.
+    """
+
+    def test_local_no_follow_write_with_strict_dir_fsync(self, _isolate_env, monkeypatch):
         dg = _load_lib()
-        seen = {}
+        seen: dict = {}
+        real_atomic = dg._atomic_bytes_no_follow
+        real_fsync_dir = dg._strict_fsync_dir
 
+        def _spy(target, data, *, mode):
+            seen["target"] = str(target)
+            return real_atomic(target, data, mode=mode)
+
+        dir_called: dict = {}
+
+        def _spy_dir(d):
+            dir_called["dir"] = str(d)
+            return real_fsync_dir(d)
+
+        monkeypatch.setattr(dg, "_atomic_bytes_no_follow", _spy)
+        monkeypatch.setattr(dg, "_strict_fsync_dir", _spy_dir)
+        # Shared helper must not be touched (it follows symlinks).
         import utils as _utils
 
-        real = _utils.atomic_json_write
+        def _boom(*a, **k):
+            raise AssertionError("shared atomic_replace must not be used for tracked.json")
 
-        def _spy(path, data, **kw):
-            seen["kw"] = kw
-            seen["path"] = str(path)
-            return real(path, data, **kw)
-
-        monkeypatch.setattr(_utils, "atomic_json_write", _spy)
+        monkeypatch.setattr(_utils, "atomic_replace", _boom)
         dg.save_tracked([{"path": "/tmp/x", "timestamp": "t", "category": "temp", "size": 1}])
-        assert seen["kw"].get("fsync_dir") is True
         tf = _isolate_env / "disk-cleanup" / "tracked.json"
         assert json.loads(tf.read_text(encoding="utf-8"))[0]["path"] == "/tmp/x"
+        assert seen["target"].endswith("tracked.json")
+        assert dir_called["dir"].endswith("disk-cleanup")
 
     def test_backup_preserves_last_good_for_restore(self, _isolate_env):
         dg = _load_lib()
@@ -802,14 +821,120 @@ class TestSaveTrackedDurability:
         dg.save_tracked(original)
         tf = _isolate_env / "disk-cleanup" / "tracked.json"
 
-        import utils as _utils
+        import os as _os
 
-        def _boom(*a, **k):
+        real_replace = _os.replace
+
+        def _boom(src, dst):
             raise OSError("injected replace failure")
 
-        monkeypatch.setattr(_utils, "atomic_replace", _boom)
+        monkeypatch.setattr(_os, "replace", _boom)
+        with pytest.raises(OSError):
+            dg.save_tracked([{"path": "/tmp/new", "timestamp": "t", "category": "temp", "size": 2}])
+        monkeypatch.setattr(_os, "replace", real_replace)
+        assert json.loads(tf.read_text(encoding="utf-8")) == original
+        state_dir = _isolate_env / "disk-cleanup"
+        assert [p for p in state_dir.iterdir() if ".tmp" in p.name] == []
+
+    def test_injected_dir_fsync_failure_propagates_no_tmp(self, _isolate_env, monkeypatch):
+        """Parent dir fsync is strict: errors propagate (durability signal)."""
+        dg = _load_lib()
+        dg.save_tracked([{"path": "/tmp/a", "timestamp": "t", "category": "temp", "size": 1}])
+
+        def _boom_dir(_d):
+            raise OSError("injected dir fsync failure")
+
+        monkeypatch.setattr(dg, "_strict_fsync_dir", _boom_dir)
+        with pytest.raises(OSError):
+            dg.save_tracked([{"path": "/tmp/b", "timestamp": "t", "category": "temp", "size": 2}])
+        state_dir = _isolate_env / "disk-cleanup"
+        assert [p for p in state_dir.iterdir() if ".tmp" in p.name] == []
+
+    def test_injected_backup_failure_aborts_before_live_write(self, _isolate_env, monkeypatch):
+        """Backup is atomic and fail-closed: a backup failure aborts before
+        live state is touched, preserving the original with no orphan."""
+        dg = _load_lib()
+        original = [{"path": "/tmp/keep", "timestamp": "t", "category": "temp", "size": 1}]
+        dg.save_tracked(original)
+        tf = _isolate_env / "disk-cleanup" / "tracked.json"
+        real_atomic = dg._atomic_bytes_no_follow
+
+        def _fail_bak_only(target, data, *, mode):
+            if str(target).endswith(".bak"):
+                raise OSError("injected backup failure")
+            return real_atomic(target, data, mode=mode)
+
+        monkeypatch.setattr(dg, "_atomic_bytes_no_follow", _fail_bak_only)
         with pytest.raises(OSError):
             dg.save_tracked([{"path": "/tmp/new", "timestamp": "t", "category": "temp", "size": 2}])
         assert json.loads(tf.read_text(encoding="utf-8")) == original
         state_dir = _isolate_env / "disk-cleanup"
         assert [p for p in state_dir.iterdir() if ".tmp" in p.name] == []
+
+    @pytest.mark.platforms("posix")
+    def test_tracked_symlink_never_writes_outside_replaces_link(self, _isolate_env, tmp_path):
+        """Repro: tracked.json symlink to outside must not be followed.
+
+        Old ``atomic_replace`` resolved the link and overwrote the target.
+        Fixed helper replaces the link itself (old ``Path.replace``
+        semantics): outside untouched, link becomes a regular file.
+        """
+        import os as _os
+
+        dg = _load_lib()
+        dg.save_tracked([{"path": "/tmp/seed", "timestamp": "t", "category": "temp", "size": 1}])
+        tf = _isolate_env / "disk-cleanup" / "tracked.json"
+        outside = tmp_path / "outside.txt"
+        outside.write_text("OUTSIDE-SECRET", encoding="utf-8")
+        # Swap the regular state file for a link to outside.
+        _os.unlink(tf)
+        tf.symlink_to(outside)
+        assert tf.is_symlink()
+        dg.save_tracked([{"path": "/tmp/new", "timestamp": "t", "category": "temp", "size": 2}])
+        assert outside.read_text(encoding="utf-8") == "OUTSIDE-SECRET"
+        assert not tf.is_symlink()
+        assert json.loads(tf.read_text(encoding="utf-8"))[0]["path"] == "/tmp/new"
+
+    @pytest.mark.platforms("posix")
+    def test_bak_symlink_never_writes_outside_replaces_link(self, _isolate_env, tmp_path):
+        """Repro: .bak symlink to outside must not be followed by copy2.
+
+        Fixed backup uses temp + ``os.replace`` onto the .bak path, replacing
+        the link itself: outside untouched, .bak becomes a regular backup.
+        """
+        import os as _os
+
+        dg = _load_lib()
+        first = [{"path": "/tmp/a", "timestamp": "t", "category": "temp", "size": 1}]
+        dg.save_tracked(first)
+        tf = _isolate_env / "disk-cleanup" / "tracked.json"
+        bak = _isolate_env / "disk-cleanup" / "tracked.json.bak"
+        outside = tmp_path / "outside_bak.txt"
+        outside.write_text("BAK-OUTSIDE-SECRET", encoding="utf-8")
+        # Force .bak to be a link to outside (remove regular backup first).
+        if bak.exists() or bak.is_symlink():
+            _os.unlink(bak)
+        bak.symlink_to(outside)
+        assert bak.is_symlink()
+        dg.save_tracked([{"path": "/tmp/b", "timestamp": "t", "category": "temp", "size": 2}])
+        assert outside.read_text(encoding="utf-8") == "BAK-OUTSIDE-SECRET"
+        assert not bak.is_symlink()
+        assert json.loads(bak.read_text(encoding="utf-8")) == first
+        assert json.loads(tf.read_text(encoding="utf-8"))[0]["path"] == "/tmp/b"
+
+    @pytest.mark.platforms("posix")
+    def test_load_refuses_symlink_state(self, _isolate_env, tmp_path):
+        """Load never follows a symlink state file (injection -> quick delete)."""
+        import os as _os
+
+        dg = _load_lib()
+        tf = _isolate_env / "disk-cleanup" / "tracked.json"
+        tf.parent.mkdir(parents=True, exist_ok=True)
+        outside = tmp_path / "evil.json"
+        outside.write_text(json.dumps([{"path": str(tmp_path / "victim"),
+                                        "timestamp": "t", "category": "test", "size": 1}]),
+                           encoding="utf-8")
+        if tf.exists() or tf.is_symlink():
+            _os.unlink(tf)
+        tf.symlink_to(outside)
+        assert dg.load_tracked() == []
