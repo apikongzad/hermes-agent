@@ -180,6 +180,24 @@ class TestConfiguredOnlySelection:
         results = {r.name: r for r in run_live_checks([])}
         assert results["Browser"].status == "pass"
 
+    def test_unconfigured_browser_is_optional_skip_not_broken(self, monkeypatch):
+        """Unconfigured optional backend must be skip (never fail, never enable)."""
+        monkeypatch.setattr(doctor_live, "_browser_available", lambda: False)
+        called = []
+        monkeypatch.setattr(doctor_live, "_launch_browser_probe",
+                            lambda timeout: called.append(True) or (True, "must not run"))
+        issues: list[str] = []
+        results = {r.name: r for r in run_live_checks(issues)}
+        assert results["Browser"].status == "skip"
+        assert called == []
+        assert issues == []
+        # Probes never enable services: no pm.ensure/install path is touched.
+        import pm as _pm
+        monkeypatch.setattr(_pm, "ensure", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not enable services")))
+        # Re-run: still skip without touching ensure.
+        results = {r.name: r for r in run_live_checks([])}
+        assert results["Browser"].status == "skip"
+
 
 @pytest.mark.parametrize("kind", ["NO_PROXY", "no_proxy"])
 @pytest.mark.parametrize("entry", ["[::1]", "[::1]:8080", "::1/128"])
