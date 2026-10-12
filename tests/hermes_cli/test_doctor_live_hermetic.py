@@ -85,8 +85,9 @@ class TestCOracleLaunchOnly:
 
     def test_launch_oracle_bounded_owned_known_dom(self, tmp_path, monkeypatch):
         # PASS requires ACTUAL launch via fake harness binary (no live host changes):
-        # exact binary, about:blank PY, nonce set-js + separate read-js, owned close/reap.
-        # Fabricated static HTML without nonce can never PASS (C-nonce).
+        # exact binary, about:blank PY, challenge + in-DOM SHA-256 derive,
+        # exact JSON one result event, owned close/reap.
+        # Fabricated static HTML / echo without derived can never PASS.
         import inspect
         import sys
         src = inspect.getsource(doctor_live)
@@ -94,10 +95,10 @@ class TestCOracleLaunchOnly:
         assert "15" in src, "timeout clamp 1..15s must be pinned (C-ORACLE-2)"
         assert "sync_playwright" not in src or "NEVER" in src or "ACTUAL CLI" in src, \
             "agent-browser via ACTUAL CLI ONLY, no Python-playwright (C-ORACLE-2)"
-        # Stateful harness fake: nonce round-trip (set + separate read), not static HTML.
+        # Stateful harness fake: challenge/derived (not static HTML/echo).
         fake = tmp_path / "fake_harness.py"
         fake.write_text(
-            "import sys, re\n"
+            "import sys, re, json, hashlib\n"
             "args=sys.argv[1:]\n"
             "data=sys.stdin.read() if not sys.stdin.isatty() else ''\n"
             "if '--help' in args:\n"
@@ -105,13 +106,15 @@ class TestCOracleLaunchOnly:
             " sys.exit(0)\n"
             "if 'about:blank' not in data:\n"
             " print('missing about:blank', file=sys.stderr); sys.exit(2)\n"
-            "if data.count('js(') < 2:\n"
-            " print('missing separate set+read', file=sys.stderr); sys.exit(2)\n"
+            "if 'js(' not in data or 'crypto.subtle.digest' not in data:\n"
+            " print('missing in-DOM derive', file=sys.stderr); sys.exit(2)\n"
             "import re as _re\n"
-            "m=_re.search(r\"dataset\\.doctorProbe='([0-9a-f]+)'\", data)\n"
+            "m=_re.search(r'const c = \"([0-9a-f]+)\"', data)\n"
             "if not m:\n"
-            " print('missing set-nonce', file=sys.stderr); sys.exit(2)\n"
-            "print(m.group(1))\n"
+            " print('missing challenge', file=sys.stderr); sys.exit(2)\n"
+            "ch=m.group(1)\n"
+            "exp=hashlib.sha256(ch.encode()).hexdigest()\n"
+            "print(json.dumps({\"event\": \"doctor-probe-result\", \"op\": \"sha256\", \"derived\": exp}))\n"
             "sys.exit(0)\n", encoding="utf-8")
         monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "browser-use")
         monkeypatch.setattr("tools.browser_use_cli._find_cli",

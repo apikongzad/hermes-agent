@@ -226,16 +226,100 @@ def _run_bounded(cmd, *, timeout: float, input_text: str | None = None, env=None
     return proc
 
 
+def _parse_probe_result_event(stdout_text: str):
+    """Exact JSON one result event parser (structured, no substring/echo).
+
+    Returns the single ``doctor-probe-result`` dict iff stdout holds exactly
+    one such JSON line with typed ``op``/``derived`` fields, else None.
+    """
+    import json as _json2
+    _cands = []
+    for _line in (stdout_text or "").splitlines():
+        _s = _line.strip()
+        if not _s:
+            continue
+        try:
+            _o = _json2.loads(_s)
+        except Exception:
+            continue
+        if isinstance(_o, dict) and _o.get("event") == "doctor-probe-result":
+            _cands.append(_o)
+    if len(_cands) != 1:
+        return None
+    _res = _cands[0]
+    if _res.get("op") != "sha256" or not isinstance(_res.get("derived"), str):
+        return None
+    return _res
+
+
+def _agent_browser_after_open(binary: str, owned: str, set_js: str, derive_js: str,
+                              expected: str, t: float) -> tuple:
+    """Entire after-open state: set + derive/read, owned close on ALL paths.
+
+    try/finally guarantees ``close`` runs for every failure mode (nonzero,
+    timeout, exception, mismatch). Bounded cleanup (min(t,5s)); cleanup
+    failure FAILs even when derived matched. Returns (ok, exit_or_close, detail).
+    """
+    import subprocess as _sp2
+    _close_ok = True
+    _probe_ok = False
+    _probe_exit = 0
+    try:
+        try:
+            sproc = _run_bounded(
+                [binary, "--session-name", owned, "eval", set_js], timeout=t)
+            if sproc.returncode != 0:
+                _probe_exit = sproc.returncode
+                return (False, _probe_exit, f"agent-browser set-challenge exited {sproc.returncode} (fail-closed)")
+        except _sp2.TimeoutExpired:
+            return (False, -1, "agent-browser set-challenge timed out (fail-closed)")
+        except Exception as exc:
+            return (False, -1, f"agent-browser set-challenge failed: {exc} (fail-closed)")
+        try:
+            eproc = _run_bounded(
+                [binary, "--session-name", owned, "eval", derive_js], timeout=t)
+            eout = ((eproc.stdout or "") + (eproc.stderr or ""))[:4000]
+            if eproc.returncode == 0 and eout.strip() == expected:
+                _probe_ok = True
+            else:
+                _probe_exit = eproc.returncode
+                return (False, _probe_exit, f"agent-browser derived mismatch (exit {eproc.returncode}) (fail-closed)")
+        except _sp2.TimeoutExpired:
+            return (False, -1, "agent-browser eval timed out (fail-closed)")
+        except Exception as exc:
+            return (False, -1, f"agent-browser eval failed: {exc} (fail-closed)")
+    finally:
+        try:
+            cproc = _run_bounded([binary, "--session-name", owned, "close"], timeout=min(t, 5.0))
+            if cproc.returncode != 0:
+                _close_ok = False
+        except _sp2.TimeoutExpired:
+            _close_ok = False
+        except Exception:
+            _close_ok = False
+    if not _probe_ok:
+        return (False, _probe_exit, f"agent-browser derived mismatch (exit {_probe_exit}) (fail-closed)")
+    if not _close_ok:
+        return (False, -1, "agent-browser close failed (fail-closed)")
+    return (True, 0, "ok")
+
+
 def _launch_browser_probe(timeout: float) -> tuple:
     """Launch oracle: the only PASS path (C-ORACLE-2, C-BACKEND-1).
 
     Launches the EXACT binary/entrypoint the tool spawns for the SELECTED
     backend only, opens about:blank via DOCUMENTED commands, proves a live
-    DOM via unpredictable-nonce round-trip (set via one evaluate, read via a
-    SEPARATE evaluate, exact match, same owned session), closes owned session
-    in finally, reaps bounded. Fabricated static HTML (wrong nonce) can never
-    PASS. Help/version inspect never confers PASS (diagnostic only).
+    DOM via challenge/derived round-trip (parent sends unguessable challenge,
+    in-browser evaluate derives distinct answer via DOM crypto/subtle SHA-256,
+    parent parses exact JSON one result event with per-operation typed output,
+    never substring/echo acceptance, same owned session), closes owned session
+    in finally, reaps bounded. Fabricated static HTML / echo of input source
+    strings can never PASS. Help/version inspect never confers PASS
+    (diagnostic only). Threat model: CLI binary trusted only; echo fakeCLI
+    must FAIL (regression pinned).
     """
+    import hashlib as _hashlib
+    import json as _json
     import os as _os
     import secrets as _secrets
     import subprocess
@@ -268,27 +352,53 @@ def _launch_browser_probe(timeout: float) -> tuple:
             return (False, "browser-use help inspect timed out (fail-closed)")
         except Exception as exc:
             return (False, f"browser-use help inspect failed: {exc} (fail-closed)")
-        # Nonce round-trip: unpredictable DOM proof via two separate evaluates.
-        nonce = _secrets.token_hex(8)
-        owned = f"doctor-live-{_os.getpid()}-{nonce[:6]}"
+        # Challenge/derived: parent sends unguessable challenge; DOM derives
+        # distinct answer in-browser (SHA-256 via crypto.subtle, awaited by
+        # js() which uses awaitPromise). Parent independently expects
+        # sha256(challenge); expected is NEVER literal in stdin, so echo of
+        # input source strings can never PASS. Structured validation: exact
+        # JSON one result event, per-operation typed output, no substring.
+        challenge = _secrets.token_hex(16)
+        expected = _hashlib.sha256(challenge.encode("utf-8")).hexdigest()
+        owned = f"doctor-live-{_os.getpid()}-{challenge[:6]}"
         env = dict(_os.environ)
         env["BU_NAME"] = owned
+        # Actual documented harness API run output: new_tab/js/print/close_tab
+        # with helpers pre-imported; js() evaluates in-browser and returns the
+        # value, parent parses the printed tool result as JSON (not substring).
+        _js_challenge = _json.dumps(challenge)
         code = (
+            'import json\n'
             'new_tab("about:blank")\n'
-            f'js("document.body.dataset.doctorProbe=\'{nonce}\'")\n'
-            'print(js("document.body.dataset.doctorProbe"))\n'
-            'close_tab()\n'
+            'try:\n'
+            f'    _derived = js("(async () => {{ const c = {_js_challenge};'
+            ' const buf = await crypto.subtle.digest(\'SHA-256\','
+            ' new TextEncoder().encode(c));'
+            ' return [...new Uint8Array(buf)].map(b=>b.toString(16).padStart(2,\'0\')).join(\'\');'
+            ' })()")\n'
+            '    print(json.dumps({"event": "doctor-probe-result", "op": "sha256", "derived": _derived}))\n'
+            'finally:\n'
+            '    close_tab()\n'
         )
+        # Parent bug guard: expected must never be literal in stdin (else echo
+        # could PASS). Distinctness: derived answer != challenge.
+        if expected in code:
+            return (False, "browser-use oracle construction failed (fail-closed)")
         try:
             proc = _run_bounded(cmd, timeout=t, input_text=code, env=env)
-            out = ((proc.stdout or "") + (proc.stderr or ""))[:4000]
-            # Exact nonce must appear as evaluate result; static HTML without
-            # nonce (fabricated) can never pass. Echo of code alone is not
-            # sufficient: real result is the bare nonce line.
-            if proc.returncode == 0 and nonce in out:
-                detail = f"launched harness + about:blank + nonce-roundtrip + closed ({nonce})"
-                return (True, detail)
-            return (False, f"browser-use nonce mismatch (exit {proc.returncode}) (fail-closed)")
+            stdout = (proc.stdout or "")[:4000]
+            if proc.returncode != 0:
+                return (False, f"browser-use derived mismatch (exit {proc.returncode}) (fail-closed)")
+            _res = _parse_probe_result_event(stdout)
+            if _res is None:
+                return (False, f"browser-use derived mismatch (exit {proc.returncode}) (fail-closed)")
+            _derived = _res["derived"]
+            # Set-challenge vs returned derived-DOM-answer: distinct,
+            # unguessable, not literal in stdin; echo input source strings FAIL.
+            if _derived != expected or _derived == challenge or expected in code:
+                return (False, f"browser-use derived mismatch (exit {proc.returncode}) (fail-closed)")
+            detail = f"launched harness + about:blank + challenge-derived + closed ({challenge[:6]})"
+            return (True, detail)
         except subprocess.TimeoutExpired:
             return (False, "browser-use launch timed out (fail-closed)")
         except Exception as exc:
@@ -315,11 +425,26 @@ def _launch_browser_probe(timeout: float) -> tuple:
         except Exception as exc:
             return (False, f"agent-browser help inspect failed: {exc} (fail-closed)")
         # Real launch via ACTUAL CLI owned session ONLY (no Python-playwright).
-        # Nonce round-trip: set via one eval, read via SEPARATE eval, exact match.
+        # Challenge/derived: set challenge via one eval, derive distinct answer
+        # in-browser via SEPARATE eval (DOM crypto.subtle SHA-256 over stored
+        # challenge), exact match on independently-expected derived. Entire
+        # after-open state is within try/finally so owned session closes on ALL
+        # failure paths (timeout/exception/nonzero); bounded cleanup failure FAILs.
+        import hashlib as _hashlib2
         import secrets as _secrets2
-        nonce = _secrets2.token_hex(8)
-        owned = f"doctor-live-{_os.getpid()}-{nonce[:6]}"
-        # about:blank open
+        challenge = _secrets2.token_hex(16)
+        expected = _hashlib2.sha256(challenge.encode("utf-8")).hexdigest()
+        owned = f"doctor-live-{_os.getpid()}-{challenge[:6]}"
+        _set_js = f"document.body.dataset.doctorChallenge='{challenge}'"
+        _derive_js = (
+            "(async () => { const v=document.body.dataset.doctorChallenge;"
+            " const buf=await crypto.subtle.digest('SHA-256',"
+            " new TextEncoder().encode(v));"
+            " return [...new Uint8Array(buf)].map(b=>b.toString(16).padStart(2,'0')).join(''); })()"
+        )
+        if expected in _set_js or expected in _derive_js or challenge == expected:
+            return (False, "agent-browser oracle construction failed (fail-closed)")
+        # about:blank open (outside owned-session try: no session yet to close).
         try:
             oproc = _run_bounded([binary, "--session-name", owned, "open", "about:blank"], timeout=t)
             if oproc.returncode != 0:
@@ -328,37 +453,14 @@ def _launch_browser_probe(timeout: float) -> tuple:
             return (False, "agent-browser open timed out (fail-closed)")
         except Exception as exc:
             return (False, f"agent-browser open failed: {exc} (fail-closed)")
-        # Set nonce via actual evaluate, then read via SEPARATE evaluate.
-        try:
-            sproc = _run_bounded(
-                [binary, "--session-name", owned, "eval",
-                 f"document.body.dataset.doctorProbe='{nonce}'"], timeout=t)
-            if sproc.returncode != 0:
-                return (False, f"agent-browser set-nonce exited {sproc.returncode} (fail-closed)")
-        except subprocess.TimeoutExpired:
-            return (False, "agent-browser set-nonce timed out (fail-closed)")
-        except Exception as exc:
-            return (False, f"agent-browser set-nonce failed: {exc} (fail-closed)")
-        try:
-            eproc = _run_bounded(
-                [binary, "--session-name", owned, "eval",
-                 "document.body.dataset.doctorProbe"], timeout=t)
-            eout = ((eproc.stdout or "") + (eproc.stderr or ""))[:4000]
-            # Exact match: separate-read result must equal the unpredictable nonce.
-            # Static HTML / wrong nonce (fabricated) can never pass.
-            if eproc.returncode == 0 and eout.strip() == nonce:
-                detail = f"launched agent-browser CLI + about:blank + nonce-roundtrip + closed ({nonce})"
-                return (True, detail)
-            return (False, f"agent-browser nonce mismatch (exit {eproc.returncode}) (fail-closed)")
-        except subprocess.TimeoutExpired:
-            return (False, "agent-browser eval timed out (fail-closed)")
-        except Exception as exc:
-            return (False, f"agent-browser eval failed: {exc} (fail-closed)")
-        finally:
-            try:
-                _run_bounded([binary, "--session-name", owned, "close"], timeout=min(t, 5.0))
-            except Exception:
-                pass
+        # Entire after-open state delegated to helper whose try/finally
+        # closes the owned session on ALL paths (nonzero/timeout/exception).
+        _ok, _code2, _detail2 = _agent_browser_after_open(
+            binary, owned, _set_js, _derive_js, expected, t)
+        if not _ok:
+            return (False, _detail2)
+        detail = f"launched agent-browser CLI + about:blank + challenge-derived + closed ({challenge[:6]})"
+        return (True, detail)
     return (False, "unknown browser selection (fail-closed)")
 
 
