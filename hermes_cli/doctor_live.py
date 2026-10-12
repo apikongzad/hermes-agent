@@ -230,11 +230,14 @@ def _launch_browser_probe(timeout: float) -> tuple:
     """Launch oracle: the only PASS path (C-ORACLE-2, C-BACKEND-1).
 
     Launches the EXACT binary/entrypoint the tool spawns for the SELECTED
-    backend only, opens about:blank via DOCUMENTED commands, evaluates
-    KNOWN-DOM actual result, closes owned session in finally, reaps bounded.
-    Help/version inspect never confers PASS (diagnostic only).
+    backend only, opens about:blank via DOCUMENTED commands, proves a live
+    DOM via unpredictable-nonce round-trip (set via one evaluate, read via a
+    SEPARATE evaluate, exact match, same owned session), closes owned session
+    in finally, reaps bounded. Fabricated static HTML (wrong nonce) can never
+    PASS. Help/version inspect never confers PASS (diagnostic only).
     """
     import os as _os
+    import secrets as _secrets
     import subprocess
     try:
         t = float(timeout)
@@ -265,23 +268,27 @@ def _launch_browser_probe(timeout: float) -> tuple:
             return (False, "browser-use help inspect timed out (fail-closed)")
         except Exception as exc:
             return (False, f"browser-use help inspect failed: {exc} (fail-closed)")
-        # Real launch: owned BU_NAME session, PY opens about:blank, evals KNOWN-DOM, closes.
-        owned = f"doctor-live-{_os.getpid()}"
+        # Nonce round-trip: unpredictable DOM proof via two separate evaluates.
+        nonce = _secrets.token_hex(8)
+        owned = f"doctor-live-{_os.getpid()}-{nonce[:6]}"
         env = dict(_os.environ)
         env["BU_NAME"] = owned
         code = (
             'new_tab("about:blank")\n'
-            'print(js("document.documentElement.outerHTML"))\n'
+            f'js("document.body.dataset.doctorProbe=\'{nonce}\'")\n'
+            'print(js("document.body.dataset.doctorProbe"))\n'
             'close_tab()\n'
         )
         try:
             proc = _run_bounded(cmd, timeout=t, input_text=code, env=env)
             out = ((proc.stdout or "") + (proc.stderr or ""))[:4000]
-            # KNOWN-DOM actual result: real DOM contains html marker (fake returns KNOWN-DOM-OK html)
-            if proc.returncode == 0 and "<html" in out.lower():
-                detail = f"launched harness + about:blank + KNOWN-DOM + closed ({out.strip()[:80]})"
+            # Exact nonce must appear as evaluate result; static HTML without
+            # nonce (fabricated) can never pass. Echo of code alone is not
+            # sufficient: real result is the bare nonce line.
+            if proc.returncode == 0 and nonce in out:
+                detail = f"launched harness + about:blank + nonce-roundtrip + closed ({nonce})"
                 return (True, detail)
-            return (False, f"browser-use launch missing KNOWN-DOM (exit {proc.returncode}) (fail-closed)")
+            return (False, f"browser-use nonce mismatch (exit {proc.returncode}) (fail-closed)")
         except subprocess.TimeoutExpired:
             return (False, "browser-use launch timed out (fail-closed)")
         except Exception as exc:
@@ -308,7 +315,10 @@ def _launch_browser_probe(timeout: float) -> tuple:
         except Exception as exc:
             return (False, f"agent-browser help inspect failed: {exc} (fail-closed)")
         # Real launch via ACTUAL CLI owned session ONLY (no Python-playwright).
-        owned = f"doctor-live-{_os.getpid()}"
+        # Nonce round-trip: set via one eval, read via SEPARATE eval, exact match.
+        import secrets as _secrets2
+        nonce = _secrets2.token_hex(8)
+        owned = f"doctor-live-{_os.getpid()}-{nonce[:6]}"
         # about:blank open
         try:
             oproc = _run_bounded([binary, "--session-name", owned, "open", "about:blank"], timeout=t)
@@ -318,16 +328,28 @@ def _launch_browser_probe(timeout: float) -> tuple:
             return (False, "agent-browser open timed out (fail-closed)")
         except Exception as exc:
             return (False, f"agent-browser open failed: {exc} (fail-closed)")
-        # KNOWN-DOM eval actual result, close in finally (owned reap)
+        # Set nonce via actual evaluate, then read via SEPARATE evaluate.
+        try:
+            sproc = _run_bounded(
+                [binary, "--session-name", owned, "eval",
+                 f"document.body.dataset.doctorProbe='{nonce}'"], timeout=t)
+            if sproc.returncode != 0:
+                return (False, f"agent-browser set-nonce exited {sproc.returncode} (fail-closed)")
+        except subprocess.TimeoutExpired:
+            return (False, "agent-browser set-nonce timed out (fail-closed)")
+        except Exception as exc:
+            return (False, f"agent-browser set-nonce failed: {exc} (fail-closed)")
         try:
             eproc = _run_bounded(
                 [binary, "--session-name", owned, "eval",
-                 "document.documentElement.outerHTML"], timeout=t)
+                 "document.body.dataset.doctorProbe"], timeout=t)
             eout = ((eproc.stdout or "") + (eproc.stderr or ""))[:4000]
-            if eproc.returncode == 0 and "<html" in eout.lower():
-                detail = f"launched agent-browser CLI + about:blank + KNOWN-DOM + closed ({eout.strip()[:80]})"
+            # Exact match: separate-read result must equal the unpredictable nonce.
+            # Static HTML / wrong nonce (fabricated) can never pass.
+            if eproc.returncode == 0 and eout.strip() == nonce:
+                detail = f"launched agent-browser CLI + about:blank + nonce-roundtrip + closed ({nonce})"
                 return (True, detail)
-            return (False, f"agent-browser eval missing KNOWN-DOM (exit {eproc.returncode}) (fail-closed)")
+            return (False, f"agent-browser nonce mismatch (exit {eproc.returncode}) (fail-closed)")
         except subprocess.TimeoutExpired:
             return (False, "agent-browser eval timed out (fail-closed)")
         except Exception as exc:

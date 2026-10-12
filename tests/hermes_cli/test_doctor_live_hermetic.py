@@ -85,7 +85,8 @@ class TestCOracleLaunchOnly:
 
     def test_launch_oracle_bounded_owned_known_dom(self, tmp_path, monkeypatch):
         # PASS requires ACTUAL launch via fake harness binary (no live host changes):
-        # exact binary, about:blank PY, KNOWN-DOM eval (outerHTML), close/reap.
+        # exact binary, about:blank PY, nonce set-js + separate read-js, owned close/reap.
+        # Fabricated static HTML without nonce can never PASS (C-nonce).
         import inspect
         import sys
         src = inspect.getsource(doctor_live)
@@ -93,19 +94,25 @@ class TestCOracleLaunchOnly:
         assert "15" in src, "timeout clamp 1..15s must be pinned (C-ORACLE-2)"
         assert "sync_playwright" not in src or "NEVER" in src or "ACTUAL CLI" in src, \
             "agent-browser via ACTUAL CLI ONLY, no Python-playwright (C-ORACLE-2)"
-        # Fake harness implementing documented --help + stdin PY protocol
+        # Stateful harness fake: nonce round-trip (set + separate read), not static HTML.
         fake = tmp_path / "fake_harness.py"
         fake.write_text(
-            "import sys\n"
+            "import sys, re\n"
             "args=sys.argv[1:]\n"
             "data=sys.stdin.read() if not sys.stdin.isatty() else ''\n"
             "if '--help' in args:\n"
             " print('browser-harness\\nCommands:')\n"
             " sys.exit(0)\n"
-            "if 'about:blank' in data and ('outerHTML' in data or 'js(' in data):\n"
-            " print('<html><body>KNOWN-DOM-OK</body></html>')\n"
-            " sys.exit(0)\n"
-            "print('missing', file=sys.stderr); sys.exit(2)\n", encoding="utf-8")
+            "if 'about:blank' not in data:\n"
+            " print('missing about:blank', file=sys.stderr); sys.exit(2)\n"
+            "if data.count('js(') < 2:\n"
+            " print('missing separate set+read', file=sys.stderr); sys.exit(2)\n"
+            "import re as _re\n"
+            "m=_re.search(r\"dataset\\.doctorProbe='([0-9a-f]+)'\", data)\n"
+            "if not m:\n"
+            " print('missing set-nonce', file=sys.stderr); sys.exit(2)\n"
+            "print(m.group(1))\n"
+            "sys.exit(0)\n", encoding="utf-8")
         monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "browser-use")
         monkeypatch.setattr("tools.browser_use_cli._find_cli",
                             lambda: [sys.executable, str(fake)])

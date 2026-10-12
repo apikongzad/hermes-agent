@@ -83,6 +83,58 @@ def _cron_preflight_enabled(cfg: dict) -> bool:
     return not isinstance(cron_cfg, dict) or cron_cfg.get("preflight", True) is not False
 
 
+def _validate_raw_fallback_config(job: dict, cfg: dict) -> Optional[str]:
+    """Validate RAW fallback config BEFORE get_fallback_chain filters.
+
+    get_fallback_chain/_iter_fallback_entries silently drop non-dict entries
+    and entries missing provider/model — a malformed operator config would
+    vanish to []/None and never block. This check inspects the RAW
+    cfg["fallback_providers"]/cfg["fallback_model"] values first and BLOCKS
+    on any malformed entry (non-list/dict container, non-dict entry, missing
+    provider/model). Pinned jobs never inherit the global chain, so they skip
+    this (their own pin is validated via the primary probe).
+    """
+    try:
+        pinned = bool(_sched._job_route_pinned(job))
+    except Exception:
+        pinned = False
+    if pinned:
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    for key in ("fallback_providers", "fallback_model"):
+        try:
+            raw = cfg.get(key)
+        except Exception:
+            continue
+        if raw is None:
+            continue
+        if isinstance(raw, dict):
+            candidates = [raw]
+        elif isinstance(raw, list):
+            candidates = raw
+        else:
+            return (
+                f"provider fallback config '{key}' malformed "
+                f"({type(raw).__name__}): config error (fail-closed). "
+                f"Fix '{key}' to a list of {{provider, model}} entries."
+            )
+        for entry in candidates:
+            if not isinstance(entry, dict):
+                return (
+                    f"provider fallback entry is not a dict ({entry!r}): "
+                    "config error (fail-closed). Fix the job's fallback chain."
+                )
+            prov = str(entry.get("provider") or "").strip()
+            mod = str(entry.get("model") or "").strip()
+            if not prov or not mod:
+                return (
+                    f"provider fallback entry missing provider/model ({entry!r}): "
+                    "config error (fail-closed). Fix the job's fallback chain."
+                )
+    return None
+
+
 def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     """READ-ONLY probe: would provider resolution fail for lack of a key?
 
@@ -95,6 +147,14 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     - Optional hint (rate-limited AuthError deferral) may skip; mandatory
       readiness never skips.
     """
+    # RAW validation BEFORE get_fallback_chain filters (malformed would
+    # otherwise vanish to []/None and never block).
+    try:
+        raw_reason = _validate_raw_fallback_config(job, cfg)
+    except Exception as exc:
+        return f"provider fallback chain probe failed: {exc} (fail-closed)"
+    if raw_reason:
+        return raw_reason
     try:
         chain = _sched._job_fallback_chain(job, cfg)
     except Exception as exc:

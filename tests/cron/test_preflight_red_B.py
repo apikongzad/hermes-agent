@@ -119,3 +119,71 @@ class TestBRedReconnectingMustBlock:
                             lambda job, cfg: "MCP server(s) x resolved to zero tools (fail-closed)")
         setup = sched._resolve_cron_agent_setup(job2, "j2", "jn", JC())
         assert setup.blocked is not None, "RED B: 2458 must block empty MCP even with flag false"
+
+
+class TestBRedRawFullPath:
+    """RAW fallback_providers validation BEFORE get_fallback_chain filters.
+
+    Uses the actual full config path (real cfg dict, real _job_fallback_chain,
+    no monkeypatched chain). Malformed dict/list entries must BLOCK at BOTH
+    entrypoints (1712 _preflight_or_block + 2458 _resolve_cron_agent_setup)
+    under BOTH flags (preflight true/false) with zero dispatch (no runtime).
+    """
+
+    @pytest.mark.parametrize("preflight_off", [False, True])
+    @pytest.mark.parametrize("raw", [
+        ["not-a-dict"],
+        [{"provider": "x"}],
+        [{"model": "y"}],
+        [{"provider": "", "model": "y"}],
+        "not-a-list",
+        [{"provider": "x", "model": "y"}, "bad"],
+    ])
+    def test_raw_malformed_blocks_both_entrypoints_zero_dispatch(
+            self, tmp_path, monkeypatch, raw, preflight_off):
+        _env(tmp_path, monkeypatch)
+        from cron import scheduler as sched
+        # Real full path: no monkeypatched _job_fallback_chain (filter-only banned).
+        job = {"id": "j-raw"}  # unpinned: inherits global chain
+        cfg = {"fallback_providers": raw}
+        if preflight_off:
+            cfg["cron"] = {"preflight": False}
+        # 1712 entrypoint must BLOCK on RAW malformed (before filtering).
+        out = sched._preflight_or_block(job, "j-raw", "jn", cfg)
+        assert out is not None, \
+            f"RED B-RAW: 1712 must BLOCK RAW malformed {raw!r} (preflight_off={preflight_off}), got pass"
+        err = out[3] if len(out) > 3 else str(out)
+        assert "fallback" in err.lower(), f"RED B-RAW: 1712 block must name fallback, got {err!r}"
+        # 2458 entrypoint must BLOCK with zero dispatch (no runtime resolution).
+        calls = []
+
+        def _rec_runtime(job2, job_id, jc):
+            calls.append("dispatched")
+            raise AssertionError("RED B-RAW: zero dispatch violated (runtime resolved despite RAW block)")
+
+        monkeypatch.setattr(sched, "_resolve_job_runtime", _rec_runtime)
+
+        class JC:
+            pass
+        jc = JC()
+        jc.cfg = cfg
+        jc.model = "m"
+        jc.model_cfg = {}
+        jc.cron_default_provider = None
+        setup = sched._resolve_cron_agent_setup({"id": "j-raw"}, "j-raw", "jn", jc)
+        assert setup.blocked is not None, \
+            f"RED B-RAW: 2458 must BLOCK RAW malformed {raw!r} (preflight_off={preflight_off})"
+        assert calls == [], \
+            f"RED B-RAW: 2458 zero dispatch violated (runtime called {calls}) for {raw!r}"
+
+    @pytest.mark.parametrize("preflight_off", [False, True])
+    def test_raw_legacy_fallback_model_malformed_blocks(self, tmp_path, monkeypatch, preflight_off):
+        _env(tmp_path, monkeypatch)
+        from cron import scheduler as sched
+        job = {"id": "j-raw2"}
+        cfg = {"fallback_model": ["not-a-dict"]}
+        if preflight_off:
+            cfg["cron"] = {"preflight": False}
+        out = sched._preflight_or_block(job, "j-raw2", "jn", cfg)
+        assert out is not None, "RED B-RAW: legacy fallback_model malformed must BLOCK"
+        assert "fallback" in out[3].lower()

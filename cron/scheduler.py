@@ -1762,8 +1762,8 @@ def _blocked_config_result(job_id: str, job_name: str, _pf_reason: str) -> tuple
         "(nothing was charged).\n\n"
         f"**Reason:** {_pf_reason}\n\n"
         "Hermes tries again at the next scheduled time and clears this state on the first healthy "
-        "run; this alert is not repeated. Check with `hermes cron doctor`. Set `cron.preflight: "
-        "false` in config.yaml to disable this check."
+        "run; this alert is not repeated. Check with `hermes cron doctor` and fix the named "
+        "configuration value."
     )
     return False, blocked_doc, "", f"{marker} {_pf_reason}"
 

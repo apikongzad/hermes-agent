@@ -110,7 +110,15 @@ _openat2_probe_cache: dict = {}
 
 
 def openat2_supported() -> bool:
-    """True when the kernel exposes a real openat2 syscall (never mocked)."""
+    """True when the kernel exposes a real openat2 syscall (never mocked).
+
+    Behavioral probe: issues the real syscall with an invalid fd and
+    differentiates errno — ENOSYS means the kernel has no such syscall
+    (unsupported); EBADF/EINVAL/ENOENT/EACCES/EPERM/ENOTDIR mean the kernel
+    accepted and dispatched it (supported). Numbers: Linux x86_64=437,
+    ARM64/aarch64=437, i386=382 (437 verified on actual aarch64 kernel via
+    EBADF, not ENOSYS).
+    """
     if "v" in _openat2_probe_cache:
         return bool(_openat2_probe_cache["v"])
     try:
@@ -130,15 +138,28 @@ def openat2_supported() -> bool:
             nr = 382
         else:
             nr = 437
-        # Probe with invalid fd: ENOSYS means unsupported, EBADF means present
-        class _How(ct.Structure):
-            _fields_ = [("flags", ct.c_uint64), ("mode", ct.c_uint64), ("resolve", ct.c_uint64)]
+        # Probe with invalid fd: ENOSYS means unsupported, any dispatched
+        # error (EBADF/EINVAL/...) means present.
+        class _How(_ct.Structure):
+            _fields_ = [("flags", _ct.c_uint64), ("mode", _ct.c_uint64), ("resolve", _ct.c_uint64)]
         how = _How(0, 0, 0)
-        libc.syscall.argtypes = [ct.c_long, ct.c_int, ct.c_char_p, ct.POINTER(_How), ct.c_size_t]
-        libc.syscall.restype = ct.c_long
-        ret = libc.syscall(nr, -1, b".", ct.byref(how), ct.sizeof(how))
+        libc.syscall.argtypes = [_ct.c_long, _ct.c_int, _ct.c_char_p, _ct.POINTER(_How), _ct.c_size_t]
+        libc.syscall.restype = _ct.c_long
+        _ct.set_errno(0)
+        ret = libc.syscall(nr, -1, b".", _ct.byref(how), _ct.sizeof(how))
         err = _ct.get_errno()
         import errno as _en
+        if ret == -1 and err == _en.ENOSYS:
+            _openat2_probe_cache["v"] = False
+            return False
+        if ret == -1 and err in (
+            _en.EBADF, _en.EINVAL, _en.ENOENT, _en.EACCES,
+            _en.EPERM, getattr(_en, "ENOTDIR", 20),
+        ):
+            _openat2_probe_cache["v"] = True
+            return True
+        # Any other dispatched outcome (including ret==0, unexpected errno)
+        # still proves the syscall exists; only ENOSYS proves absence.
         if ret == -1 and err == _en.ENOSYS:
             _openat2_probe_cache["v"] = False
             return False

@@ -302,79 +302,102 @@ class TestARedRegistryLazyOpenat2:
 
 
 class TestARedTracerBlocked:
-    def test_real_tracer_required_blocked_when_missing(self, tmp_path, monkeypatch):
+    def _which(self, name: str):
+        import os as _os
+        for d in _os.environ.get("PATH", "").split(_os.pathsep):
+            if not d:
+                continue
+            cand = _os.path.join(d, name)
+            try:
+                if _os.path.isfile(cand) and _os.access(cand, _os.X_OK):
+                    return cand
+            except OSError:
+                continue
+        return None
+
+    def _forbidden_hits(self, log: str):
+        hits = []
+        for forb in ("mkdir(", "mkdirat(", "unlink(", "unlinkat(",
+                     "rmdir(", "rename(", "renameat(", "symlink(", "symlinkat(",
+                     'execve("git', 'execve("./git'):
+            if forb in log:
+                hits.append(forb)
+        return hits
+
+    def test_real_tracer_strace_file_process_hooks_slash(self, tmp_path, monkeypatch):
         home = _home(tmp_path, monkeypatch)
-        dg = _load_lib()
-        # Real tracer: strace or seccomp or kernel fd-trace. If missing, acceptance BLOCKED (fail), never fake pass.
-        has_real = False
-        detail = ""
-        # Probe 1: strace binary runnable (bounded, no live changes: --version only)
+        repo_root = Path(__file__).resolve().parents[2]
+        import subprocess as _sp
+        strace = self._which("strace")
+        if not strace:
+            pytest.fail("BLOCKED A-TRACER-1: no strace binary — must not fake audit-hook pass; do not install (parent handles)")
+        # Version is diagnostic only, NEVER proof: must still produce nonempty trace below.
         try:
-            import subprocess as _sp
-
-            def _which(name: str):
-                for d in __import__("os").environ.get("PATH", "").split(__import__("os").pathsep):
-                    cand = __import__("os").path.join(d, name)
-                    try:
-                        if __import__("os").path.isfile(cand) and __import__("os").access(cand, __import__("os").X_OK):
-                            return cand
-                    except OSError:
-                        continue
-                return None
-
-            strace = _which("strace")
-            if strace:
-                p = _sp.run([strace, "--version"], capture_output=True, text=True, timeout=5, check=False)
-                if p.returncode == 0:
-                    has_real = True
-                    detail = "strace"
-        except Exception as e:
-            detail = f"strace probe failed: {e}"
-        # Probe 2: seccomp python module
-        if not has_real:
-            try:
-                import seccomp  # type: ignore
-                has_real = True
-                detail = "seccomp"
-            except Exception:
-                pass
-        # Probe 3: explicit helper from lib exposing real trace support
-        if not has_real and hasattr(dg, "tracer_available"):
-            try:
-                if bool(dg.tracer_available()):
-                    has_real = True
-                    detail = "lib-tracer"
-            except Exception:
-                pass
-        if not has_real:
-            pytest.fail(f"BLOCKED A-TRACER-1: no real tracer (strace/seccomp) available [{detail}] — must not fake audit-hook pass; do not install packages (parent handles)")
-        # If real tracer exists, exercise slice under it and assert zero forbidden syscalls
-        # (minimal: run quick() under strace -f -e trace=%file,%process and assert no mkdir/unlink etc)
-        # Hermetic bounded: trace only quick() with temp home, output cap.
+            pv = _sp.run([strace, "--version"], capture_output=True, text=True, timeout=5, check=False)
+            _version_ok = (pv.returncode == 0)
+        except Exception:
+            _version_ok = False
+        # Hermetic log under workspace/.cache, NEVER bare /tmp.
+        cache_dir = home / "workspace" / ".cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        log_path = cache_dir / "redA-strace.log"
+        canary_path = cache_dir / "redA-canary.log"
+        assert not str(log_path).startswith("/tmp/") or str(home) in str(log_path), \
+            "tracer log must live under hermetic workspace/.cache, not bare /tmp"
+        # Isolated child: real readonly API calls covering hooks + slash.
+        dg_path = repo_root / "plugins" / "disk-cleanup" / "disk_cleanup.py"
+        plug_path = repo_root / "plugins" / "disk-cleanup" / "__init__.py"
+        code = (
+            "import os,sys; os.environ['HERMES_HOME']=sys.argv[1]; "
+            f"sys.path.insert(0, {str(repo_root)!r}); "
+            "import importlib.util as _ilu, sys as _sys; "
+            f"spec=_ilu.spec_from_file_location('dg_trace', {str(dg_path)!r}); "
+            "dg=_ilu.module_from_spec(spec); _sys.modules['dg_trace']=dg; spec.loader.exec_module(dg); "
+            f"spec2=_ilu.spec_from_file_location('plug_trace', {str(plug_path)!r}); "
+            "plug=_ilu.module_from_spec(spec2); _sys.modules['plug_trace']=plug; spec2.loader.exec_module(plug); "
+            # Real readonly slice: bound reads only, no writes.
+            "dg.status(); dg.dry_run(); dg.quick(); "
+            # Slash readonly subcommands.
+            "plug._handle_slash('status'); plug._handle_slash('dry-run'); "
+            # Hooks readonly classification (absent-path snapshot, no writes).
+            "plug._on_pre_tool_call(tool_name='write_file', args={'path': 'test_probe_x.py'}, task_id='t1', session_id='s1', tool_call_id='c1'); "
+            "plug._on_post_tool_call(tool_name='write_file', args={'path': 'test_probe_x.py'}, task_id='t1', session_id='s1', tool_call_id='c1'); "
+        )
+        _sp.run([strace, "-f", "-e", "trace=%file,%process", "-o", str(log_path),
+                 sys.executable, "-c", code, str(home)],
+                capture_output=True, text=True, timeout=20, check=False)
+        # Parse: nonempty trace required — version-ok alone NEVER passes.
         try:
-            import subprocess as _sp2
-            strace2 = _which("strace") if "_which" in dir() else None
-            if strace2 and detail == "strace":
-                # Run quick() in subprocess under strace to get real syscall profile
-                code = (
-                    "import os,sys; os.environ['HERMES_HOME']=sys.argv[1]; "
-                    "sys.path.insert(0, '.'); "
-                    "import importlib.util; spec=importlib.util.spec_from_file_location('m','plugins/disk-cleanup/disk_cleanup.py'); "
-                    "m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m); m.quick()"
-                )
-                _sp2.run([strace2, "-f", "-e", "trace=%file,%process", "-o", "/tmp/redA-strace.log",
-                               sys.executable, "-c", code, str(home)],
-                              capture_output=True, text=True, timeout=15, check=False)
-                # Read log bounded
-                try:
-                    log = Path("/tmp/redA-strace.log").read_text(encoding="utf-8", errors="replace")[:8000]
-                except OSError:
-                    log = ""
-                for forb in ("mkdir", "unlink", "rmdir", "rename", "execve(\"git\"", "execve(\"./git\""):
-                    assert forb not in log, f"RED A-TRACER: forbidden syscall {forb} on slice"
-                try:
-                    Path("/tmp/redA-strace.log").unlink()
-                except OSError:
-                    pass
-        except Exception as e:
-            pytest.fail(f"RED A-TRACER real-trace assertion failed: {e}")
+            log = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            log = ""
+        assert log.strip() != "", \
+            f"RED A-TRACER: empty trace FAIL (version_ok={_version_ok} is not proof); strace produced no output"
+        # Startup boundary: trace must start from child exec (proves full capture, not truncated/empty).
+        assert "execve(" in log, "RED A-TRACER: missing startup boundary execve( (trace truncated or not -f from start)"
+        # File/process classes actually traced.
+        assert ("openat" in log or "open(" in log), "RED A-TRACER: no file-class syscalls (need -e trace=%file)"
+        # Zero forbidden syscalls on readonly slice.
+        hits = self._forbidden_hits(log)
+        assert hits == [], f"RED A-TRACER: forbidden syscall on readonly slice: {hits}"
+        # Positive canary: same parser MUST reject a real forbidden syscall (proves non-vacuous).
+        canary_code = (
+            "import os,sys,pathlib; os.environ['HERMES_HOME']=sys.argv[1]; "
+            "p=pathlib.Path(sys.argv[1]) / 'canary_dir_proof'; p.mkdir(exist_ok=True)"
+        )
+        _sp.run([strace, "-f", "-e", "trace=%file,%process", "-o", str(canary_path),
+                 sys.executable, "-c", canary_code, str(home)],
+                capture_output=True, text=True, timeout=15, check=False)
+        try:
+            canary_log = canary_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            canary_log = ""
+        assert canary_log.strip() != "", "RED A-TRACER canary: empty trace FAIL"
+        assert "execve(" in canary_log, "RED A-TRACER canary: missing startup boundary"
+        canary_hits = self._forbidden_hits(canary_log)
+        assert "mkdir(" in canary_log or "mkdirat(" in canary_log, \
+            "RED A-TRACER canary: expected mkdir in canary trace, got none (parser vacuous check failed)"
+        assert canary_hits != [], \
+            "RED A-TRACER canary: parser failed to reject real forbidden mkdir (must reject)"
+        # Never used bare /tmp log.
+        assert not Path("/tmp/redA-strace.log").exists(), "must not use bare /tmp log; use workspace/.cache"
