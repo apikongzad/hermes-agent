@@ -277,8 +277,76 @@ class TestBrowserAvailable:
             raise FileNotFoundError("agent-browser CLI not found")
 
         monkeypatch.setattr(bt_install, "_find_agent_browser", _raise)
+        monkeypatch.setattr("tools.browser_use_cli._find_cli", lambda: None)
 
         assert _real_browser_available() is False
+
+    def test_true_when_harness_ready_despite_missing_agent_browser(self, monkeypatch, tmp_path):
+        self._block_path_and_node_modules_checks(monkeypatch, tmp_path)
+
+        def _raise(**_kw):
+            raise FileNotFoundError("agent-browser CLI not found")
+
+        monkeypatch.setattr(bt_install, "_find_agent_browser", _raise)
+        monkeypatch.setattr("tools.browser_use_cli._find_cli", lambda: ["python", "-m", "browser_harness.run"])
+
+        assert _real_browser_available() is True
+
+
+class TestBrowserBackendProbe:
+    """Configured-backend probe must not fail a ready backend for missing playwright."""
+
+    def test_harness_ready_passes_without_playwright(self, monkeypatch):
+        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: True)
+        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
+        import sys as _sys
+        monkeypatch.setitem(_sys.modules, "browser_harness", type(_sys)("browser_harness"))
+        ok, detail = doctor_live._launch_browser_probe(5.0)
+        assert ok is True
+        assert "BrowserUseCLI" in detail
+
+    def test_agent_browser_ready_probes_binary_bounded(self, monkeypatch, tmp_path):
+        fake_bin = tmp_path / "agent-browser"
+        fake_bin.write_text("#!/bin/sh\necho agent-browser-1.2.3\n")
+        fake_bin.chmod(0o755)
+        fake_chromium = tmp_path / "chromium"
+        fake_chromium.write_text("x")
+        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: False)
+        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: True)
+        monkeypatch.setattr("tools.browser_tool_install._find_agent_browser", lambda **_kw: str(fake_bin))
+        monkeypatch.setattr(doctor_live, "chromium_executable", lambda: str(fake_chromium))
+        import subprocess as _sp
+        real_run = _sp.run
+        seen = {}
+
+        def _spy(*a, **k):
+            seen["timeout"] = k.get("timeout")
+            return real_run(*a, **k)
+
+        monkeypatch.setattr(_sp, "run", _spy)
+        ok, detail = doctor_live._launch_browser_probe(5.0)
+        assert ok is True
+        assert "agent-browser runnable" in detail
+        assert seen["timeout"] is not None and seen["timeout"] <= 15.0
+
+    def test_no_backend_no_playwright_reports_ready_state_not_bare_import(self, monkeypatch):
+        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: False)
+        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
+        import sys as _sys
+        monkeypatch.delitem(_sys.modules, "playwright.sync_api", raising=False)
+        # Force ImportError even if playwright happens to be installed in the env.
+        import builtins as _bi
+        real_import = _bi.__import__
+
+        def _no_playwright(name, *a, **k):
+            if name.startswith("playwright"):
+                raise ImportError("No module named playwright")
+            return real_import(name, *a, **k)
+
+        monkeypatch.setattr(_bi, "__import__", _no_playwright)
+        ok, detail = doctor_live._launch_browser_probe(5.0)
+        assert ok is False
+        assert "no browser backend ready" in detail
 
 
 class TestFailureIsolation:

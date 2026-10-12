@@ -52,8 +52,17 @@ def _http_get(url: str, headers: Optional[dict] = None, timeout: Optional[float]
     return httpx.get(url, headers=headers or {}, timeout=timeout)
 
 
-def _browser_available() -> bool:
-    """Is the local browser automation backend (agent-browser) installed?"""
+def _browser_use_ready() -> bool:
+    """Bundled BrowserUseCLI backend ready (browser_harness importable)?"""
+    try:
+        from tools.browser_use_cli import _find_cli
+        return _find_cli() is not None
+    except Exception:
+        return False
+
+
+def _agent_browser_ready() -> bool:
+    """PM/store or PATH agent-browser binary present (passive, no install)?"""
     try:
         from tools.browser_tool_install import _find_agent_browser
         return bool(_find_agent_browser(validate=False))
@@ -61,13 +70,76 @@ def _browser_available() -> bool:
         return False
 
 
+def _browser_available() -> bool:
+    """Is any local browser automation backend ready?
+
+    Covers both the bundled BrowserUseCLI harness (default backend, runs on
+    this interpreter) and the PM-owned agent-browser binary. Passive only:
+    never installs or executes anything.
+    """
+    return _browser_use_ready() or _agent_browser_ready()
+
+
+def _probe_configured_backend(timeout: float) -> tuple | None:
+    """Bounded readiness probe via the configured backend (no playwright needed).
+
+    Returns ``(ok, detail)`` when a backend-specific probe ran, else ``None``
+    to fall through to the playwright launch path. Uses only bounded,
+    side-effect-free checks with cleanup: harness import + agent-browser
+    ``--version`` subprocess with timeout.
+    """
+    import subprocess
+
+    # BrowserUseCLI first: it is the default backend whenever the harness is
+    # importable, even with no agent-browser on PATH.
+    if _browser_use_ready():
+        try:
+            import browser_harness  # noqa: F401 -- readiness probe only
+            return (True, "browser-harness importable (BrowserUseCLI backend ready)")
+        except Exception as exc:
+            return (False, f"browser-harness broken: {exc}")
+    # agent-browser binary + Chromium executable: bounded --version run proves
+    # the bootstrap the browser tools actually exec is runnable.
+    if _agent_browser_ready():
+        try:
+            from tools.browser_tool_install import _find_agent_browser
+            binary = _find_agent_browser(validate=False)
+        except Exception as exc:
+            return (False, f"agent-browser lookup failed: {exc}")
+        chromium = chromium_executable()
+        if not chromium:
+            return (False, "agent-browser ready but Chromium executable missing")
+        try:
+            proc = subprocess.run([binary, "--version"], capture_output=True,
+                                  text=True, encoding="utf-8", errors="replace",
+                                  timeout=max(1.0, min(timeout, 15.0)), check=False)
+            if proc.returncode == 0:
+                return (True, f"agent-browser runnable + Chromium present ({proc.stdout.strip()[:80] or 'ok'})")
+            return (False, f"agent-browser --version exited {proc.returncode}")
+        except subprocess.TimeoutExpired:
+            return (False, "agent-browser --version timed out")
+        except Exception as exc:
+            return (False, f"agent-browser probe failed: {exc}")
+    return None
+
+
 def _launch_browser_probe(timeout: float) -> tuple:
-    """Launch a browser, open about:blank, close. Returns (ok, detail). Uses Playwright directly (what
-    agent-browser drives underneath) so the probe owns the full lifecycle and always cleans up."""
+    """Launch a browser, open about:blank, close. Returns (ok, detail).
+
+    Prefers the configured backend's bounded readiness probe (bundled
+    BrowserUseCLI harness or agent-browser bootstrap) so a missing optional
+    playwright python package never fails a ready backend. Falls through to a
+    full playwright launch (what agent-browser drives underneath) only when no
+    backend probe applied and playwright is importable; the launch owns the
+    full lifecycle and always cleans up.
+    """
+    backend_probe = _probe_configured_backend(timeout)
+    if backend_probe is not None:
+        return backend_probe
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        return (False, "playwright not installed")
+        return (False, "no browser backend ready (browser-harness/agent-browser missing) and playwright not installed")
     with sync_playwright() as p:
         browser = p.chromium.launch(
             channel="chromium", executable_path=chromium_executable(),
