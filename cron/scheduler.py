@@ -1695,10 +1695,11 @@ def _load_prefill_messages(cfg: dict, job_id: str) -> Optional[list]:
 
 
 def _preflight_or_block(job: dict, job_id: str, job_name: str, cfg: dict) -> Optional[tuple]:
-    """Pre-dispatch config validation: refuse unrunnable jobs (missing key, unready skill,
-    unconfigured delivery) BEFORE AIAgent is built. run_one_job keys off BLOCKED_CONFIG_MARKER to
-    record blocked_config and alert once (`preflight_alerted` bit). Must run after the wake gate so
-    silent ticks stay silent. Opt-out: `cron.preflight: false`. Returns failure tuple or None.
+    """Pre-dispatch config validation: fail-closed (B-CRON-6, B-PREFLIGHT-FLAG).
+
+    NEW mandatory guard ALWAYS runs regardless of cron.preflight flag at BOTH
+    1712 and 2458, fail-closed on raise. cron.preflight:false disables ONLY
+    optional costly non-security hints, never mandatory readiness.
     """
     # --------------------------------------------------------------- Pre-dispatch configuration validation
     # (T1-26). A job whose configuration cannot possibly produce a successful run — missing provider API key
@@ -1709,20 +1710,35 @@ def _preflight_or_block(job: dict, job_id: str, job_name: str, cfg: dict) -> Opt
     # job's `preflight_alerted` bit — the #73506 alert-once shape).
     _pf_reason = None
     try:
-        if _cron_preflight_enabled(cfg):
+        # B-PREFLIGHT-FLAG: NEW mandatory guard ALWAYS runs, even with preflight:false
+        try:
+            from cron.scheduler_preflight import _cron_mandatory_readiness_guard as _mand
+            _pf_reason = _mand(job, cfg)
+        except Exception as exc:
+            _pf_reason = f"mandatory readiness guard failed: {exc} (fail-closed)"
+        if _pf_reason is None and _cron_preflight_enabled(cfg):
             _pf_reason = _preflight_job_config(job, cfg)
             if not _pf_reason and job.get("preflight_alerted"):
                 # Config healthy again: clear alert-once marker so a future break re-alerts.
                 with contextlib.suppress(Exception):
                     from cron.jobs import clear_preflight_alerted
                     clear_preflight_alerted(job_id)
-    except Exception:
-        # Fail open: the validator must never take down a runnable job.
-        logger.debug("Job '%s': preflight validation errored — failing open", job_id, exc_info=True)
-        _pf_reason = None
+    except Exception as exc:
+        # B-CRON-6 fail-closed: validator error -> blocked, job does not dispatch
+        logger.debug("Job '%s': preflight validation errored — failing closed", job_id, exc_info=True)
+        _pf_reason = f"preflight validator errored: {exc} (fail-closed)"
     if not _pf_reason:
         return None
     return _blocked_config_result(job_id, job_name, _pf_reason)
+
+
+def _cron_mandatory_readiness_guard(job: dict, cfg: dict) -> Optional[str]:
+    """Re-exported mandatory guard for B-PREFLIGHT-FLAG tests (both 1712+2458)."""
+    try:
+        from cron.scheduler_preflight import _cron_mandatory_readiness_guard as _inner
+        return _inner(job, cfg)
+    except Exception as exc:
+        return f"mandatory readiness guard failed: {exc} (fail-closed)"
 
 
 def _blocked_config_result(job_id: str, job_name: str, _pf_reason: str) -> tuple:
@@ -1746,8 +1762,8 @@ def _blocked_config_result(job_id: str, job_name: str, _pf_reason: str) -> tuple
         "(nothing was charged).\n\n"
         f"**Reason:** {_pf_reason}\n\n"
         "Hermes tries again at the next scheduled time and clears this state on the first healthy "
-        "run; this alert is not repeated. Check with `hermes cron doctor`. Set `cron.preflight: "
-        "false` in config.yaml to disable this check."
+        "run; this alert is not repeated. Check with `hermes cron doctor` and fix the named "
+        "configuration value."
     )
     return False, blocked_doc, "", f"{marker} {_pf_reason}"
 
@@ -2455,10 +2471,13 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     _init_cron_mcp_tools(job_id)
     # Only now can a requested MCP toolset be judged: its alias is process-global but its tools live
     # in this profile's registry overlay, and quiet_mode hides the empty resolution (#109050).
-    if _cron_preflight_enabled(_cfg):
+    # B-PREFLIGHT-FLAG 2458: mandatory MCP full policy ALWAYS runs, even with preflight:false.
+    try:
         _mcp_reason = _empty_requested_mcp_toolsets(job, _cfg)
-        if _mcp_reason:
-            setup.blocked = _blocked_config_result(job_id, job_name, _mcp_reason)
+    except Exception as exc:
+        _mcp_reason = f"mandatory MCP check failed: {exc} (fail-closed)"
+    if _mcp_reason:
+        setup.blocked = _blocked_config_result(job_id, job_name, _mcp_reason)
     return setup
 
 

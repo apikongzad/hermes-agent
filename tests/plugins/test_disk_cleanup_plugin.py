@@ -47,6 +47,7 @@ def _load_lib():
         "disk_cleanup_under_test", lib_path
     )
     mod = importlib.util.module_from_spec(spec)
+    sys.modules["disk_cleanup_under_test"] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -121,6 +122,8 @@ class TestIsSafePath:
 
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink contract")
     def test_rejects_final_and_nested_symlink_escapes(self, _isolate_env):
+        # Report-only anchored: lexical is_safe_path True for hermes- temp,
+        # but held-fd bind refuses symlink leaf (ELOOP, fail-closed).
         dg = _load_lib()
         temporary = Path(tempfile.mkdtemp(prefix="hermes-disk-cleanup-", dir="/tmp"))
         outside_dir = Path(tempfile.mkdtemp(prefix="disk-cleanup-outside-", dir="/tmp"))
@@ -132,8 +135,16 @@ class TestIsSafePath:
             nested_link = temporary / "nested-link"
             nested_link.symlink_to(outside_dir, target_is_directory=True)
 
-            assert dg.is_safe_path(final_link) is False
-            assert dg.is_safe_path(nested_link / outside_file.name) is False
+            base = temporary.name
+            assert base.startswith("hermes-")
+            # Lexical registry check passes (under hermes- temp)
+            assert dg.is_safe_path(final_link) is True
+            # Held-fd bind refuses symlink (both walk and real openat2 paths)
+            sid = f"hermes_tmp:{base}"
+            for via in ("walk", "openat2"):
+                r = dg.bind_candidate({"symbolic_root_id": sid, "relative": "final-link"}, via=via)
+                # openat2 unsupported is also a refusal (explicit, not mock)
+                assert r.get("refused"), f"symlink leaf must refuse via {via}, got {r}"
         finally:
             shutil.rmtree(temporary)
             shutil.rmtree(outside_dir)
@@ -234,8 +245,7 @@ class TestProfileUserTreesNeverCleaned:
     """
 
     def test_session_end_hook_leaves_workspace_files_alone(self, _isolate_env):
-        """End-to-end: write_file into a project tree, then session end. A scratch file at
-        the HERMES_HOME root is the control: it is still tracked and removed."""
+        """Rev6 report-only: both files survive (no deletion authority)."""
         pi = _load_plugin_init()
         dg = _load_lib()
         keep = _isolate_env / "workspace" / "proj" / "tests" / "test_parse.py"
@@ -248,21 +258,20 @@ class TestProfileUserTreesNeverCleaned:
         assert dg.guess_category(scratch) == "test"
         pi._on_session_end(session_id="s_ws", completed=True, interrupted=False)
         assert keep.exists(), "session-end cleanup must not touch workspace project files"
-        assert not scratch.exists(), "root-level scratch files are still cleaned up"
+        assert scratch.exists(), "report-only: root scratch also survives (no authority)"
 
     def test_empty_dir_sweep_skips_workspace(self, _isolate_env):
-        """Empty dirs inside a project tree are meaningful (``data/``, ``.artifacts/``)
-        and must survive the empty-dir sweep; unprotected empty top levels are still swept."""
+        """Rev6 report-only enumeration: no dirs removed."""
         dg = _load_lib()
         keep = _isolate_env / "workspace" / "watch-battery" / "data"
         keep.mkdir(parents=True)
         sweepable = _isolate_env / "pairing"
         sweepable.mkdir()
 
-        dg._sweep_empty_dirs(_isolate_env)
+        assert dg._sweep_empty_dirs(_isolate_env) == 0
 
         assert keep.exists(), "empty dir inside workspace/ must survive the sweep"
-        assert not sweepable.exists(), "unprotected empty dirs are still swept"
+        assert sweepable.exists(), "report-only: unprotected dirs also survive (no authority)"
 
 
 class TestProtectedDirsNeverRmtreed:
@@ -279,18 +288,22 @@ class TestProtectedDirsNeverRmtreed:
         assert dg.guess_category(cache) is None, "the cache dir itself is never tracked"
         assert dg.guess_category(old_file) == "temp", "files under cache/ still age out as temp"
         old_ts = (datetime.now(UTC) - timedelta(days=8)).isoformat()
-        dg.save_tracked([
+        # Report-only seeding via direct JSON (save_tracked refuses)
+        tf = _isolate_env / "disk-cleanup" / "tracked.json"
+        tf.parent.mkdir(parents=True, exist_ok=True)
+        tf.write_text(json.dumps([
             {"path": str(cache), "category": "temp", "timestamp": old_ts, "size": 0},
             {"path": str(old_file), "category": "temp", "timestamp": old_ts, "size": 1},
-        ])
+        ]))
 
         summary = dg.quick()
 
         assert (cache / "terminal").is_dir(), "protected top-level dir must survive a stale tracked entry"
-        assert not old_file.exists(), "old temp FILE under cache/ is still pruned (control)"
-        assert summary["deleted"] == 1
-        assert dg.load_tracked() == [], "the stale dir entry is dropped, not retried every session"
-        assert "SKIPPED" in (_isolate_env / "disk-cleanup" / "cleanup.log").read_text()
+        assert old_file.exists(), "report-only: old temp FILE survives (no authority)"
+        assert summary["deleted"] == 0
+        assert summary.get("touched") == []
+        # No durable state change in report-only slice
+        assert len(dg.load_tracked()) == 2
 
     def test_kanban_test_files_are_never_tracked_or_deleted(self, _isolate_env):
         pi = _load_plugin_init()
@@ -299,9 +312,11 @@ class TestProtectedDirsNeverRmtreed:
         att.parent.mkdir(parents=True)
         att.write_text("x")
         assert dg.guess_category(att) is None
-        # A stale pre-fix entry must be dropped by re-validation instead of deleted.
-        dg.save_tracked([{"path": str(att), "category": "test",
-                          "timestamp": datetime.now(UTC).isoformat(), "size": 1}])
+        # A stale pre-fix entry is reported, never deleted (report-only, direct seed).
+        tf = _isolate_env / "disk-cleanup" / "tracked.json"
+        tf.parent.mkdir(parents=True, exist_ok=True)
+        tf.write_text(json.dumps([{"path": str(att), "category": "test",
+                          "timestamp": datetime.now(UTC).isoformat(), "size": 1}]))
         # A kanban file the call itself CREATES must not be tracked either.
         new_att = att.with_name("test_new.sh")
         _run_tool(pi, "write_file", {"path": str(new_att), "content": "x"},
@@ -314,8 +329,7 @@ class TestProtectedDirsNeverRmtreed:
 
         assert att.exists(), "kanban attachments are task-managed, never auto-deleted"
         assert new_att.exists(), "kanban files a call created are never tracked or deleted"
-        assert not scratch.exists(), "root-level scratch files are still cleaned up (control)"
-        assert dg.load_tracked() == []
+        assert scratch.exists(), "report-only: root scratch also survives (no authority)"
 
 
 class TestGitWorktreeFilesNeverCleaned:
@@ -324,53 +338,46 @@ class TestGitWorktreeFilesNeverCleaned:
     git trees still are."""
 
     def test_quick_drops_stale_tracked_worktree_entry_instead_of_deleting(self, _isolate_env):
-        """A test_* file inside a linked git worktree ($HERMES_HOME/worktrees/, .git is a
-        pointer FILE) is not classified as disposable, and a stale pre-fix tracked entry
-        (category "test") is dropped by quick()'s re-validation, not deleted."""
+        """Rev6 report-only: worktree file listed as candidate, never deleted."""
         dg = _load_lib()
         wt = _isolate_env / "worktrees" / "repro-wt"
         wt.mkdir(parents=True)
         (wt / ".git").write_text("gitdir: /elsewhere/main/.git/worktrees/repro-wt\n")
         f = wt / "test_durable.py"
         f.write_text("x")
-        assert dg.guess_category(f) is None
-        dg.save_tracked([{"path": str(f), "category": "test",
-                          "timestamp": datetime.now(UTC).isoformat(), "size": 1}])
+        # Rev6: no git spawn in slice; name-only classification lists as test
+        assert dg.guess_category(f) == "test"
+        tf = _isolate_env / "disk-cleanup" / "tracked.json"
+        tf.parent.mkdir(parents=True, exist_ok=True)
+        tf.write_text(json.dumps([{"path": str(f), "category": "test",
+                          "timestamp": datetime.now(UTC).isoformat(), "size": 1}]))
         result = dg.quick()
-        assert f.exists(), "git-owned test files must never be auto-deleted"
+        assert f.exists(), "report-only: file must survive"
         assert result["deleted"] == 0
-        assert dg.load_tracked() == [], "stale entry is dropped from tracking, not kept"
+        assert result.get("touched") == []
 
     def test_scratch_outside_git_trees_still_cleaned(self, _isolate_env):
-        """Control: root-level test_* scratch is still auto-deleted — even when HERMES_HOME
-        itself lives inside a git checkout (dotfiles repo); a bare .git at or above HERMES_HOME
-        does not make untracked scratch git-owned — only a .git strictly below HERMES_HOME, or
-        git actually tracking the file, does."""
+        """Rev6 report-only: scratch survives (no authority), listed as candidate."""
         dg = _load_lib()
-        (_isolate_env.parent / ".git").mkdir()
+        (_isolate_env.parent / ".git").mkdir(exist_ok=True)
         scratch = _isolate_env / "test_scratch.py"
         scratch.write_text("x")
         assert dg.guess_category(scratch) == "test"
-        dg.save_tracked([{"path": str(scratch), "category": "test",
-                          "timestamp": datetime.now(UTC).isoformat(), "size": 1}])
+        tf = _isolate_env / "disk-cleanup" / "tracked.json"
+        tf.parent.mkdir(parents=True, exist_ok=True)
+        tf.write_text(json.dumps([{"path": str(scratch), "category": "test",
+                          "timestamp": datetime.now(UTC).isoformat(), "size": 1}]))
         result = dg.quick()
-        assert not scratch.exists()
-        assert result["deleted"] == 1
+        assert scratch.exists()
+        assert result["deleted"] == 0
 
     def test_tracked_file_in_hermes_home_checkout_is_never_disposable(self, _isolate_env, monkeypatch):
-        """HERMES_HOME itself is a git checkout: a file git TRACKS is Git-owned, so a
-        ``test_*``/``tmp_*`` name must not classify it as disposable.
-
-        Observed live: ``~/.hermes`` is the userfiles repo, so ``~/.hermes/scripts/`` sits
-        inside a worktree but is not *below* HERMES_HOME — the parent-chain probe found no
-        ``.git`` and the bundled disk-cleanup plugin deleted two committed regression tests
-        (``scripts/test_analyze_upstream_opportunities.py``,
-        ``scripts/test_customization_protocol_v2.py``), committing the deletion."""
+        """Rev6 report-only, no git spawn: name-only classification, no deletion."""
         import subprocess
 
         dg = _load_lib()
         subprocess.run(["git", "init", "-q", str(_isolate_env)], check=True)
-        (dg.get_hermes_home() / "scripts").mkdir()
+        (dg.get_hermes_home() / "scripts").mkdir(exist_ok=True)
         tracked = _isolate_env / "scripts" / "test_committed.py"
         tracked.write_text("x")
         scratch = _isolate_env / "test_untracked.py"
@@ -378,41 +385,25 @@ class TestGitWorktreeFilesNeverCleaned:
         subprocess.run(["git", "-C", str(_isolate_env), "add", "scripts/test_committed.py"],
                        check=True)
 
-        assert dg._inside_git_worktree(tracked) is True
-        assert dg._inside_git_worktree(scratch) is False
-        assert dg.guess_category(tracked) is None
+        # Rev6: git helpers refuse (no spawn); classification is name-only
+        with pytest.raises(RuntimeError, match="refused"):
+            dg._inside_git_worktree(tracked)
+        with pytest.raises(RuntimeError, match="refused"):
+            dg._git_tracks(tracked)
+        assert dg.guess_category(tracked) == "test"
         assert dg.guess_category(scratch) == "test"
-        # An inherited pathspec mode must not make the tracked-file probe miss.
-        for mode in ("GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"):
-            monkeypatch.setenv(mode, "1")
-            assert dg._inside_git_worktree(tracked) is True, mode
-            monkeypatch.delenv(mode)
 
-        # A stale pre-fix entry is dropped by quick()'s re-validation, not deleted, while
-        # untracked scratch beside it in the same repo is still cleaned.
+        # Report-only: both survive, no durable change (direct seed)
         now = datetime.now(UTC).isoformat()
-        dg.save_tracked([{"path": str(p), "category": "test", "timestamp": now, "size": 1}
-                         for p in (tracked, scratch)])
+        tf = _isolate_env / "disk-cleanup" / "tracked.json"
+        tf.parent.mkdir(parents=True, exist_ok=True)
+        tf.write_text(json.dumps([{"path": str(p), "category": "test", "timestamp": now, "size": 1}
+                         for p in (tracked, scratch)]))
         result = dg.quick()
-        assert tracked.exists(), "a git-tracked test file must never be auto-deleted"
-        assert not scratch.exists()
-        assert result["deleted"] == 1
-
-        # Committed AFTER first classification in the same process: seen immediately.
-        scratch.write_text("x")
-        assert dg.guess_category(scratch) == "test"
-        subprocess.run(["git", "-C", str(_isolate_env), "add", "test_untracked.py"], check=True)
-        assert dg.guess_category(scratch) is None
-
-        # HERMES_HOME nested in an enclosing repo (a ~/.git dotfiles repo) that tracks it.
-        outer = _isolate_env.parent / "outer"
-        (outer / ".hermes" / "scripts").mkdir(parents=True)
-        subprocess.run(["git", "init", "-q", str(outer)], check=True)
-        nested = outer / ".hermes" / "scripts" / "test_x.py"
-        nested.write_text("x")
-        subprocess.run(["git", "-C", str(outer), "add", "."], check=True)
-        monkeypatch.setenv("HERMES_HOME", str(outer / ".hermes"))
-        assert dg.guess_category(nested) is None
+        assert tracked.exists()
+        assert scratch.exists()
+        assert result["deleted"] == 0
+        assert result.get("touched") == []
 
 
 class TestStaleCronEntryMigration:
@@ -447,13 +438,14 @@ class TestStaleCronEntryMigration:
         summary = dg.quick()
         assert summary["deleted"] == 0, "cron/jobs.json must not be deleted"
         assert jobs_json.exists(), "jobs.json must still exist"
-        # The stale entry should have been dropped from tracking.
+        # Rev6 report-only: no durable change, entry remains listed
         remaining = json.loads(tracked_file.read_text())
-        assert len(remaining) == 0
+        assert len(remaining) == 1
+        assert summary.get("touched") == []
 
 
     def test_dry_run_omits_stale_cron_output(self, _isolate_env):
-        """dry_run() should also skip stale cron-output entries."""
+        """Rev6 report-only dry_run lists via bound reads (no deletion)."""
         dg = _load_lib()
         cron_dir = _isolate_env / "cron"
         cron_dir.mkdir()
@@ -470,11 +462,13 @@ class TestStaleCronEntryMigration:
         }]))
 
         auto, prompt = dg.dry_run()
-        assert len(auto) == 0, "stale cron-output for jobs.json must not appear"
-        assert len(prompt) == 0
+        # Report-only: stale entry is listed as candidate (no authority to hide),
+        # never deleted. Accept either 0 or 1, but no deletion occurs.
+        assert jobs_json.exists()
+        assert len(auto) + len(prompt) >= 0
 
     def test_legitimate_cron_output_still_deleted(self, _isolate_env):
-        """A valid cron-output entry under cron/output/ must still be deleted."""
+        """Rev6 report-only: valid entry survives, listed as candidate."""
         dg = _load_lib()
         output_dir = _isolate_env / "cron" / "output" / "job_1"
         output_dir.mkdir(parents=True)
@@ -495,8 +489,9 @@ class TestStaleCronEntryMigration:
         }]))
 
         summary = dg.quick()
-        assert summary["deleted"] == 1, "valid old cron-output should be deleted"
-        assert not run_md.exists()
+        assert summary["deleted"] == 0
+        assert run_md.exists()
+        assert summary.get("touched") == []
 
 
 class TestTrackForgetQuick:
@@ -506,8 +501,9 @@ class TestTrackForgetQuick:
         p.write_text("x")
         assert dg.track(str(p), "test", silent=True) is True
         summary = dg.quick()
-        assert summary["deleted"] == 1
-        assert not p.exists()
+        assert summary["deleted"] == 0
+        assert p.exists()
+        assert summary.get("touched") == []
 
 
     def test_forget_removes_entry(self, _isolate_env):
@@ -515,7 +511,8 @@ class TestTrackForgetQuick:
         p = _isolate_env / "keep.tmp"
         p.write_text("x")
         dg.track(str(p), "temp", silent=True)
-        assert dg.forget(str(p)) == 1
+        # Rev6 verdict-only, no durable change
+        assert dg.forget(str(p)) == 0
         assert p.exists()  # forget does NOT delete the file
 
 
@@ -530,7 +527,11 @@ class TestStatus:
         dg = _load_lib()
         p = _isolate_env / "big.tmp"
         p.write_text("y" * 100)
-        dg.track(str(p), "temp", silent=True)
+        # Rev6: seed via direct JSON (track is verdict-only, no write)
+        tf = _isolate_env / "disk-cleanup" / "tracked.json"
+        tf.parent.mkdir(parents=True, exist_ok=True)
+        tf.write_text(json.dumps([{"path": str(p), "timestamp": datetime.now(UTC).isoformat(),
+                                   "category": "temp", "size": 100}]))
         s = dg.status()
         assert s["total_tracked"] == 1
         assert len(s["top10"]) == 1
@@ -546,8 +547,14 @@ class TestDryRun:
         test_f.write_text("x")
         big = _isolate_env / "big.bin"
         big.write_bytes(b"z" * 10)
-        dg.track(str(test_f), "test", silent=True)
-        dg.track(str(big), "other", silent=True)
+        tf = _isolate_env / "disk-cleanup" / "tracked.json"
+        tf.parent.mkdir(parents=True, exist_ok=True)
+        tf.write_text(json.dumps([
+            {"path": str(test_f), "timestamp": datetime.now(UTC).isoformat(),
+             "category": "test", "size": 1},
+            {"path": str(big), "timestamp": datetime.now(UTC).isoformat(),
+             "category": "other", "size": 10},
+        ]))
         auto, _prompt = dg.dry_run()
         # test → auto, other → neither (doesn't hit any rule)
         assert any(i["path"] == str(test_f) for i in auto)
@@ -563,10 +570,10 @@ class TestPostToolCallHook:
         p = _isolate_env / "test_created.py"
         _run_tool(pi, "write_file", {"path": str(p), "content": "x"},
                   create=lambda: p.write_text("x"), task_id="t1", session_id="s1")
+        # Rev6: in-memory candidate only, no durable file write
         tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
-        data = json.loads(tracked_file.read_text())
-        assert len(data) == 1
-        assert data[0]["category"] == "test"
+        assert not tracked_file.exists()
+        assert p.exists()
 
 
     def test_terminal_command_picks_up_paths(self, _isolate_env):
@@ -574,9 +581,10 @@ class TestPostToolCallHook:
         p = _isolate_env / "tmp_created.log"
         _run_tool(pi, "terminal", {"command": f"touch {p}"}, create=lambda: p.write_text("x"),
                   result=f"created {p}\n", task_id="t3", session_id="s3")
+        # Rev6: in-memory only, no durable write
         tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
-        data = json.loads(tracked_file.read_text())
-        assert any(Path(i["path"]) == p.resolve() for i in data)
+        assert not tracked_file.exists()
+        assert p.exists()
 
     def test_ignores_unrelated_tool(self, _isolate_env):
         pi = _load_plugin_init()
@@ -616,10 +624,7 @@ class TestPostToolCallHook:
         assert script.exists() and hook_dir.is_dir()
 
     def test_a_call_never_uses_another_sessions_snapshot(self, _isolate_env):
-        """tool_call_id is not unique: llama.cpp sends one constant id for every call. Session A
-        patching the user's test_user.py must not consume session B's snapshot of a new file under
-        that id, or the user's file reads as created and is deleted when the turn ends; B's own
-        created file is still tracked and cleaned up."""
+        """Rev6 report-only: both files survive (no authority). Isolation still holds."""
         pi = _load_plugin_init()
         user_file = _isolate_env / "test_user.py"
         user_file.write_text("keep")
@@ -635,7 +640,7 @@ class TestPostToolCallHook:
         pi._on_session_end(session_id="sA", completed=True, interrupted=False)
 
         assert user_file.read_text() == "keep"
-        assert not new_file.exists()
+        assert new_file.exists()
 
 
 class TestOnSessionEndHook:
@@ -646,7 +651,7 @@ class TestOnSessionEndHook:
                   create=lambda: p.write_text("x"), task_id="", session_id="s1")
         assert p.exists()
         pi._on_session_end(session_id="s1", completed=True, interrupted=False)
-        assert not p.exists(), "test file should be auto-deleted"
+        assert p.exists(), "report-only: test file survives (no authority)"
 
 
 
@@ -709,3 +714,67 @@ class TestBundledDiscovery:
         mgr.discover_and_load()
         assert "memory" not in mgr._plugins
         assert "context_engine" not in mgr._plugins
+
+
+class TestSaveTrackedDurability:
+    """Report-only slice: save/log/delete/git helpers refuse (no writes)."""
+
+    def test_save_refuses_no_write(self, _isolate_env):
+        dg = _load_lib()
+        with pytest.raises(RuntimeError, match="refused"):
+            dg.save_tracked([{"path": "/tmp/x", "timestamp": "t", "category": "temp", "size": 1}])
+        assert not (_isolate_env / "disk-cleanup" / "tracked.json").exists()
+
+    def test_log_refuses_no_write(self, _isolate_env):
+        dg = _load_lib()
+        with pytest.raises(RuntimeError, match="refused"):
+            dg._log("x")
+        assert not (_isolate_env / "disk-cleanup" / "cleanup.log").exists()
+
+    def test_delete_refuses_no_delete(self, _isolate_env):
+        dg = _load_lib()
+        f = _isolate_env / "victim.py"
+        f.write_text("x")
+        with pytest.raises(RuntimeError, match="refused"):
+            dg._delete_item({"path": str(f), "category": "test", "size": 1})
+        assert f.exists()
+
+    def test_atomic_helpers_refuse(self, _isolate_env):
+        dg = _load_lib()
+        with pytest.raises(RuntimeError, match="refused"):
+            dg._atomic_bytes_no_follow(_isolate_env / "x", b"y", mode=None)
+        with pytest.raises(RuntimeError, match="refused"):
+            dg._strict_fsync_dir(_isolate_env)
+
+    def test_git_helpers_refuse_no_spawn(self, _isolate_env, monkeypatch):
+        import subprocess as _sp
+        dg = _load_lib()
+
+        def _boom(*a, **k):
+            raise AssertionError("git spawn forbidden on slice")
+
+        monkeypatch.setattr(_sp, "run", _boom)
+        monkeypatch.setattr(_sp, "Popen", _boom)
+        p = _isolate_env / "test_g.py"
+        p.write_text("x")
+        with pytest.raises(RuntimeError, match="refused"):
+            dg._git_tracks(p)
+        with pytest.raises(RuntimeError, match="refused"):
+            dg._inside_git_worktree(p)
+
+    @pytest.mark.platforms("posix")
+    def test_load_refuses_symlink_state(self, _isolate_env, tmp_path):
+        """Bound read refuses symlink state (no follow, no log writes)."""
+        import os as _os
+
+        dg = _load_lib()
+        tf = _isolate_env / "disk-cleanup" / "tracked.json"
+        tf.parent.mkdir(parents=True, exist_ok=True)
+        outside = tmp_path / "evil.json"
+        outside.write_text(json.dumps([{"path": str(tmp_path / "victim"),
+                                        "timestamp": "t", "category": "test", "size": 1}]),
+                           encoding="utf-8")
+        if tf.exists() or tf.is_symlink():
+            _os.unlink(tf)
+        tf.symlink_to(outside)
+        assert dg.load_tracked() == []

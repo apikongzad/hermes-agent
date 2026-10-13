@@ -96,10 +96,11 @@ def _on_pre_tool_call(tool_name: str = "", args: Optional[dict[str, Any]] = None
 
 def _on_post_tool_call(tool_name: str = "", args: Optional[dict[str, Any]] = None,
                        task_id: str = "", session_id: str = "", tool_call_id: str = "", **_: Any) -> None:
-    """Auto-track ephemeral files THIS call created: a path from the call's final arguments that
-    this call's own pre-call snapshot saw absent and that exists now. Paths seen only in terminal
-    OUTPUT (a `find` or `ls` listing), or absent from the snapshot, carry no such proof and are
-    never tracked. Best-effort, never raises."""
+    """Rev6 initial slice: report-only candidate, no durable change (A-H1).
+
+    Computes classification via bound read and records in-memory candidate
+    only. Never calls durable write paths.
+    """
     extractor = _PATH_EXTRACTORS.get(tool_name)
     if not isinstance(args, dict) or extractor is None or not tool_call_id:
         return
@@ -113,15 +114,19 @@ def _on_post_tool_call(tool_name: str = "", args: Optional[dict[str, Any]] = Non
             created = str(p) in absent and p.exists()
         except Exception:
             continue
-        category = dg.guess_category(p) if created else None
-        if category is not None and dg.track(str(p), category, silent=True) and category == "test":
+        # Classification via anchored policy only; in-memory record, no write.
+        try:
+            category = dg.guess_category(p) if created else None
+        except Exception:
+            category = None
+        if category is not None and category == "test":
             with _lock:
                 _recent_test_tracks.setdefault(_owner(task_id, session_id), set()).add(str(p))
 
 
 def _on_session_end(
     session_id: str = "", completed: bool = True, interrupted: bool = False, **_: Any) -> None:
-    """Run quick cleanup if any test files were tracked during this turn."""
+    """Rev6 initial slice: report-only enumeration, no durable change (A-H2)."""
     # Drain the session bucket plus every task-scoped bucket (subagents record into their own).
     with _lock:
         had_tracks = bool(_recent_test_tracks.pop(session_id or "default", None) or _recent_test_tracks)
@@ -133,9 +138,9 @@ def _on_session_end(
     except Exception as exc:
         logger.debug("disk-cleanup quick cleanup failed: %s", exc)
         return
-    if summary["deleted"] or summary["empty_dirs"]:
-        dg._log(f"AUTO_QUICK (session_end): deleted={summary['deleted']} "
-                f"dirs={summary['empty_dirs']} freed={dg.fmt_size(summary['freed'])}")
+    # Report-only: diagnostics are in-memory return values only.
+    _ = summary.get("candidates", [])
+    return
 
 
 _HELP_TEXT = """\

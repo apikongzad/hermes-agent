@@ -27,11 +27,11 @@ def _audit_json(critical=0, high=0, moderate=0):
     })
 
 
-def _run_audit_one(capsys, audit_extra, audit_stdout):
+def _run_audit_one(capsys, audit_extra, audit_stdout, label="root build tooling (--workspaces=false)"):
     issues: list[str] = []
     completed = subprocess.CompletedProcess([], 0, stdout=audit_stdout, stderr="")
     with patch.object(doctor_tools.subprocess, "run", return_value=completed):
-        doctor_tools._audit_one("npm", "C:/fake/root", "Browser tools (agent-browser)",
+        doctor_tools._audit_one("npm", "C:/fake/root", label,
                                 audit_extra, issues)
     return capsys.readouterr().out, issues
 
@@ -44,7 +44,26 @@ def test_root_remedy_never_prescribes_local_audit_fix(capsys):
     assert "run: cd" not in out
     assert "npm audit fix" not in out
     assert "lockfile bump" in out
-    assert issues == ["Browser tools (agent-browser) has 2 npm vulnerabilities"]
+    assert issues == ["root build tooling (--workspaces=false) has 2 npm vulnerabilities"]
+    # Root --workspaces=false is build-time tooling, not browser runtime:
+    # agent-browser is a native executable with 0 npm deps.
+    assert "build-time tooling" in out
+    assert "agent-browser runtime is native" in out
+
+
+def test_workspace_row_reports_hoisted_build_tooling(capsys):
+    """--workspace rows must name hoisting (root node_modules) and build-time scope."""
+    out, issues = _run_audit_one(capsys, ["--workspace", "web"], _audit_json(high=1), label="web workspace")
+    assert "hoisted via root node_modules" in out
+    assert "build-time tooling" in out
+    assert issues == ["web workspace has 1 npm vulnerability"]
+
+
+def test_bridge_row_reports_runtime_tree(capsys):
+    """Standalone bridge row (no extra args) audits a runtime service tree."""
+    out, issues = _run_audit_one(capsys, [], _audit_json(high=1), label="WhatsApp bridge")
+    assert "runtime dependency tree" in out
+    assert issues == ["WhatsApp bridge has 1 npm vulnerability"]
 
 
 

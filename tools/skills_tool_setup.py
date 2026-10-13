@@ -80,6 +80,89 @@ def _get_required_environment_variables(frontmatter: dict[str, Any]) -> list[dic
     return list(required.values())
 
 
+_REQUIRED_COMMAND_SAFE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")
+_INVALID_COMMAND_MARKER = "<invalid required_commands declaration>"
+
+
+def _is_safe_command_basename(cmd: str) -> bool:
+    """True when *cmd* is a safe executable basename (no path, no shell).
+
+    Only ``[A-Za-z0-9_.-]`` starting alphanumerically, no ``/`` ``\\`` spaces
+    or shell metachars, not ``.``/``..``. Anything else must fail closed
+    (treated as missing) so a skill cannot probe absolute paths (``/tmp/evil``)
+    or inject flags (``foo --flag``) through PATH discovery.
+    """
+    if not isinstance(cmd, str):
+        return False
+    cmd = cmd.strip()
+    if not cmd or cmd in (".", ".."):
+        return False
+    if "/" in cmd or "\\" in cmd:
+        return False
+    return bool(_REQUIRED_COMMAND_SAFE_RE.match(cmd))
+
+
+def _get_required_commands(frontmatter: dict[str, Any]) -> list[str]:
+    """Declared ``required_commands`` (e.g. ``[node, npx]``, ``[ffmpeg, ffprobe]``).
+
+    Valid form is ``list[str]`` of safe basenames (single string coerced for
+    backwards compat, ``{name:}``/``{command:}`` dicts unwrapped then
+    validated). Malformed declarations fail closed: a non-list/non-str top
+    level or an entry that cannot yield a name becomes an explicit invalid
+    marker that :func:`_missing_required_commands` reports as missing, so the
+    skill shows ``setup_needed`` instead of silently ``available``.
+    """
+    raw = frontmatter.get("required_commands", [])
+    if raw is None or raw == []:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return [_INVALID_COMMAND_MARKER]
+    required: list[str] = []
+    for item in raw:
+        if isinstance(item, dict):
+            name = str(item.get("name") or item.get("command") or "").strip()
+            if not name:
+                # Dict without a usable name: explicit invalid, fail closed.
+                if _INVALID_COMMAND_MARKER not in required:
+                    required.append(_INVALID_COMMAND_MARKER)
+                continue
+        elif isinstance(item, str):
+            name = item.strip()
+            if not name:
+                continue
+        else:
+            # Non-str entry (int, None, ...): fail closed, not silently dropped.
+            if _INVALID_COMMAND_MARKER not in required:
+                required.append(_INVALID_COMMAND_MARKER)
+            continue
+        if name not in required:
+            required.append(name)
+    return required
+
+
+def _missing_required_commands(required: list[str]) -> list[str]:
+    """Actual discovery: commands in *required* with no executable on PATH.
+
+    Unsafe basenames (absolute paths, shell, traversal) never reach
+    ``shutil.which`` — they are reported missing fail-closed.
+    """
+    import shutil
+
+    missing: list[str] = []
+    for cmd in required:
+        if not _is_safe_command_basename(cmd):
+            missing.append(cmd)
+            continue
+        try:
+            if shutil.which(cmd) is None:
+                missing.append(cmd)
+        except Exception:
+            missing.append(cmd)
+    return missing
+
+
 def _capture_result(missing_names, setup_skipped=False, gateway_setup_hint=None):
     return {"missing_names": missing_names, "setup_skipped": setup_skipped, "gateway_setup_hint": gateway_setup_hint}
 

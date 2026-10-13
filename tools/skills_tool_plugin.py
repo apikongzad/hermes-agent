@@ -153,12 +153,30 @@ def _serve_plugin_skill(
     rendered_content = content if not preprocess else _preprocess_skill(
         content, skill_md.parent, session_id, "Could not preprocess plugin skill %s:%s",
         namespace, bare)
+    # Shared readiness gate (same as local skills): required env / commands /
+    # credential files with safe-basename validation, fail-closed, and a
+    # remote-host note based on the actual TERMINAL_ENV backend. A plugin
+    # skill that was previously hardcoded AVAILABLE now reports setup_needed
+    # so cron preflight blocks it like any local skill.
+    try:
+        from tools.skills_tool import _skill_readiness as _shared_readiness
+        readiness_fields, readiness_extras = _shared_readiness(parsed_frontmatter, qualified_name)
+    except Exception:
+        logger.debug("Plugin skill readiness failed for %s:%s", namespace, bare, exc_info=True)
+        # B-PLUGIN-1 fail-closed: exception -> setup_needed, never available
+        readiness_fields = {
+            "required_environment_variables": [], "required_commands": [],
+            "missing_required_environment_variables": [],
+            "missing_credential_files": [], "missing_required_commands": [],
+            "setup_needed": True, "setup_skipped": False,
+            "readiness_status": SkillReadinessStatus.SETUP_NEEDED.value}
+        readiness_extras = {}
     return _json({
         "success": True, "name": qualified_name, "content": banner + rendered_content,
         "description": _truncate_description(str(parsed_frontmatter.get("description", ""))),
         "linked_files": _plugin_skill_linked_files(skill_md.parent),
-        "readiness_status": SkillReadinessStatus.AVAILABLE.value,
-        "skill_dir": str(skill_md.parent), "_source_path": str(skill_md)})
+        "skill_dir": str(skill_md.parent), "_source_path": str(skill_md),
+        **readiness_fields, **readiness_extras})
 
 
 def _plugin_skill_linked_files(skill_root: Path) -> dict[str, list[str]] | None:

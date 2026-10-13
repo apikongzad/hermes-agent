@@ -725,6 +725,7 @@ import {
 } from './windows-stack-cookie-fallback'
 import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
+import { pickClipboardPng } from './clipboard-image'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
 import { resolvePickerDefaultPath, setActiveGatewayProfile, setWslBridgeProfileState } from './wsl-path-bridge'
 
@@ -17897,8 +17898,9 @@ ipcMain.handle('hermes:selectPaths', async (_event, options: any = {}) => {
   return result.filePaths
 })
 
-ipcMain.handle('hermes:writeClipboard', (_event, text) => {
-  clipboard.writeText(String(text || ''))
+// Electron 44: clipboard.writeText is async (Promise<void>).
+ipcMain.handle('hermes:writeClipboard', async (_event, text) => {
+  await clipboard.writeText(String(text || ''))
 
   return true
 })
@@ -17923,6 +17925,8 @@ ipcMain.handle('hermes:selectSavePath', async (_event, options: any = {}) => {
 // navigator.clipboard.readText() throws "Document is not focused" whenever a
 // portaled overlay has focus, and there's no way to route a read through the
 // canvas. The main process has no such gate.
+// Electron 44: clipboard.readText is async (Promise<string>); ipcMain.handle
+// forwards the promise to the renderer, which already awaits it.
 ipcMain.handle('hermes:readClipboard', () => clipboard.readText())
 
 ipcMain.handle('hermes:saveGatewayFile', (_event, payload) => saveGatewayFile(payload))
@@ -18009,21 +18013,28 @@ ipcMain.handle('hermes:savePastedText', async (_event, payload) => {
   return writeComposerPaste(HERMES_HOME, text)
 })
 
+// Electron 44 removed the sync clipboard.readImage()/NativeImage path: read
+// image bytes via the async W3C-style clipboard.read() ClipboardItems.
+// Arbitrary image/* bytes are never saved raw as .png: they decode through
+// nativeImage and re-encode via toPNG() with size validation
+// (clipboard-image.ts), so a JPEG/GIF/BMP clipboard becomes a real PNG and
+// garbage never lands in composer-images.
 ipcMain.handle('hermes:saveClipboardImage', async () => {
-  const image = clipboard.readImage()
+  const png = await pickClipboardPng(() => clipboard.read() as unknown as Promise<any>)
 
-  if (image && !image.isEmpty()) {
-    return writeComposerImage(image.toPNG(), '.png')
+  if (png) {
+    return writeComposerImage(png, '.png')
   }
 
   // WSL2/WSLg doesn't bridge clipboard *images* from the Windows host to the
   // Linux clipboard Electron reads, so a host screenshot looks empty above.
   // Pull it straight off the Windows clipboard via PowerShell as a fallback.
+  // The WSL helper already validates the PNG signature.
   if (IS_WSL) {
-    const png = readWslWindowsClipboardImage()
+    const wslPng = readWslWindowsClipboardImage()
 
-    if (png) {
-      return writeComposerImage(png, '.png')
+    if (wslPng) {
+      return writeComposerImage(wslPng, '.png')
     }
   }
 
