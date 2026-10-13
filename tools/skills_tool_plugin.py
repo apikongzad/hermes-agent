@@ -163,12 +163,13 @@ def _serve_plugin_skill(
         readiness_fields, readiness_extras = _shared_readiness(parsed_frontmatter, qualified_name)
     except Exception:
         logger.debug("Plugin skill readiness failed for %s:%s", namespace, bare, exc_info=True)
+        # B-PLUGIN-1 fail-closed: exception -> setup_needed, never available
         readiness_fields = {
             "required_environment_variables": [], "required_commands": [],
             "missing_required_environment_variables": [],
             "missing_credential_files": [], "missing_required_commands": [],
-            "setup_needed": False, "setup_skipped": False,
-            "readiness_status": SkillReadinessStatus.AVAILABLE.value}
+            "setup_needed": True, "setup_skipped": False,
+            "readiness_status": SkillReadinessStatus.SETUP_NEEDED.value}
         readiness_extras = {}
     return _json({
         "success": True, "name": qualified_name, "content": banner + rendered_content,

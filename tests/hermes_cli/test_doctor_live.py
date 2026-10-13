@@ -95,6 +95,9 @@ class TestConfiguredOnlySelection:
             raise AssertionError("HTTP call made for unconfigured backend")
 
         monkeypatch.setattr(doctor_live, "_http_get", _no_net)
+        # Rev6: resolver inputs False -> unconfigured-skip
+        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: False)
+        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
         results = run_live_checks([])
         assert all(r.status == "skip" for r in results)
 
@@ -174,6 +177,9 @@ class TestConfiguredOnlySelection:
 
     def test_browser_probed_when_available(self, monkeypatch):
         monkeypatch.setattr(doctor_live, "_browser_available", lambda: True)
+        # Rev6 resolver: harness runnable -> browser-use selected
+        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: True)
+        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
         monkeypatch.setattr(
             doctor_live, "_launch_browser_probe",
             lambda timeout: (True, "about:blank ok"))
@@ -183,6 +189,9 @@ class TestConfiguredOnlySelection:
     def test_unconfigured_browser_is_optional_skip_not_broken(self, monkeypatch):
         """Unconfigured optional backend must be skip (never fail, never enable)."""
         monkeypatch.setattr(doctor_live, "_browser_available", lambda: False)
+        # Rev6: genuinely-none-configured -> unconfigured-skip
+        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: False)
+        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
         called = []
         monkeypatch.setattr(doctor_live, "_launch_browser_probe",
                             lambda timeout: called.append(True) or (True, "must not run"))
@@ -228,6 +237,9 @@ def test_run_live_checks_sanitizes_clash_env_and_probes_pass(clash_env, monkeypa
     # InvalidURL under this env; _run_one's catch-all dressed it up as
     # "(Invalid port: ':1]')" — a backend-failure verdict for a healthy service.
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test")
+    # Isolate Browser to skip (off) so Firecrawl pass yields no issues; real
+    # launch oracle would otherwise FAIL without a live browser (fail-closed).
+    monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "off")
 
     # Real HTTP origin: a 200 from an actual socket proves both client construction
     # and the request reaching a reachable origin. The remote-credential probes would
@@ -315,7 +327,7 @@ class TestBrowserBackendProbe:
     """Configured-backend probe honors backend and does real exec, no pm.ensure."""
 
     def test_harness_ready_passes_without_playwright_via_real_version_exec(self, monkeypatch):
-        """Harness probe runs bounded --version subprocess (not bare import)."""
+        """Rev6 launch-only: version string alone NEVER confers PASS (must FAIL)."""
         monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "")
         monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: True)
         monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
@@ -323,15 +335,12 @@ class TestBrowserBackendProbe:
                             lambda: ["python", "-m", "browser_harness.run"])
         import subprocess as _sp
         from types import SimpleNamespace as _NS
-        seen: dict = {}
 
         def _fake_run(*a, **k):
-            seen["timeout"] = k.get("timeout")
-            seen["cmd"] = a[0] if a else k.get("args")
+            # Version-only output (no about:blank, no KNOWN-DOM) must never PASS
             return _NS(returncode=0, stdout="0.1.13\n", stderr="")
 
         monkeypatch.setattr(_sp, "run", _fake_run)
-        # Playwright must never be needed for a ready harness backend.
         import builtins as _bi
         real_import = _bi.__import__
 
@@ -341,18 +350,16 @@ class TestBrowserBackendProbe:
             return real_import(name, *a, **k)
 
         monkeypatch.setattr(_bi, "__import__", _no_playwright)
-        # No pm.ensure mutation even when probe runs.
         import pm as _pm
         monkeypatch.setattr(_pm, "ensure",
                             lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not ensure")))
         ok, detail = doctor_live._launch_browser_probe(5.0)
-        assert ok is True
-        assert "runnable" in detail
-        assert seen["timeout"] is not None and seen["timeout"] <= 15.0
-        assert "--version" in str(seen["cmd"])
+        # Version-only (no real launch) must FAIL per C-ORACLE-1
+        assert ok is False
+        assert "fail-closed" in detail
 
     def test_harness_import_alone_does_not_pass_when_version_fails(self, monkeypatch):
-        """Repro: bare import false-passed; real --version failure must fail."""
+        """Rev6: launch failure must fail (no version-pass)."""
         monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "")
         monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: True)
         monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
@@ -365,7 +372,7 @@ class TestBrowserBackendProbe:
         monkeypatch.setitem(_sys.modules, "browser_harness", type(_sys)("browser_harness"))
         ok, detail = doctor_live._launch_browser_probe(5.0)
         assert ok is False
-        assert "--version" in detail
+        assert "fail-closed" in detail
 
     def test_explicit_off_honors_backend_as_not_available(self, monkeypatch):
         monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "off")
@@ -400,9 +407,10 @@ class TestBrowserBackendProbe:
         monkeypatch.setattr(_bi, "__import__", _no_playwright)
         ok, detail = doctor_live._launch_browser_probe(5.0)
         assert ok is False
-        assert "no browser backend ready" in detail
+        assert "not configured" in detail or "fail-closed" in detail
 
     def test_agent_browser_ready_probes_binary_bounded(self, monkeypatch, tmp_path):
+        # Fake binary echoes version only (no open/eval/close) -> must FAIL (no --help PASS)
         fake_bin = tmp_path / "agent-browser"
         fake_bin.write_text("#!/bin/sh\necho agent-browser-1.2.3\n")
         fake_bin.chmod(0o755)
@@ -412,23 +420,16 @@ class TestBrowserBackendProbe:
         monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: True)
         monkeypatch.setattr("tools.browser_tool_install._find_agent_browser", lambda **_kw: str(fake_bin))
         monkeypatch.setattr(doctor_live, "chromium_executable", lambda: str(fake_chromium))
-        import subprocess as _sp
-        real_run = _sp.run
-        seen = {}
-
-        def _spy(*a, **k):
-            seen["timeout"] = k.get("timeout")
-            return real_run(*a, **k)
-
-        monkeypatch.setattr(_sp, "run", _spy)
+        monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "agent-browser")
         ok, detail = doctor_live._launch_browser_probe(5.0)
-        assert ok is True
-        assert "agent-browser runnable" in detail
-        assert seen["timeout"] is not None and seen["timeout"] <= 15.0
+        # Help/version-only (no real open/eval/close) must FAIL per C-ORACLE-1/2
+        assert ok is False
+        assert "fail-closed" in detail
 
     def test_no_backend_no_playwright_reports_ready_state_not_bare_import(self, monkeypatch):
         monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: False)
         monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
+        monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "")
         import sys as _sys
         monkeypatch.delitem(_sys.modules, "playwright.sync_api", raising=False)
         # Force ImportError even if playwright happens to be installed in the env.
@@ -443,7 +444,7 @@ class TestBrowserBackendProbe:
         monkeypatch.setattr(_bi, "__import__", _no_playwright)
         ok, detail = doctor_live._launch_browser_probe(5.0)
         assert ok is False
-        assert "no browser backend ready" in detail
+        assert "not configured" in detail or "fail-closed" in detail
 
 
 class TestFailureIsolation:
@@ -510,7 +511,9 @@ class TestTimeoutHandling:
 
 class TestReadOnly:
 
-    def test_skips_never_append_issues(self, capsys):
+    def test_skips_never_append_issues(self, capsys, monkeypatch):
+        # Isolate Browser to skip so clean env (no keys, local audio) yields no issues.
+        monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "off")
         issues: list[str] = []
         run_live_checks(issues)
         assert issues == []
