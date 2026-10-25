@@ -16,7 +16,11 @@ from pm.environments import install_state_dir
 NAME = "test-environment"
 # The default developer environment includes the app's normal features.
 # CI lanes pass their wider provider matrix explicitly.
-DEFAULT_TEST_EXTRAS = ("all",)
+# fal is included by default because tests/tools/test_fal_sdk.py exercises the
+# real SDK wire contract (managed FAL adapter); CI passes fal explicitly, and a
+# local default of ("all",) alone leaves the import failing locally (strict,
+# no skip guard).
+DEFAULT_TEST_EXTRAS = ("all", "fal")
 GROUPS = ("dev", "test")
 
 

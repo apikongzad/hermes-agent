@@ -180,6 +180,9 @@ def load_git_dates(catalog_dir: Path) -> dict[str, dict[str, str]]:
     for line in log.splitlines():
         if line.startswith("\x00"):
             when = line[1:].strip()
+            # Contract: UTC dates are emitted with a literal Z (not +00:00).
+            if when.endswith("+00:00"):
+                when = when[:-6] + "Z"
             continue
         parts = line.split("\t")
         if len(parts) < 2 or not when:

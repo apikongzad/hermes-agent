@@ -24,7 +24,12 @@ def _clean_memo():
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
+    from pathlib import Path
+
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # build_alias_map() reads Path.home()/.local/bin; isolate it so the real
+    # ~/.local/bin node symlink (into the real hermes home) never trips the guard.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     (tmp_path / "profiles" / "bob").mkdir(parents=True)
     return tmp_path
 

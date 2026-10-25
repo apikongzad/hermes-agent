@@ -182,7 +182,13 @@ def test_disk_cleanup_protected_cron_paths_follow_the_active_home(homes):
     spec = importlib.util.spec_from_file_location(
         "disk_cleanup_mux_scope", REPO / "plugins" / "disk-cleanup" / "disk_cleanup.py")
     dc = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(dc)
+    # dataclasses with KW_ONLY resolve the module via sys.modules at class creation;
+    # the spec name must be present or exec fails with AttributeError (None.__dict__).
+    sys.modules[spec.name] = dc
+    try:
+        spec.loader.exec_module(dc)
+    finally:
+        del sys.modules[spec.name]
     a, b = homes
     for home in (a, b):
         (home / "cron").mkdir()

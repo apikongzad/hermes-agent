@@ -659,5 +659,11 @@
     "symbol": "_installed_git",
     "kind": "bare_which",
     "reason": "only asks whether the caller's bare git is on PATH; when it is not (Desktop on a Windows install whose only git is install.ps1's PM-staged copy) it defers to update_pause_record._git_executable, the updater's own resolution"
+  },
+  {
+    "path": "tools/skills_tool_setup.py",
+    "symbol": "_missing_required_commands",
+    "kind": "bare_which",
+    "reason": "skill required_commands are arbitrary third-party executables (ffmpeg, ffprobe, ...) resolved for the terminal tool env; managed runtimes (uv/node/npm/npx) route through find_node_executable/uv_launcher first, bare PATH is only for the unmanaged remainder"
   }
 ]

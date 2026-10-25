@@ -214,8 +214,41 @@ for (const [product, out] of [['tui', 'ui-tui/dist'], ['web', 'hermes_cli/web_di
     # The passive query must not write even import caches: -I ignores the
     # environment's bytecode switch, so the published query enforces it.
     def snapshot():
-        return {p: (hashlib.sha256(p.read_bytes()).hexdigest(), p.stat().st_mtime_ns) for tree in (root, home, store)
-                for p in tree.rglob("*") if p.is_file()}
+        # Symlinks (store/<tool>/bin/node -> system node, venv site-packages ->
+        # test venv) point into the real hermes home via ~/.local/bin; ANY
+        # Python stat on them (is_symlink/is_file/stat/readlink, which guard
+        # realpaths) trips the real-home guard. Walk via os.scandir DirEntry
+        # (d_type, no stat) and never resolve links: record their existence only.
+        result = {}
+
+        def walk(top):
+            try:
+                with os.scandir(top) as it:
+                    entries = list(it)
+            except OSError:
+                return
+            for entry in entries:
+                try:
+                    # d_type, no stat when the filesystem reports it.
+                    if entry.is_symlink():
+                        result[entry.path] = ("symlink", 0)
+                        continue
+                except OSError:
+                    continue
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        with open(entry.path, "rb") as f:
+                            data = f.read()
+                        st = entry.stat(follow_symlinks=False)
+                        result[entry.path] = (hashlib.sha256(data).hexdigest(), st.st_mtime_ns)
+                    elif entry.is_dir(follow_symlinks=False):
+                        walk(entry.path)
+                except OSError:
+                    continue
+
+        for tree in (root, home, store):
+            walk(os.fspath(tree))
+        return result
     before = snapshot()
     result = subprocess.run(command, env=env, cwd=tmp_path, capture_output=True, text=True, timeout=60, check=False)
     assert result.returncode == 0, result.stdout + result.stderr

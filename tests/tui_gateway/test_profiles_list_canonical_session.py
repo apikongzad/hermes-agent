@@ -38,9 +38,15 @@ import tui_gateway.server as srv
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     """Temp HERMES_HOME with the default profile plus one named profile."""
+    from pathlib import Path
+
     h = tmp_path / ".hermes"
     (h / "profiles" / "ops").mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(h))
+    # build_alias_map() reads Path.home()/.local/bin wrappers; keep it in the
+    # isolated fixture (real ~/.local/bin holds a node symlink into the real
+    # hermes home, which trips the real-home guard).
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     return h
 
 

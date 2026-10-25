@@ -147,6 +147,10 @@ def _missing_required_commands(required: list[str]) -> list[str]:
 
     Unsafe basenames (absolute paths, shell, traversal) never reach
     ``shutil.which`` — they are reported missing fail-closed.
+
+    Hermes-managed runtimes (uv, node, npm, npx) resolve through the managed
+    layer, never bare PATH: a system copy (or its absence) must not decide a
+    skill's readiness when PM owns the runtime.
     """
     import shutil
 
@@ -156,11 +160,44 @@ def _missing_required_commands(required: list[str]) -> list[str]:
             missing.append(cmd)
             continue
         try:
+            if _is_managed_runtime_command(cmd):
+                if _managed_runtime_present(cmd):
+                    continue
+                missing.append(cmd)
+                continue
             if shutil.which(cmd) is None:
                 missing.append(cmd)
         except Exception:
             missing.append(cmd)
     return missing
+
+
+_MANAGED_RUNTIME_COMMANDS = frozenset({"uv", "uvx", "node", "npm", "npx"})
+
+
+def _is_managed_runtime_command(cmd: str) -> bool:
+    base = cmd.strip().lower()
+    for suffix in (".cmd", ".exe", ".ps1"):
+        base = base.removesuffix(suffix)
+    return base in _MANAGED_RUNTIME_COMMANDS
+
+
+def _managed_runtime_present(cmd: str) -> bool:
+    base = cmd.strip().lower()
+    for suffix in (".cmd", ".exe", ".ps1"):
+        base = base.removesuffix(suffix)
+    try:
+        if base in {"node", "npm", "npx"}:
+            from hermes_constants import find_node_executable
+
+            return find_node_executable(cmd) is not None
+        if base in {"uv", "uvx"}:
+            from pm.install import uv_launcher
+
+            return uv_launcher(base) is not None
+    except Exception:
+        return False
+    return False
 
 
 def _capture_result(missing_names, setup_skipped=False, gateway_setup_hint=None):
