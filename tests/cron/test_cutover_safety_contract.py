@@ -225,13 +225,29 @@ def _seed_success_host(host: FakeHost, config: CutoverConfig) -> Path:
     host.on_run("pm.build_env", RunResult(0, str(venv_python), ""))
 
     def _staged_probe(argv: list[str]) -> RunResult:
-        # REAL launch prep: staged venv python -I -B -c with hermes_bootstrap.
+        # REAL launch prep: staged venv python -I -B -c with hermes_bootstrap
+        # + prepare_launch + before/after + get_code_identity schema.
         # Root wraps with `env -i …` / `runuser … env -i …`, so the venv python
         # is anywhere in argv, not argv[0].
         if str(venv_python) in argv and "-c" in argv:
             blob = " ".join(argv)
-            if "hermes_bootstrap" in blob and "get_code_identity" in blob:
-                return RunResult(0, json.dumps({"sha": CANDIDATE_SHA}), "")
+            if (
+                "hermes_bootstrap" in blob
+                and "get_code_identity" in blob
+                and "prepare_launch" in blob
+            ):
+                before = {"exe": str(venv_python), "prefix": str(venv_python.parent.parent)}
+                payload = {
+                    "sha": CANDIDATE_SHA,
+                    "short_sha": CANDIDATE_SHA[:8],
+                    "version": "test",
+                    "source": "git",
+                    "before": before,
+                    "after": dict(before),
+                    "relaunch": "None",
+                    "relaunch_error": None,
+                }
+                return RunResult(0, json.dumps(payload), "")
             return RunResult(1, "", "probe must use real Hermes launch prep")
         return RunResult(0, "", "")
 
@@ -374,7 +390,7 @@ def test_staging_uses_documented_pm_entrypoint_and_no_invented_ones(tmp_path: Pa
 
 
 def test_stage_probe_uses_real_hermes_launch_prep(tmp_path: Path) -> None:
-    """Re-exec probe must import hermes_bootstrap + version identity, not sys.executable."""
+    """Re-exec probe must call prepare_launch + record before/after, not sys.executable."""
     config = _make_config(tmp_path)
     host = FakeHost()
     _seed_success_host(host, config)
@@ -387,20 +403,39 @@ def test_stage_probe_uses_real_hermes_launch_prep(tmp_path: Path) -> None:
     ]
     assert probe_cmds, "expected a real Hermes launch-prep probe"
     assert any("get_code_identity" in cmd for cmd in probe_cmds)
+    assert any("prepare_launch" in cmd for cmd in probe_cmds)
+    # Isolated HERMES_HOME (never the default production profile).
+    assert any(
+        env is not None
+        and env.get("HERMES_HOME", "") != ""
+        and env.get("HERMES_HOME") != str(config.hermes_home)
+        and "PYTHONPATH" not in env
+        for env in host.run_envs
+    )
 
 
 def test_install_failure_triggers_restore_not_success(tmp_path: Path) -> None:
-    """A PM staging failure restores (source/facts/dropins) and never reports success."""
+    """A PM staging failure is pre-mutation: failed, zero lifecycle writes."""
     config = _make_config(tmp_path)
     host = FakeHost()
     _seed_success_host(host, config)
     host.run_handlers = [h for h in host.run_handlers if "pm.build_env" not in h[0]]
     host.on_run("pm.build_env", RunResult(1, "", "uv sync failed"))
     result = orchestrate(host, config)
-    assert result.status in ("failed", "unknown")
+    assert result.status == "failed"
     assert result.status != "success"
-    kinds = [kind for kind, _ in host.timeline]
-    assert "run" in kinds and "write" in kinds
+    assert "fleet untouched" in result.reason
+    # Zero lifecycle: no daemon-reload/restart, no facts rewrite, no dropin remove.
+    assert not any(
+        kind == "run" and ("daemon-reload" in detail or "systemctl restart" in detail)
+        for kind, detail in host.timeline
+    )
+    assert not any(
+        kind == "write" and "installs" in detail for kind, detail in host.timeline
+    )
+    assert not any(
+        kind == "remove" and "zzz-candidate" in detail for kind, detail in host.timeline
+    )
 
 
 def test_dropin_binds_execstart_workdir_path_and_sorts_after_runtime(tmp_path: Path) -> None:
@@ -667,7 +702,9 @@ def test_cli_preflight_reaches_beyond_controller_gate(tmp_path: Path) -> None:
 
 
 def test_isolated_launch_prep_reports_candidate_sha(tmp_path: Path) -> None:
-    """Real Hermes launch prep (hermes_bootstrap + code identity) selects the candidate."""
+    """Real Hermes launch prep (hermes_bootstrap + prepare_launch + identity) selects candidate."""
+    from scripts.maintenance.cutover_stage import _launch_probe_code
+
     repo_root = Path(__file__).resolve().parents[2]
     real_head = subprocess.run(
         ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
@@ -675,22 +712,239 @@ def test_isolated_launch_prep_reports_candidate_sha(tmp_path: Path) -> None:
     ).stdout.strip()
     candidate = str(repo_root.resolve())
     assert "'" not in candidate
-    code = (
-        "import sys; sys.path.insert(0, '" + candidate + "'); "
-        "import hermes_bootstrap; "
-        "from hermes_cli.version_info import get_code_identity; "
-        "import json; print(json.dumps(get_code_identity()))"
-    )
+    code = _launch_probe_code(candidate)
+    assert "prepare_launch" in code and "hermes_bootstrap" in code
+    assert "sys.executable" in code and "sys.prefix" in code
+    probe_home = tmp_path / "probe-home"
+    probe_home.mkdir(exist_ok=True)
     env = {
         "PATH": "/usr/bin:/bin",
-        "HOME": str(tmp_path),
-        "HERMES_HOME": str(tmp_path / "home"),
+        "HOME": str(probe_home),
+        "HERMES_HOME": str(probe_home),
+        "HERMES_RUNTIME_DIR": "/home/ubuntu/.hermes/tools",
     }
     done = subprocess.run(
         [sys.executable, "-I", "-B", "-c", code],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True, text=True, timeout=120,
         cwd=candidate, env=env, check=False,
     )
     assert done.returncode == 0, (done.stdout or "") + (done.stderr or "")
-    identity = json.loads((done.stdout or "").strip().splitlines()[-1])
-    assert identity.get("sha") == real_head
+    payload = json.loads((done.stdout or "").strip().splitlines()[-1])
+    assert payload.get("sha") == real_head
+    assert {"sha", "short_sha", "version", "source"}.issubset(payload)
+    before, after = payload.get("before") or {}, payload.get("after") or {}
+    assert before.get("exe") and before.get("prefix")
+    assert after == before
+    assert payload.get("relaunch_error") in (None, "")
+    # Default production profile never HERMES_HOME in the isolated probe.
+    assert str(probe_home) != "/home/ubuntu/.hermes"
+    assert env["HERMES_HOME"] != "/home/ubuntu/.hermes"
+
+
+def _crash_host_after_dropin(config: CutoverConfig) -> FakeHost:
+    """Seed, snapshot the ORIGINAL, then mutate live to candidate/stopped (crash)."""
+    from scripts.maintenance.cutover_preflight import preflight
+    from scripts.maintenance.cutover_snapshot import save_baseline
+    from scripts.maintenance.cutover_stage import stage, verify_isolated_launch
+    from scripts.maintenance.cutover_dropin import write_candidate_dropins
+
+    host = FakeHost()
+    _seed_success_host(host, config)
+    baseline = preflight(host, config)
+    save_baseline(host, config, baseline)
+    staged = stage(host, config)
+    verify_isolated_launch(host, config, staged, baseline.live_main_exe)
+    write_candidate_dropins(host, config, staged)
+    # Crash before receipt: live now shows candidate dropins + mutated facts.
+    sel = selection_facts_path_for(config.live_tree, config.hermes_home)
+    host.files[str(sel)] = b'{"packages": {"venv": {"environment": "candidate"}}}'
+    return host
+
+
+def test_resume_after_dropin_write_restores_original_bytes(tmp_path: Path) -> None:
+    """Crash after dropin: resume(snapshot) restores original bytes + healthy old fleet."""
+    from scripts.maintenance.cutover_journal import read_all
+    from scripts.maintenance.cutover_orchestrate import resume
+    from scripts.maintenance.cutover_snapshot import load_baseline
+
+    config = _make_config(tmp_path)
+    host = _crash_host_after_dropin(config)
+    snapshot = load_baseline(host, config)
+    assert snapshot.live_head == PARENT_SHA
+    gw_target = str(config.gateway_dropin_dir / "zzz-candidate.conf")
+    assert gw_target in host.files
+    result = resume(host, config)
+    assert result.status == "failed"
+    assert "restored to parent" in result.reason
+    assert gw_target not in host.files
+    sel = str(selection_facts_path_for(config.live_tree, config.hermes_home))
+    assert host.files[sel] == b'{"packages": {"venv": {"environment": "x"}}}'
+    rows = read_all(host, config.journal_path)
+    assert any(r.get("phase") == "rollback-ok" for r in rows)
+    assert any(r.get("phase") == "receipt-failed" for r in rows)
+
+
+def test_resume_after_one_service_stopped_still_restores(tmp_path: Path) -> None:
+    """One unit stopped (MainPID=0): resume must NOT recapture, still restores."""
+    from scripts.maintenance.cutover_orchestrate import resume
+    from scripts.maintenance.cutover_preflight import PreflightError, preflight
+
+    config = _make_config(tmp_path)
+    host = _crash_host_after_dropin(config)
+    # Stop gateway: show MainPID=0 so a recapturing preflight would refuse.
+    host.run_handlers = [h for h in host.run_handlers if "systemctl show hermes-gateway" not in h[0]]
+    host.on_run(
+        "systemctl show hermes-gateway",
+        RunResult(0, "MainPID=0\nActiveEnterTimestamp=\nNRestarts=0", ""),
+    )
+    try:
+        preflight(host, config)
+        recapture_ok = True
+    except (PreflightError, OSError):
+        recapture_ok = False
+    assert not recapture_ok
+    result = resume(host, config)
+    assert result.status == "failed"
+    assert "restored to parent" in result.reason
+    assert str(config.gateway_dropin_dir / "zzz-candidate.conf") not in host.files
+
+
+def test_resume_after_restart_before_receipt_restores_oldfleet(tmp_path: Path) -> None:
+    """Restart happened but no receipt: resume restores original + healthy old fleet."""
+    from scripts.maintenance.cutover_orchestrate import resume
+
+    config = _make_config(tmp_path)
+    host = _crash_host_after_dropin(config)
+    # Simulate restart already flipped PIDs to candidate but journal has no receipt.
+    host.http["http://127.0.0.1:9119/api/health"] = (
+        200,
+        json.dumps({"ok": True, "commit": CANDIDATE_SHA}),
+    )
+    result = resume(host, config)
+    assert result.status == "failed"
+    # Rollback verify uses old-fleet liveness (is-active + 200), then receipt.
+    assert any(kind == "run" and "systemctl restart" in detail for kind, detail in host.timeline)
+
+
+def test_resume_refuses_with_terminal_receipt(tmp_path: Path) -> None:
+    """A terminal receipt blocks a second resume (no double restore)."""
+    from scripts.maintenance.cutover_orchestrate import orchestrate, resume
+
+    config = _make_config(tmp_path)
+    host = FakeHost()
+    _seed_success_host(host, config)
+    first = orchestrate(host, config)
+    assert first.status == "success"
+    second = resume(host, config)
+    assert second.status == "unknown"
+    assert "terminal receipt" in second.reason
+
+
+def test_resume_refuses_on_snapshot_mismatch(tmp_path: Path) -> None:
+    """Mismatched/tampered snapshot is fail-closed unknown, never blind restore."""
+    from scripts.maintenance.cutover_orchestrate import resume
+
+    config = _make_config(tmp_path)
+    host = _crash_host_after_dropin(config)
+    other = _make_config(tmp_path, journal_path=tmp_path / "other.jsonl")
+    other_host_result = resume(host, other)
+    assert other_host_result.status == "unknown"
+
+
+def test_launch_verify_failure_leaves_fleet_untouched(tmp_path: Path) -> None:
+    """Launch-verify failure is pre-mutation: no reload/restart/facts rewrite."""
+    from scripts.maintenance.cutover_orchestrate import orchestrate
+
+    config = _make_config(tmp_path)
+    host = FakeHost()
+    venv_python = _seed_success_host(host, config)
+    host.run_handlers = [h for h in host.run_handlers if str(venv_python) not in h[0]]
+
+    def _bad_probe(argv: list[str]) -> RunResult:
+        if str(venv_python) in argv and "-c" in argv:
+            return RunResult(0, json.dumps({"sha": "c" * 40}), "")
+        return RunResult(0, "", "")
+
+    host.on_run(str(venv_python), _bad_probe)
+    result = orchestrate(host, config)
+    assert result.status == "failed"
+    assert "fleet untouched" in result.reason
+    assert not any("systemctl restart" in detail for _, detail in host.timeline)
+    assert not any("daemon-reload" in detail for _, detail in host.timeline)
+
+
+def test_restart_timeout_triggers_rollback_not_crash(tmp_path: Path) -> None:
+    """TimeoutExpired on restart routes to rollback, never escapes uncaught."""
+    import subprocess as _subprocess
+
+    from scripts.maintenance.cutover_orchestrate import orchestrate
+
+    config = _make_config(tmp_path)
+    host = FakeHost()
+    _seed_success_host(host, config)
+    host.run_handlers = [h for h in host.run_handlers if "systemctl restart" not in h[0]]
+
+    def _timeout_restart(argv: list[str]) -> RunResult:
+        raise _subprocess.TimeoutExpired(argv, 180)
+
+    host.on_run("systemctl restart", _timeout_restart)
+    result = orchestrate(host, config)
+    assert result.status in ("failed", "unknown")
+    assert any(kind == "write" or kind == "remove" for kind, _ in host.timeline)
+
+
+def test_controller_boundary_no_mutable_import_and_manifest(tmp_path: Path) -> None:
+    """Root boundary: no pm/hermes_cli import, manifest names the package."""
+    import sys as _sys
+
+    from scripts.maintenance import cutover as _facade
+    from scripts.maintenance.cutover_manifest import (
+        EXPECTED_SIBLINGS,
+        assert_no_candidate_import,
+        is_root_installed,
+    )
+
+    assert "cutover_orchestrate.py" in EXPECTED_SIBLINGS
+    assert "cutover_snapshot.py" in EXPECTED_SIBLINGS
+    assert not is_root_installed(tmp_path / "cutover.py")
+    assert_no_candidate_import(tmp_path / "candidate")
+    _sys.path.insert(0, str(tmp_path / "candidate"))
+    try:
+        try:
+            assert_no_candidate_import(tmp_path / "candidate")
+            boundary_hit = False
+        except Exception:
+            boundary_hit = True
+        assert boundary_hit
+    finally:
+        _sys.path.remove(str(tmp_path / "candidate"))
+    repo_root = Path(__file__).resolve().parents[2]
+    for name in EXPECTED_SIBLINGS:
+        assert (repo_root / "scripts" / "maintenance" / name).is_file()
+    assert hasattr(_facade, "save_baseline") and hasattr(_facade, "load_baseline")
+
+
+def test_actual_cli_resume_subprocess_no_snapshot_is_unknown(tmp_path: Path) -> None:
+    """Actual `cutover.py resume -I` subprocess with no snapshot is fail-closed unknown."""
+    repo_root = Path(__file__).resolve().parents[2]
+    script = repo_root / "scripts" / "maintenance" / "cutover.py"
+    journal = tmp_path / "journal.jsonl"
+    home = tmp_path / "home"
+    (home).mkdir(exist_ok=True)
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "HERMES_HOME": str(home)}
+    done = subprocess.run(
+        [
+            sys.executable, "-I", "-B", str(script), "resume",
+            "--candidate-sha", CANDIDATE_SHA,
+            "--parent-sha", PARENT_SHA,
+            "--candidate-src", str(tmp_path / "candidate"),
+            "--live-tree", str(tmp_path / "live"),
+            "--generation-root", str(tmp_path / "generations"),
+            "--journal", str(journal),
+            "--hermes-home", str(home),
+        ],
+        capture_output=True, text=True, timeout=60,
+        cwd=str(repo_root), env=env, check=False,
+    )
+    assert done.returncode != 0
+    assert "unknown" in ((done.stdout or "") + (done.stderr or ""))

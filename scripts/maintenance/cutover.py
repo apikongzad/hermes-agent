@@ -66,9 +66,16 @@ from scripts.maintenance.cutover_dropin import (
 )
 from scripts.maintenance.cutover_health import check_health, check_rollback_health
 from scripts.maintenance.cutover_journal import append, has_terminal_receipt, read_all
+from scripts.maintenance.cutover_manifest import (
+    EXPECTED_SIBLINGS,
+    ManifestError,
+    assert_no_candidate_import,
+    is_root_installed,
+)
 from scripts.maintenance.cutover_orchestrate import orchestrate, resume
 from scripts.maintenance.cutover_preflight import PreflightError, preflight
 from scripts.maintenance.cutover_restore import RestoreError, rollback
+from scripts.maintenance.cutover_snapshot import SnapshotError, load_baseline, save_baseline
 from scripts.maintenance.cutover_stage import StageError, stage, verify_isolated_launch
 from scripts.maintenance.cutover_types import (
     Baseline,
@@ -79,24 +86,31 @@ from scripts.maintenance.cutover_types import (
     RunResult,
     Staged,
     is_hex_sha,
+    snapshot_path_for,
 )
 
 __all__ = [
+    "EXPECTED_SIBLINGS",
     "Baseline",
     "CutoverConfig",
     "CutoverResult",
     "Host",
+    "ManifestError",
     "PreflightError",
     "ProductionHost",
     "RestoreError",
     "RunResult",
+    "SnapshotError",
     "StageError",
     "Staged",
     "append",
+    "assert_no_candidate_import",
     "check_health",
     "check_rollback_health",
     "has_terminal_receipt",
     "is_hex_sha",
+    "is_root_installed",
+    "load_baseline",
     "orchestrate",
     "preflight",
     "read_all",
@@ -104,6 +118,8 @@ __all__ = [
     "render_gateway_dropin",
     "resume",
     "rollback",
+    "save_baseline",
+    "snapshot_path_for",
     "stage",
     "verify_isolated_launch",
 ]
@@ -192,10 +208,13 @@ def _cmd_health(host: Host, config: CutoverConfig) -> int:
 
 def _cmd_rollback(host: Host, config: CutoverConfig) -> int:
     try:
-        baseline = preflight(host, config)
-    except (PreflightError, OSError) as exc:
-        print(f"rollback preflight fail-closed: {exc}", file=sys.stderr)
-        return 2
+        baseline = load_baseline(host, config)
+    except SnapshotError:
+        try:
+            baseline = preflight(host, config)
+        except (PreflightError, OSError) as exc:
+            print(f"rollback preflight fail-closed: {exc}", file=sys.stderr)
+            return 2
     errors = rollback(host, config, baseline)
     if errors:
         print(f"rollback errors: {'; '.join(errors)}", file=sys.stderr)

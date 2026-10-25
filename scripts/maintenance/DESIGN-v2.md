@@ -261,3 +261,83 @@ receipts live in §8.
 Parent owns live `systemctl`, root-only dropins (`zz-runtime-3.14.9.conf`
 permission-denied as `ubuntu`), and `/opt/hermes-maintenance` deploy.
 This tree performs NO live restart/outbound/data mutation.
+
+## 9. Recovery hardening amendment (v2.1, parent REJECT follow-up)
+
+Parent found `resume()` STILL UNSAFE: it re-ran `preflight()` after
+interruption, so when the candidate dropin was already written or a unit
+was stopped it either captured the candidate as the rollback baseline or
+refused on `MainPID=0` and could not auto-restore.
+
+- B1 Durable original baseline BEFORE FIRST MUTATION. `orchestrate()`
+  persists the full preflight `Baseline` to
+  `<journal>.baseline.json` immediately after preflight, before `stage()`.
+  The file is root-owned `0600`, atomic replace + `fsync` file and parent
+  dir (via `ProductionHost.write_bytes` durability). `stage()` writes only
+  the side generation (`<generation_root>/gen-<sha>/`), never live
+  source/facts/dropins, so the snapshot predates every live mutation.
+- B2 Authenticated bound resume, never recapture. `resume()` deserializes
+  the snapshot, verifies `sha256` checksum + `candidate_sha`/`parent_sha`
+  bind to the CLI config + `live_head==parent`/`candidate_head==candidate`,
+  and rolls back from THOSE bytes. It never calls `preflight()` on live
+  state. Missing/corrupt/mismatched snapshot or an existing terminal
+  receipt is fail-closed `unknown` (manual recovery), never a blind
+  recapture. A stopped unit (`MainPID=0`) does not block resume: the
+  snapshot already names the healthy old fleet; rollback restores bytes
+  then `daemon-reload` + `restart` + verify.
+- B3 Pre/post-mutation failure split (stagefail zero lifecycle). `stage()`
+  and `verify_isolated_launch()` failures happen before any live mutation:
+  they return `failed` directly with NO `rollback()` lifecycle writes (no
+  `git checkout`, no facts rewrite, no dropin remove, no
+  `daemon-reload`/`restart`). Only after `write_candidate_dropins()`
+  succeeds (`live_mutated=True`, including partial-write failure which is
+  treated as mutated) do `reload`/`restart`/`health` failures route to
+  `rollback()`. Regression: staging failure leaves `systemctl` untouched
+  and the healthy live gateway running.
+- B4 Typed timeout + outer guarantee + independent OnFailure.
+  `ProductionHost.run()` raises `subprocess.TimeoutExpired` on timeout
+  (not `RunResult`); `http_get` may raise `OSError`/`TimeoutError`. All
+  post-mutation `host.run`/`check_health` sites catch
+  `(OSError, RuntimeError, TimeoutError, subprocess.TimeoutExpired)` and
+  route to `rollback()`. An outer `except Exception` around the mutated
+  section guarantees a rollback attempt even on an unexpected exception.
+  The systemd `hermes-runtime-cutover-recovery.service` (`OnFailure=`) is
+  the independent second chance: it re-invokes `resume` from the same
+  journal+snapshot after reboot/crash, before any receipt.
+- B5 Real launch prep, isolated home, no production mutation. The probe is
+  REAL Hermes preparation, not `sys.executable`: the child runs
+  `<staged>/bin/python -I -B -c` that records `sys.executable`/`sys.prefix`
+  BEFORE, inserts the candidate, imports `hermes_bootstrap`, calls
+  `hermes_cli.venv_sync.prepare_launch(candidate, ["gateway","run"])`,
+  records AFTER, then `get_code_identity()`; the JSON must carry
+  `sha==candidate`, `before`/`after`, and the `prepare_launch` return.
+  Verifier requires `before.exe==staged venv python`,
+  `after==before` (no mid-probe re-exec), and `prepare_launch` present.
+  Actual schema: `get_code_identity()->{"sha","short_sha","version",
+  "source","commit_date"}` (`hermes_cli/version_info.py:308-332`).
+  Isolation: `_isolated_env()` uses
+  `HERMES_HOME=<generation_root>/probe-home-<sha12>` and `HOME` there,
+  with `HERMES_RUNTIME_DIR=/home/ubuntu/.hermes/tools` (production
+  toolchain read-only, per `pm/environments._unstamped_store` borrowing).
+  The default production profile (`/home/ubuntu/.hermes`) is never
+  `HERMES_HOME` in the probe; the journal records user (`ubuntu`),
+  isolated home, and the before/after transcript.
+- B6 Controller package manifest (root-installed vs candidate). Root never
+  imports mutable candidate code: `cutover.py` inserts only the
+  root-owned prefix (`/opt/hermes-maintenance`) via stdlib, pops
+  `PYTHON*`, and refuses `candidate_src` on `sys.path` in the root
+  process. The child (as `ubuntu`, `cwd=candidate`) is the ONLY importer
+  of candidate `pm`/`hermes_bootstrap`. `MANIFEST` is the sibling file
+  list (`cutover*.py`, `systemd/*.service`) with `sha256`; parent verifies
+  the root-owned copy matches the candidate bytes gated by preflight
+  (`def orchestrate` in orchestrator, re-export in facade) before deploy.
+  No `import pm/hermes_cli/gateway` in root-owned code (stdlib +
+  `ProductionHost` only).
+
+Crash-matrix (FakeHost, no real units): interrupt after dropin write,
+after one service stopped (`MainPID=0` + `is-active` fail for one unit),
+after restart before receipt (new PIDs + candidate state but no receipt):
+`resume(snapshot)` restores original unit texts/dropin bytes/selection
+facts bytes + healthy old fleet (`is-active` both, old exes), never the
+candidate. Fullsuite `update_lock` 2 failures remain documented flaky
+(isolated pass, load-induced); no fullsuite rerun in this slice.

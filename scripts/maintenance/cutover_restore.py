@@ -7,6 +7,7 @@ start-before-restore, every error journaled + returned.
 
 from __future__ import annotations
 
+import subprocess
 import traceback
 
 from scripts.maintenance.cutover_dropin import remove_candidate_dropins
@@ -37,14 +38,24 @@ def _check_provenance(config: CutoverConfig, baseline: Baseline) -> None:
 
 
 def _restore_source(host: Host, config: CutoverConfig, baseline: Baseline) -> None:
-    res = host.run(["git", "-C", str(config.live_tree), "rev-parse", "HEAD"], timeout=30)
+    try:
+        res = host.run(
+            ["git", "-C", str(config.live_tree), "rev-parse", "HEAD"], timeout=30
+        )
+    except (OSError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as exc:
+        raise RestoreError(f"source HEAD read failed: {type(exc).__name__}: {exc}") from exc
     current = (res.stdout or "").strip() if res.returncode == 0 else ""
     if current == config.parent_sha:
         return
-    back = host.run(
-        ["git", "-C", str(config.live_tree), "checkout", "--detach", config.parent_sha],
-        timeout=120,
-    )
+    try:
+        back = host.run(
+            ["git", "-C", str(config.live_tree), "checkout", "--detach", config.parent_sha],
+            timeout=120,
+        )
+    except (OSError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as exc:
+        raise RestoreError(
+            f"source restore transport failed: {type(exc).__name__}: {exc}"
+        ) from exc
     if back.returncode != 0:
         raise RestoreError(f"source restore failed: {(back.stderr or '')[-300:]}")
 
@@ -102,8 +113,16 @@ def rollback(host: Host, config: CutoverConfig, baseline: Baseline) -> list[str]
             append(host, config.journal_path, "restore-dropins-failed", False, {"error": str(exc)})
 
     if not errors:
-        reloaded = host.run(["systemctl", "daemon-reload"], timeout=60)
-        if reloaded.returncode != 0:
+        try:
+            reloaded = host.run(["systemctl", "daemon-reload"], timeout=60)
+        except (OSError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as exc:
+            errors.append(f"daemon-reload transport failed: {type(exc).__name__}: {exc}"[-300:])
+            append(
+                host, config.journal_path, "restore-reload-failed", False,
+                {"error": errors[-1][-300:]},
+            )
+            reloaded = None
+        if reloaded is not None and reloaded.returncode != 0:
             errors.append(f"daemon-reload failed: {(reloaded.stderr or '')[-200:]}")
             append(
                 host, config.journal_path, "restore-reload-failed", False,
@@ -111,10 +130,19 @@ def rollback(host: Host, config: CutoverConfig, baseline: Baseline) -> list[str]
             )
 
     if not errors:
-        restarted = host.run(
-            ["systemctl", "restart", config.gateway_unit, config.dashboard_unit], timeout=180
-        )
-        if restarted.returncode != 0:
+        try:
+            restarted = host.run(
+                ["systemctl", "restart", config.gateway_unit, config.dashboard_unit],
+                timeout=180,
+            )
+        except (OSError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as exc:
+            errors.append(f"restart transport failed: {type(exc).__name__}: {exc}"[-300:])
+            append(
+                host, config.journal_path, "restore-restart-failed", False,
+                {"error": errors[-1][-300:]},
+            )
+            restarted = None
+        if restarted is not None and restarted.returncode != 0:
             errors.append(f"restart failed: {(restarted.stderr or '')[-200:]}")
             append(
                 host, config.journal_path, "restore-restart-failed", False,
@@ -122,8 +150,18 @@ def rollback(host: Host, config: CutoverConfig, baseline: Baseline) -> list[str]
             )
 
     if not errors:
-        report = check_rollback_health(host, config)
-        if not report.ok:
+        try:
+            report = check_rollback_health(host, config)
+        except (OSError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as exc:
+            errors.append(
+                f"rollback verify transport failed: {type(exc).__name__}: {exc}"[-300:]
+            )
+            append(
+                host, config.journal_path, "restore-verify-failed", False,
+                {"error": errors[-1][-300:]},
+            )
+            report = None
+        if report is not None and not report.ok:
             errors.append(f"rollback verify failed: {report.detail}")
             append(host, config.journal_path, "restore-verify-failed", False, {"detail": report.detail})
 

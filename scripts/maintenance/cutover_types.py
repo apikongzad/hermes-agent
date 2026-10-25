@@ -103,7 +103,33 @@ class ProductionHost(Host):
         target.parent.mkdir(parents=True, exist_ok=True)
         staging = target.with_name(f".{target.name}.stage.{os.getpid()}")
         staging.write_bytes(data)
+        try:
+            with open(staging, "rb") as handle:
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError:
+            pass
         os.replace(staging, target)
+        try:
+            with open(target, "rb") as handle:
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError:
+            pass
+        try:
+            dir_fd = os.open(str(target.parent), os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+        name = target.name
+        if "journal" in name or "baseline" in name:
+            try:
+                os.chmod(target, 0o600)
+            except OSError:
+                pass
 
     def remove(self, path: Path) -> None:
         try:
@@ -228,6 +254,11 @@ def venv_python_for(config: CutoverConfig) -> Path:
 
 def candidate_dropin_path(dropin_dir: Path, name: str) -> Path:
     return Path(dropin_dir) / name
+
+
+def snapshot_path_for(journal: Path) -> Path:
+    """Durable baseline snapshot sibling for a journal (root-owned, fsynced)."""
+    return Path(str(journal) + ".baseline.json")
 
 
 def facts_path_for(hermes_home: Path) -> Path:

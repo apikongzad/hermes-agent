@@ -62,7 +62,7 @@ absolute `/usr/bin/python3`, isolated `HOME/HERMES_HOME/HERMES_RUNTIME_DIR`,
 `env -i`, no `PYTHONPATH`:
 
 ```bash
-sudo runuser -u ubuntu -- env -i HOME=/home/ubuntu HERMES_HOME=/home/ubuntu/.hermes \
+sudo runuser -u ubuntu -- env -i HOME=<gen>/probe-home-<sha12> HERMES_HOME=<gen>/probe-home-<sha12> \
   HERMES_RUNTIME_DIR=/home/ubuntu/.hermes/tools PATH=/usr/bin:/bin \
   /usr/bin/python3 -m pm.build_env \
   --source /opt/candidate/hermes-agent --out /home/ubuntu/.hermes/generations/gen-<sha12>/venv
@@ -71,15 +71,19 @@ sudo runuser -u ubuntu -- env -i HOME=/home/ubuntu HERMES_HOME=/home/ubuntu/.her
 That CLI wraps `pm.build_environment(source, out)` (`pm/build_env.py`,
 `pm/operations.py:28-65`; `cwd=source` for `uv sync`). Tests assert
 `pm.build_env` + `--source` appear and reject `pm.py` /
-`scripts/sync_venv.py` / `scripts/publish_launcher.py`.
+`scripts/sync_venv.py` / `scripts/publish_launcher.py`. The snapshot
+`<journal>.baseline.json` (root-owned `0600`, fsynced) is persisted BEFORE
+`stage()`; `resume` uses ONLY that snapshot, never a live recapture.
 
 Re-exec verify uses REAL Hermes launch prep (not `sys.executable`):
 
 ```bash
 <generation>/venv/bin/python -I -B -c \
-  "import sys; sys.path.insert(0, '<candidate>'); import hermes_bootstrap; \
-   from hermes_cli.version_info import get_code_identity; print(...)"
-# must report sha == candidate, with isolated HOME/HERMES_HOME, cwd=candidate
+  "import sys, json; _before={...}; sys.path.insert(0, '<candidate>'); import hermes_bootstrap; \
+   from hermes_cli.venv_sync import prepare_launch; from hermes_cli.version_info import get_code_identity; \
+   prepare_launch(...); print(json.dumps({...}))"
+# must report sha == candidate + before/after exe/prefix + prepare_launch, with
+# isolated HERMES_HOME=<gen>/probe-home-<sha12> (never /home/ubuntu/.hermes), cwd=candidate
 ```
 
 ## Cutover dropin (sorted AFTER zz-runtime)
