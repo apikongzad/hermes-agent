@@ -788,7 +788,7 @@ class TestRunJobSessionPersistence:
                 return {"final_response": "ok"}
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._preflight_job_config", return_value=None), \
+             patch("gateway.config.load_gateway_config", return_value=MagicMock(get_connected_platforms=MagicMock(return_value=[__import__("gateway.config", fromlist=["Platform"]).Platform.TELEGRAM]))), \
              patch("hermes_state_registry.acquire", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
@@ -848,7 +848,7 @@ class TestRunJobSessionPersistence:
                 return {"final_response": "ok"}
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._preflight_job_config", return_value=None), \
+             patch("gateway.config.load_gateway_config", return_value=MagicMock(get_connected_platforms=MagicMock(return_value=[__import__("gateway.config", fromlist=["Platform"]).Platform.SLACK]))), \
              patch("hermes_state_registry.acquire", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
@@ -993,7 +993,7 @@ class TestRunJobSessionPersistence:
                 return {"final_response": "ok"}
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._preflight_job_config", return_value=None), \
+             patch("gateway.config.load_gateway_config", return_value=MagicMock(get_connected_platforms=MagicMock(return_value=[__import__("gateway.config", fromlist=["Platform"]).Platform.TELEGRAM]))), \
              patch("hermes_state_registry.acquire", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
@@ -1108,10 +1108,11 @@ class TestRunJobConfigEnvVarExpansion:
                 raise httpx.ConnectError(
                     "[Errno 8] nodename nor servname provided, or not known"
                 )
-            # First fallback rung (xai API key) succeeds.
-            assert kwargs["requested"] == "xai"
-            assert kwargs["target_model"] == "grok-4.5"
-            return {**self._RUNTIME, "provider": "xai", "api_mode": "chat_completions"}
+            if kwargs.get("requested") in ("xai", "anthropic"):
+                want = {"xai": "grok-4.5", "anthropic": "claude-opus-5"}[kwargs["requested"]]
+                assert kwargs["target_model"] == want
+                return {**self._RUNTIME, "provider": kwargs["requested"], "api_mode": "chat_completions"}
+            raise AssertionError(kwargs.get("requested"))
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
@@ -1129,7 +1130,7 @@ class TestRunJobConfigEnvVarExpansion:
 
         assert success is True, error
         assert error is None
-        assert requested == [None, "xai"]
+        assert requested[:2] == ["xai", "anthropic"] and requested[-2:] == [None, "xai"]
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["provider"] == "xai"
         assert kwargs["model"] == "grok-4.5"
@@ -1144,7 +1145,6 @@ class TestRunJobConfigEnvVarExpansion:
             "  default: gpt-5.6-sol\n"
             "  provider: openai-codex\n"
             "fallback_providers:\n"
-            "  - provider: anthropic\n"
             "  - provider: openrouter\n"
             "    model: z-ai/glm-5.2\n",
             encoding="utf-8",
@@ -1181,7 +1181,7 @@ class TestRunJobConfigEnvVarExpansion:
 
         assert success is True
         assert error is None
-        assert requested == [None, "openrouter"]
+        assert requested[0] == "openrouter" and requested[-2:] == [None, "openrouter"]
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["provider"] == "openrouter"
         assert kwargs["model"] == "z-ai/glm-5.2"
@@ -1325,7 +1325,7 @@ class TestRunJobSkillBacked:
             from tools.env_passthrough import register_env_passthrough
 
             register_env_passthrough(["NOTION_API_KEY"])
-            return json.dumps({"success": True, "content": "# notion\nUse Notion."})
+            return json.dumps({"success": True, "content": "# notion\nUse Notion.", "readiness_status": "available", "setup_needed": False})
 
         def _run_conversation(prompt, *, task_id=None):
             from tools.env_passthrough import get_all_passthrough

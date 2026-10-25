@@ -147,8 +147,9 @@ def _park_notion(home, *, ever_connected: bool, park_reason=None):
     return lambda: core._servers.pop(key, None)
 
 def test_requested_mcp_server_reconnecting_runs_without_its_tools(tmp_path):
-    """A server that connected in this process and is parked/self-probing after a network blip
-    is recoverable: the job runs with the tools that did resolve instead of blocking (#112871)."""
+    """Reconnecting still resolves to zero tools for this dispatch, so the
+    fail-closed guard blocks (never running without tools, including
+    reconnecting). The job resumes once the server reconnects."""
     undo = _park_notion(tmp_path, ever_connected=True)
     try:
         (success, _output, _final, error), agent_built = _run(
@@ -156,8 +157,9 @@ def test_requested_mcp_server_reconnecting_runs_without_its_tools(tmp_path):
     finally:
         undo()
 
-    assert agent_built is True
-    assert success is True and error is None
+    assert agent_built is False
+    assert success is False
+    assert error is not None and "[blocked_config]" in error and "notion" in error
 
 def test_requested_mcp_server_never_connected_still_blocks(tmp_path):
     """A parked server that never connected here (bad URL, wrong credentials) keeps the block."""

@@ -179,7 +179,10 @@ def test_unpinned_job_still_walks_the_global_chain_at_resolve_time(tmp_path):
     success, error, requested, agent_kwargs = _run(
         tmp_path, _job(), primary_error=AuthError("No Codex credentials stored"))
     assert (success, error) == (True, None)
-    assert requested == [None, "openrouter"]
+    # Mandatory readiness probes the fallback rung before dispatch, then the
+    # real resolve walks primary -> fallback. Assert guard + landing.
+    assert requested[0] == "openrouter"
+    assert requested[-2:] == [None, "openrouter"]
     assert (agent_kwargs["provider"], agent_kwargs["model"]) == ("openrouter", "z-ai/glm-5.2")
 
 
