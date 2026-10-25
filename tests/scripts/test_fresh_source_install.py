@@ -85,9 +85,9 @@ def test_current_installer_publishes_real_dependencies_and_warm_path(tmp_path, s
     recipe = tomllib.loads((source / "pm/pyproject.toml").read_text())
     yaml_dep = next(d for d in recipe["project"]["dependencies"] if d.startswith("ruamel.yaml"))
     (source / "pyproject.toml").write_text(
-        '[project]\nname="installer-fixture"\nversion="1"\nrequires-python=">=3.14"\n'
-        f'dependencies=["installer-probe==1.0",{json.dumps(yaml_dep)}]\n'
-        '[project.optional-dependencies]\nall=[]\n[dependency-groups]\ndev=[]\ntest=[]\n'
+            '[project]\nname="installer-fixture"\nversion="1"\nrequires-python=">=3.14"\n'
+            f'dependencies=["installer-probe==1.0",{json.dumps(yaml_dep)}]\n'
+            '[project.optional-dependencies]\nall=[]\nfal=[]\n[dependency-groups]\ndev=[]\ntest=[]\n'
         '[tool.uv]\npackage=false\n'
         '[tool.uv.sources]\ninstaller-probe={path="wheels/installer_probe-1.0-py3-none-any.whl"}\n',
         encoding="utf-8")

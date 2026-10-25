@@ -104,8 +104,10 @@ def _capture_unit(
         raise PreflightError(f"cannot read /proc/{pid}/cwd: {exc}") from exc
     try:
         start_time = host.proc_start_time(pid)
-    except OSError:
-        start_time = None
+    except OSError as exc:
+        raise PreflightError(f"cannot read /proc/{pid}/start_time: {exc}") from exc
+    if start_time is None:
+        raise PreflightError(f"live {unit} start_time is unknown (refusing to proceed)")
     return (
         cat_text,
         pid,
@@ -131,17 +133,32 @@ def preflight(host: Host, config: CutoverConfig) -> Baseline:
     if "HERMES_EXE" in config.candidate_dropin_name:
         raise PreflightError("dropin name must not imply HERMES_EXE selects the interpreter")
 
-    candidate_controller = (
+    candidate_facade = (
         Path(config.candidate_src) / "scripts" / "maintenance" / "cutover.py"
     )
+    candidate_orchestrator = (
+        Path(config.candidate_src) / "scripts" / "maintenance" / "cutover_orchestrate.py"
+    )
     try:
-        controller_bytes = host.read_bytes(candidate_controller)
+        facade_bytes = host.read_bytes(candidate_facade)
     except FileNotFoundError:
-        raise PreflightError(f"candidate tree has no controller: {candidate_controller}")
+        raise PreflightError(f"candidate tree has no controller: {candidate_facade}")
     except OSError as exc:
         raise PreflightError(f"cannot read candidate controller: {exc}") from exc
-    if b"def orchestrate" not in controller_bytes:
+    try:
+        orchestrator_bytes = host.read_bytes(candidate_orchestrator)
+    except FileNotFoundError:
+        raise PreflightError(
+            f"candidate tree has no orchestrator: {candidate_orchestrator}"
+        )
+    except OSError as exc:
+        raise PreflightError(f"cannot read candidate orchestrator: {exc}") from exc
+    # Facade re-exports (import), implementation defines. Checking the facade
+    # for `def orchestrate` always refused real trees (facade only imports).
+    if b"def orchestrate" not in orchestrator_bytes:
         raise PreflightError("candidate controller is not the cutover orchestrator")
+    if b"orchestrate" not in facade_bytes:
+        raise PreflightError("candidate facade does not re-export the orchestrator")
 
     if not (config.candidate_dropin_name > "zz-runtime-3.14.9.conf"):
         raise PreflightError("candidate dropin must sort AFTER zz-runtime-3.14.9.conf")

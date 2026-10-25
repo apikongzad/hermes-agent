@@ -159,8 +159,10 @@ receipts live in §8.
 ## 5. Invariants (fail-closed)
 
 - I1 `candidate_sha != parent_sha`, both 40-hex; `dashboard_port==9119`.
-- I2 Controller file lives inside `candidate_src/scripts/maintenance/cutover.py`
-  and contains `def orchestrate`.
+- I2 Controller facade lives inside `candidate_src/scripts/maintenance/cutover.py`
+  and re-exports `orchestrate`; the implementation
+  `candidate_src/scripts/maintenance/cutover_orchestrate.py` contains
+  `def orchestrate` (facade-only `def` check always refused real trees).
 - I3 `candidate_dropin_name > zz-runtime-3.14.9.conf` (lexicographic win).
 - I4 Staging argv is EXACTLY the documented PM entrypoint
   (`pm.build_env --source <abs candidate> --out <abs side>/venv [--python <abs>]`)
@@ -207,10 +209,12 @@ receipts live in §8.
 
 - Preflight: `systemctl cat <gw> <dash>` contains `ExecStart=`;
   `systemctl show <gw> -p MainPID` → `>0`;
-  `readlink(/proc/<pid>/exe)` non-empty;
+  `readlink(/proc/<pid>/exe)` non-empty; `/proc/<pid>/start_time` readable
+  (fail-closed, never None);
   `git -C <live> rev-parse HEAD == parent_sha`;
   `git -C <candidate> rev-parse HEAD == candidate_sha`;
-  `candidate/.../cutover.py` contains `def orchestrate`;
+  `candidate/.../cutover_orchestrate.py` contains `def orchestrate` AND
+  `candidate/.../cutover.py` re-exports it;
   `facts.json` (selection) + `gateway_state.json` readable;
   dropin prior bytes captured.
 - Stage (as ubuntu): `runuser -u ubuntu -- env -i HOME=… HERMES_HOME=…

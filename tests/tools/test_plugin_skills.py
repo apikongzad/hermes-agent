@@ -534,6 +534,11 @@ class TestPluginSkillReadinessGate:
 
         self._reg(tmp_path, "---\nname: foo\ndescription: d\nrequired_commands: [node]\n---\nBody.\n")
         monkeypatch.setattr("shutil.which", lambda cmd: f"/usr/bin/{cmd}")
+        # Managed runtimes (node/npm/npx/uv/uvx) resolve via the PM layer,
+        # never bare PATH: a system copy must not decide readiness.
+        monkeypatch.setattr(
+            "hermes_constants.find_node_executable", lambda cmd: f"/usr/bin/{cmd}"
+        )
         result = json.loads(skill_view("myplugin:foo"))
         assert result["readiness_status"] == "available"
         assert result["setup_needed"] is False

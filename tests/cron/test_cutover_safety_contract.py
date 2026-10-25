@@ -178,9 +178,13 @@ def _seed_success_host(host: FakeHost, config: CutoverConfig) -> Path:
     venv_python = gen / "venv" / "bin" / "python3"
     store_home = Path("/opt/store/python/bin")
     store_exe = store_home / "python3.14"
+    # Real layout: facade re-exports, orchestrator defines.
     host.files[str(config.candidate_src / "scripts" / "maintenance" / "cutover.py")] = (
-        b"def orchestrate(): pass"
+        b"from scripts.maintenance.cutover_orchestrate import orchestrate, resume"
     )
+    host.files[
+        str(config.candidate_src / "scripts" / "maintenance" / "cutover_orchestrate.py")
+    ] = (b"def orchestrate(host, config): pass\ndef resume(host, config): pass\n")
     # Staged pyvenv.cfg binds the expected store interpreter (exact).
     host.files[str(gen / "venv" / "pyvenv.cfg")] = (
         f"home = {store_home}\nexecutable = {store_exe}\nversion_info = 3.14.9\n".encode()
@@ -578,3 +582,115 @@ def test_cli_runs_under_isolated_I_without_pythonpath() -> None:
     )
     assert done.returncode == 0
     assert "Hermes standalone runtime cutover" in (done.stdout or "")
+
+
+def test_preflight_accepts_real_controller_files() -> None:
+    """Real facade re-exports, real orchestrator defines (old facade-only check refused)."""
+    repo_root = Path(__file__).resolve().parents[2]
+    facade_bytes = (repo_root / "scripts" / "maintenance" / "cutover.py").read_bytes()
+    orch_bytes = (
+        repo_root / "scripts" / "maintenance" / "cutover_orchestrate.py"
+    ).read_bytes()
+    assert b"def orchestrate" in orch_bytes
+    assert b"orchestrate" in facade_bytes
+    # The v1 gate looked for `def` in the facade, which only imports:
+    # it refused every real tree.
+    assert b"def orchestrate" not in facade_bytes
+
+
+def test_preflight_controller_gate_passes_with_real_bytes(tmp_path: Path) -> None:
+    """FakeHost seeded with REAL controller bytes gets past the controller gate."""
+    from scripts.maintenance.cutover_preflight import PreflightError, preflight
+
+    repo_root = Path(__file__).resolve().parents[2]
+    config = _make_config(tmp_path, candidate_src=repo_root)
+    host = FakeHost()
+    _seed_success_host(host, config)
+    # Overwrite the minimal facsimile with the real file bytes.
+    host.files[str(repo_root / "scripts" / "maintenance" / "cutover.py")] = (
+        repo_root / "scripts" / "maintenance" / "cutover.py"
+    ).read_bytes()
+    host.files[
+        str(repo_root / "scripts" / "maintenance" / "cutover_orchestrate.py")
+    ] = (repo_root / "scripts" / "maintenance" / "cutover_orchestrate.py").read_bytes()
+    try:
+        preflight(host, config)
+    except PreflightError as exc:
+        # Must get past the controller gate: any failure now is HEAD/units,
+        # never "not the cutover orchestrator".
+        assert "cutover orchestrator" not in str(exc)
+        assert "orchestrator" not in str(exc).lower() or "HEAD" in str(exc) or "live" in str(exc)
+        return
+    # If the fake SHAs happened to match (they cannot: CANDIDATE_SHA is fake),
+    # success also proves the gate passed.
+    assert True
+
+
+def test_cli_preflight_reaches_beyond_controller_gate(tmp_path: Path) -> None:
+    """Real `cutover.py preflight` CLI on real bytes fails past the controller gate."""
+    repo_root = Path(__file__).resolve().parents[2]
+    script = repo_root / "scripts" / "maintenance" / "cutover.py"
+    real_head = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+        capture_output=True, text=True, timeout=30, check=True,
+    ).stdout.strip()
+    assert len(real_head) == 40
+    journal = tmp_path / "journal.jsonl"
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(tmp_path),
+        "HERMES_HOME": str(home),
+    }
+    done = subprocess.run(
+        [
+            sys.executable, "-I", "-B", str(script), "preflight",
+            "--candidate-sha", "a" * 40,
+            "--parent-sha", real_head,
+            "--candidate-src", str(repo_root),
+            "--live-tree", str(repo_root),
+            "--generation-root", str(tmp_path / "generations"),
+            "--journal", str(journal),
+            "--hermes-home", str(home),
+            "--gateway-dropin-dir", str(tmp_path / "gw.d"),
+            "--dashboard-dropin-dir", str(tmp_path / "dash.d"),
+        ],
+        capture_output=True, text=True, timeout=60,
+        cwd=str(repo_root), env=env, check=False,
+    )
+    # Must fail closed (candidate HEAD != fake SHA, or live units unreadable
+    # as non-root) but NOT on the controller gate.
+    assert done.returncode == 2
+    err = (done.stderr or "") + (done.stdout or "")
+    assert "cutover orchestrator" not in err
+
+
+def test_isolated_launch_prep_reports_candidate_sha(tmp_path: Path) -> None:
+    """Real Hermes launch prep (hermes_bootstrap + code identity) selects the candidate."""
+    repo_root = Path(__file__).resolve().parents[2]
+    real_head = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+        capture_output=True, text=True, timeout=30, check=True,
+    ).stdout.strip()
+    candidate = str(repo_root.resolve())
+    assert "'" not in candidate
+    code = (
+        "import sys; sys.path.insert(0, '" + candidate + "'); "
+        "import hermes_bootstrap; "
+        "from hermes_cli.version_info import get_code_identity; "
+        "import json; print(json.dumps(get_code_identity()))"
+    )
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(tmp_path),
+        "HERMES_HOME": str(tmp_path / "home"),
+    }
+    done = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", code],
+        capture_output=True, text=True, timeout=60,
+        cwd=candidate, env=env, check=False,
+    )
+    assert done.returncode == 0, (done.stdout or "") + (done.stderr or "")
+    identity = json.loads((done.stdout or "").strip().splitlines()[-1])
+    assert identity.get("sha") == real_head

@@ -858,6 +858,11 @@ class TestRequiredCommandsDiscovery:
 
     def test_present_commands_leave_skill_available(self, tmp_path, monkeypatch):
         monkeypatch.setattr("shutil.which", lambda cmd: f"/usr/bin/{cmd}")
+        # Managed runtimes resolve via PM (find_node_executable/uv_launcher),
+        # never bare PATH: mock the managed boundary for node/npx.
+        monkeypatch.setattr(
+            "hermes_constants.find_node_executable", lambda cmd: f"/usr/bin/{cmd}"
+        )
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "font-skill",
                         frontmatter_extra="required_commands: [node, npx]\n")
