@@ -29,6 +29,7 @@ import ast
 import functools
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -209,7 +210,32 @@ class _ResolutionSiteVisitor(ast.NodeVisitor):
 
 
 def _source_files() -> list[Path]:
-    files: list[Path] = []
+    # The guard is about SOURCE, not the working tree: tracked files plus
+    # untracked-but-not-ignored (new work). A raw os.walk also descends into
+    # gitignored build/env artifacts — ignored/cutover-generations venvs and
+    # ignored/probe-home installs (15k+ site-packages files) — which is slow
+    # and reports third-party code as unreviewed lookups. git ls-files with
+    # --exclude-standard is the source inventory; it never lists ignored/.
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "*.py"],
+            cwd=REPO_ROOT, capture_output=True, check=False, timeout=30,
+        )
+        if proc.returncode == 0:
+            files: list[Path] = []
+            for entry in proc.stdout.split(b"\0"):
+                if not entry:
+                    continue
+                rel = Path(entry.decode("utf-8", errors="replace"))
+                top = rel.parts[0] if len(rel.parts) > 1 else ""
+                if top in _EXEMPT_DIRS or (top and _is_packaging_copy(top)):
+                    continue
+                files.append(REPO_ROOT / rel)
+            return files
+    except (OSError, subprocess.SubprocessError):
+        pass
+    # Fallback when git is unavailable (not a checkout): walk but still prune
+    # the known ignored staging root alongside the exempt/packaging dirs.
     # os.walk instead of Path.rglob: rglob raises FileNotFoundError when a
     # directory vanishes mid-scan — a sibling CI job's sdist extraction
     # (hermes_agent-<version>/) gets created and deleted concurrently, and
@@ -217,12 +243,13 @@ def _source_files() -> list[Path]:
     # workspaces. os.walk tolerates vanishing dirs (onerror=None), and
     # pruning exempt/packaging dirs at the top level also skips their
     # subtrees entirely.
+    files = []
     for dirpath, dirnames, filenames in os.walk(REPO_ROOT):
         rel_dir = Path(dirpath).relative_to(REPO_ROOT)
         if rel_dir == Path("."):
             dirnames[:] = [
                 d for d in dirnames
-                if d not in _EXEMPT_DIRS and not _is_packaging_copy(d)
+                if d not in _EXEMPT_DIRS and d != "ignored" and not _is_packaging_copy(d)
             ]
         for fname in filenames:
             if fname.endswith(".py"):

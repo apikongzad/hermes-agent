@@ -56,11 +56,80 @@ def marker(tmp_path):
 
 @pytest.fixture
 def other_pid():
-    """A live process that is not us: the stand-in for another updater (our own pid is ours)."""
-    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], stdin=subprocess.DEVNULL)
-    yield proc.pid
-    proc.kill()
-    proc.wait()
+    """A live partner process with handshake readiness and bounded teardown.
+
+    The stand-in for another updater (our own pid is ours). The child signals
+    ``ready`` after exec so the claim never races interpreter startup: without
+    the handshake a claim written before the child is observable reads as dead
+    (or with an unreadable creation time) under full-suite load, and the
+    handoff/delegate adoption then refuses with ``acquire() is False``. The
+    creation-time probe is awaited boundedly for the same reason. Teardown is
+    bounded so sleepers never leak across tests.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-c",
+         "import sys, time; print('ready', flush=True); sys.stdout.close(); time.sleep(120)"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    )
+    try:
+        ready = proc.stdout.readline().strip() if proc.stdout else ""
+        assert ready == "ready", f"partner never signaled readiness (got {ready!r}, pid={proc.pid})"
+        deadline = time.monotonic() + 10.0
+        while process_create_time(proc.pid) is None:
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"partner pid {proc.pid} creation time unreadable after 10s")
+            time.sleep(0.02)
+        yield proc.pid
+    finally:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            proc.wait(timeout=10)
+        if proc.stdout:
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
+
+
+def _refusal_cause(marker, partner_pid, lock) -> str:
+    """Capture why an adoption refused: holder, liveness, identity, handoff."""
+    from hermes_cli import update_lock as _ul
+    from hermes_cli._early_recovery import _pid_is_running
+
+    try:
+        parsed = _ul._read_marker(marker)
+        partners = _ul._live_partners(parsed) if parsed is not None else None
+    except Exception as exc:
+        partners = f"<unreadable: {exc!r}>"
+    try:
+        handoff = _ul._handoff_pid()
+    except Exception as exc:
+        handoff = f"<unreadable: {exc!r}>"
+    try:
+        is_partner = _ul.UpdateLock._is_partner(partner_pid)
+    except Exception as exc:
+        is_partner = f"<unreadable: {exc!r}>"
+    try:
+        alive = _pid_is_running(partner_pid)
+    except Exception as exc:
+        alive = f"<unreadable: {exc!r}>"
+    try:
+        ct = process_create_time(partner_pid)
+    except Exception as exc:
+        ct = f"<unreadable: {exc!r}>"
+    return (
+        f"holder={lock.holder!r} partners={partners!r} is_partner={is_partner!r} "
+        f"handoff={handoff!r} pid_alive={alive!r} ct={ct!r} partner={partner_pid}"
+    )
 
 
 def _claim(marker, pid, started_at=None):
@@ -269,7 +338,7 @@ def test_delegate_keeps_the_claim_live_after_the_partner_dies(marker, monkeypatc
     monkeypatch.setenv(HANDOFF_PID_ENV, str(other_pid))
 
     lock = UpdateLock(path=marker)
-    assert lock.acquire() is True and lock.acquired is False
+    assert lock.acquire() is True and lock.acquired is False, _refusal_cause(marker, other_pid, lock)
     lines = marker.read_text(encoding="utf-8-sig").splitlines()
     assert marker.read_bytes().startswith(base) and lines[3].startswith(f"delegate:{os.getpid()} ct:")
 
@@ -637,7 +706,7 @@ class TestHandoffFromOrchestratingUpdater:
         monkeypatch.setenv(HANDOFF_PID_ENV, str(other_pid))
 
         lock = UpdateLock(path=marker)
-        assert lock.acquire() is True
+        assert lock.acquire() is True, _refusal_cause(marker, other_pid, lock)
         assert lock.acquired is False, "the parent's claim is not ours to own"
 
         lock.release()
