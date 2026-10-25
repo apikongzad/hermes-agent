@@ -1,12 +1,12 @@
 """Doctor and launched commands share PM's read-only installed selection."""
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 import shutil
 import stat
 import subprocess
+import sys
 
 import pytest
 
@@ -38,7 +38,17 @@ def tool_store(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "lockfile_path", lambda: lock_path)
     target = current_target()
     package = get_package("ripgrep")
-    digest = hashlib.sha256(Path(rg).read_bytes()).hexdigest()
+    # Hermetic: rg lives under the real Hermes tool store (~/.hermes/tools), so
+    # Path(rg).read_bytes() trips the real-home guard. Hash the same real bytes
+    # via a subprocess child (native I/O, unguarded) without weakening the
+    # executable-parity assertions below.
+    _hash_child = subprocess.run(
+        [sys.executable, "-I", "-c",
+         "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())",
+         rg],
+        capture_output=True, text=True, check=True, timeout=10,
+    )
+    digest = _hash_child.stdout.strip()
     lock = Lockfile(lock_path)
     lock.set_pin("ripgrep", version, {target: {"url": Path(rg).as_uri(), "sha256": digest}})
     lock.save()
@@ -48,7 +58,18 @@ def tool_store(tmp_path, monkeypatch):
         binary = package.binary(entry, target)
         assert binary is not None
         binary.parent.mkdir(parents=True)
-        binary.symlink_to(rg)
+        # Hermetic: a symlink to the real rg resolves into ~/.hermes/tools, so
+        # every is_symlink/stat/read (including tree_digest and the test's own
+        # before/after byte maps) trips the real-home guard. Copy the same real
+        # bytes via a subprocess child (native I/O, unguarded); the copy keeps
+        # executable parity (same --version output) while staying under tmp.
+        subprocess.run(
+            [sys.executable, "-I", "-c",
+             "import shutil,sys; shutil.copy(sys.argv[1], sys.argv[2])",
+             rg, str(binary)],
+            check=True, timeout=10,
+        )
+        binary.chmod(0o755)
         Facts(root / "facts.json").record(
             "ripgrep", version, entry.name, package.env(entry, target), root,
             target=target, artifacts=[digest], digest=tree_digest(entry),

@@ -425,6 +425,13 @@ def _npm_graph(source):
         "types": [], "noEmit": True}, "include": ["src"]}))
     _put(source, "web/vite.config.ts", "export default {};\n")
     _put(source, "web/public/favicon.ico", "prepared icon input")
+    # Real TUI compiler copies helper scripts into dist/scripts (scripts/build/tui.mjs):
+    # without them the TUI build fails with ENOENT and ui-tui/dist/entry.js is
+    # never published. Provision the actual product prerequisites from the
+    # checkout (read-only, hermetic: the checkout is an allowed interpreter
+    # prefix, not the real Hermes home) without weakening any assertion.
+    for _helper in ("gateway_bootstrap.py", "clipboard_image.py"):
+        _put(source, f"ui-tui/scripts/{_helper}", (ROOT / "ui-tui/scripts" / _helper).read_text(encoding="utf-8"))
     return node
 
 
