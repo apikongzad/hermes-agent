@@ -1,87 +1,95 @@
-# Hermes standalone runtime cutover controller
+# Hermes standalone runtime cutover controller — v2
 
 Root-owned, stdlib-only orchestrator that moves the `hermes-gateway` /
 `hermes-dashboard` systemd fleet onto a staged candidate generation and
 rolls back automatically on start/health failure. No outbound sends; the
 result is a local journal receipt only.
 
+DESIGN FIRST: see `DESIGN-v2.md` (versioned threat model, invariants, state
+machine, authority, rollback/failure, exact probes). Parent REJECTED v1 for
+seven findings; v2 fixes all seven and is the only coherent design.
+
 ## Layout (facade + siblings, stdlib only)
 
 - `cutover.py` — facade: CLI (`full` / `preflight` / `stage` / `health` /
-  `rollback` / `resume`) + re-exports.
+  `rollback` / `resume`) + re-exports. Runs under
+  `/usr/bin/python3 -I -B <abs path>/cutover.py` with NO `PYTHONPATH`; it
+  inserts its own safe `sys.path[0]` via stdlib.
 - `cutover_types.py` — `Host` IO adapter, `ProductionHost`, config, paths.
-- `cutover_preflight.py` — fail-closed baseline capture.
-- `cutover_stage.py` — PM-documented staging + isolated-launch verify.
+  `Host.run(argv, cwd, env)` carries explicit isolation; `proc_*` reads
+  `/proc` stdlib-only. Selection facts are
+  `<home>/installs/<key>/facts.json` (real PM record), not `tools/facts.json`.
+- `cutover_preflight.py` — fail-closed baseline capture for BOTH units.
+- `cutover_stage.py` — PM-documented staging as `ubuntu` + real Hermes
+  launch-prep verify.
 - `cutover_dropin.py` — `zzz-candidate.conf` rendering (sorts AFTER
   `zz-runtime-3.14.9.conf`).
-- `cutover_health.py` — read-only health (SHA + `/proc/PID/exe` + 9119).
-- `cutover_restore.py` — reversible rollback in mandated order.
+- `cutover_health.py` — read-only health (BOTH exes exact + state + /api/health).
+- `cutover_restore.py` — provenance-bound reversible rollback.
 - `cutover_orchestrate.py` — `orchestrate()` / `resume()`.
 - `cutover_journal.py` — JSONL state journal (durable resume).
-- `systemd/` — root-owned units with `OnFailure` recovery.
+- `systemd/` — root-owned units with `EnvironmentFile` + `OnFailure` recovery.
+- `DESIGN-v2.md` — versioned plan (read first).
 
 The controller never imports `pm`, `hermes_cli`, or `gateway`. Root installs
-the whole `scripts/maintenance` tree to a root-owned prefix and runs it with
-`PYTHONPATH` pointed there, so `scripts.maintenance.*` resolves to
-root-owned bytes, never mutable user modules.
+the whole `scripts/maintenance` tree to `/opt/hermes-maintenance` root-owned
+and runs it with `-I` and NO `PYTHONPATH` (the facade inserts the safe prefix
+itself), so `scripts.maintenance.*` resolves to root-owned bytes, never
+mutable user modules.
 
-## Live baseline (captured by parent preflight, encoded as defaults)
+## Live baseline (verified this host, encoded as defaults)
 
-- Gateway `ExecStart=/home/ubuntu/.local/bin/hermes gateway run`,
-  dashboard `... dashboard --port 9119 --host 127.0.0.1 --no-open
-  --skip-build` (effective, via `zz-runtime-3.14.9.conf`).
+- Gateway effective `ExecStart=/home/ubuntu/.local/bin/hermes gateway run`,
+  dashboard `… dashboard --port 9119 --host 127.0.0.1 --no-open --skip-build`
+  (via `zz-runtime-3.14.9.conf`, root-only).
 - Base `ExecStop=-<oldvenv> -m gateway.systemd_stop_mark`,
   `ExecStopPost=-<oldvenv> -m gateway.cgroup_cleanup`.
 - Slice `system-hermes.slice`, `KillMode=mixed`, `TimeoutStopSec=70`,
-  `Restart=always` / `RestartSec=5s`, `User=/Group=ubuntu`.
-- Gateway `WorkingDirectory=~/.hermes`, dashboard `/home/ubuntu`,
-  both `HERMES_HOME` default (`/home/ubuntu/.hermes`).
-- Parent verifies: `systemctl cat/show` bytes, source archive bytes
-  (19527 entries), live `50e82ad783`, live `/proc/PID/exe`; any failure is
-  fail-closed. Protected root overrides are backed up at
-  `/home/ubuntu/backups/hermes-upgrade-20261025-150042/protected-state-root.tar.gz`.
+  `Restart=always` / `RestartSec=5s`, `User/Group=ubuntu`.
+- Gateway `WorkingDirectory=/home/ubuntu/.hermes`, dashboard `/home/ubuntu`,
+  both `HERMES_HOME=/home/ubuntu/.hermes`.
+- Live `/proc/PID/exe` is the shared store interpreter
+  (`…/tools/python-3.14.9+…/bin/python3.14`), NOT the venv dir; `cmdline[0]`
+  is the launcher/store python, `cwd` is the WorkingDirectory.
+- `gateway_state.json` carries `code_sha/updated_at/pid/start_time`
+  (`gateway/status.py`); `/api/health` returns `commit` (`web_routers/status.py`).
 
-## Staging (PM-documented entrypoint, isolated durable generation)
+## Staging (PM-documented entrypoint, isolated, as ubuntu)
 
-Source the exact candidate from a copied tree/archive the parent
-materializes — never `git checkout` the active live tree:
-
-```bash
-# Parent materializes the candidate copy, then stages an isolated generation:
-python3 -m pm.build_env --source /opt/candidate/hermes-agent --out /home/ubuntu/.hermes/generations/gen-<sha12>/venv
-```
-
-That CLI is the wrapper around `pm.build_environment(source, out)`
-(`pm/build_env.py`; see also `tests/AGENTS.md`). The controller runs
-exactly that argv through the injected `Host` (tests assert the argv and
-reject invented `pm.py` / `scripts/sync_venv.py` /
-`scripts/publish_launcher.py`). `pm.ensure_environment` /
-`pm.sync_venv` / `hermes pm install` /
-`hermes_cli.venv_sync.publish_launchers` are the other supported
-entrypoints; the controller does not invent new ones.
-
-Isolated-launch verify (no re-exec to the live old generation):
+Parent materializes the candidate copy — never `git checkout` the live tree.
+Root spawns the build as `ubuntu` with explicit `cwd=candidate_src`,
+absolute `/usr/bin/python3`, isolated `HOME/HERMES_HOME/HERMES_RUNTIME_DIR`,
+`env -i`, no `PYTHONPATH`:
 
 ```bash
-<generation>/venv/bin/python3 -c 'import sys; print(sys.executable); print(sys.prefix)'
-# must name the generation dir, never the live /proc/PID/exe target
+sudo runuser -u ubuntu -- env -i HOME=/home/ubuntu HERMES_HOME=/home/ubuntu/.hermes \
+  HERMES_RUNTIME_DIR=/home/ubuntu/.hermes/tools PATH=/usr/bin:/bin \
+  /usr/bin/python3 -m pm.build_env \
+  --source /opt/candidate/hermes-agent --out /home/ubuntu/.hermes/generations/gen-<sha12>/venv
 ```
 
-User config/auth/skills/plugins stay at the default home
-(`/home/ubuntu/.hermes`) for the final service; an isolated home is used
-only inside tests (injected `Host`).
+That CLI wraps `pm.build_environment(source, out)` (`pm/build_env.py`,
+`pm/operations.py:28-65`; `cwd=source` for `uv sync`). Tests assert
+`pm.build_env` + `--source` appear and reject `pm.py` /
+`scripts/sync_venv.py` / `scripts/publish_launcher.py`.
+
+Re-exec verify uses REAL Hermes launch prep (not `sys.executable`):
+
+```bash
+<generation>/venv/bin/python -I -B -c \
+  "import sys; sys.path.insert(0, '<candidate>'); import hermes_bootstrap; \
+   from hermes_cli.version_info import get_code_identity; print(...)"
+# must report sha == candidate, with isolated HOME/HERMES_HOME, cwd=candidate
+```
 
 ## Cutover dropin (sorted AFTER zz-runtime)
-
-Systemd sorts dropins lexicographically; the candidate file is named
-`zzz-candidate.conf` so it wins over `zz-runtime-3.14.9.conf`:
 
 ```ini
 # /etc/systemd/system/hermes-gateway.service.d/zzz-candidate.conf
 [Service]
 ExecStart=<generation>/venv/bin/python3 <candidate_src>/hermes_cli/main.py gateway run
 WorkingDirectory=/home/ubuntu/.hermes
-Environment="PATH=<generation>/venv/bin:/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PATH=<generation>/venv/bin:/home/ubuntu/.local/bin:/opt/node24/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="HERMES_HOME=/home/ubuntu/.hermes"
 ```
 
@@ -90,66 +98,75 @@ Environment="HERMES_HOME=/home/ubuntu/.hermes"
 [Service]
 ExecStart=<generation>/venv/bin/python3 <candidate_src>/hermes_cli/main.py dashboard --port 9119 --host 127.0.0.1 --no-open --skip-build
 WorkingDirectory=/home/ubuntu
-Environment="PATH=<generation>/venv/bin:/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PATH=<generation>/venv/bin:/home/ubuntu/.local/bin:/opt/node24/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="HERMES_HOME=/home/ubuntu/.hermes"
 ```
 
-`HERMES_EXE` never selects the interpreter (units hardcode `ExecStart`).
-Prior bytes for the candidate name are saved in the journal; rollback
-removes what was added and restores what was overwritten.
+`HERMES_EXE` never selects the interpreter. Prior bytes saved; rollback
+restores them.
 
-## Health (read-only, binds SHA + exe + 9119)
+## Health (read-only, BOTH units + state + /api/health)
 
-- `systemctl is-active` for both units.
-- `systemctl show -p MainPID`, then `readlink /proc/<pid>/exe` must name
-  the staged generation (not the live old interpreter).
-- `git -C <candidate_src> rev-parse HEAD` must equal the candidate SHA;
-  `gateway_state.json` `code_sha` (when present) must equal it too.
-- `GET http://127.0.0.1:9119/health` must be 200/302. Port is always 9119,
-  never 3000/8501. No `launcher --version` probe, no old-runtime version
-  string, no writes, no sends.
+- `is-active` both; `MainPID>0` both; PIDs differ from baseline (restart proof).
+- `/proc/PID/exe` EXACTLY equals staged `pyvenv.cfg:home/executable`
+  (resolved), NOT a substring of the generation.
+- `/proc/PID/cmdline[0]` exactly equals staged venv python.
+- `/proc/PID/cwd` exactly equals WorkingDirectory; `HERMES_HOME` in environ.
+- `gateway_state.json:code_sha` present + `==candidate` (missing fails),
+  `updated_at` fresh ≤120s, `pid==gateway MainPID`.
+- `GET http://127.0.0.1:9119/api/health` must be 200 with `commit==candidate`
+  (`/health` 302 is SPA, not health). Port always 9119. No `--version`, no sends.
 
-## Rollback (mandated order, never swallowed)
+## Rollback (provenance-bound, mandated order)
 
-`source` → `facts` → `dropins` → `daemon-reload` → `restart` → `verify`.
-Never start-before-restore; every restore error is journaled and returned
-(`failed` when the fleet is back, `unknown` when it is not) — never
-`success`, never `except: pass` / bare `except`.
+`source` → `selection-facts` → `dropins` → `daemon-reload` → `restart` → `verify`.
+Baseline must name `parent/candidate` SHAs or rollback refuses. Restores the
+REAL selection record (`installs/<key>/facts.json`). Never start-before-restore;
+every error journaled + returned (`failed` when fleet restored, `unknown`
+otherwise).
 
-## Root install / activate (parent-only, no live restart yet)
+## Root install / activate (parent-only, no live restart in this tree)
 
 ```bash
-# 1. Parent preflight (fail-closed): capture systemctl cat/show, dropin bytes,
-#    archive bytes, live PID exe. Any failure aborts before mutation.
+# 1. Parent preflight (fail-closed): systemctl cat/show, dropin bytes,
+#    live PIDs/exes, git SHAs, gateway_state.json, selection facts.
 systemctl cat hermes-gateway.service hermes-dashboard.service
-systemctl show hermes-gateway.service -p MainPID,ExecStart,WorkingDirectory,Environment
-readlink /proc/$(systemctl show hermes-gateway.service -p MainPID --value)/exe
-tar -tf /home/ubuntu/backups/hermes-upgrade-20261025-150042/protected-state-root.tar.gz | wc -l
+systemctl show hermes-gateway.service -p MainPID,ActiveEnterTimestamp,NRestarts,ExecStart
 
-# 2. Stage the candidate generation (PM builds it; controller verifies it):
-python3 -m pm.build_env --source /opt/candidate/hermes-agent --out /home/ubuntu/.hermes/generations/gen-<sha12>/venv
+# 2. Stage as ubuntu (PM builds it; controller verifies it):
+sudo runuser -u ubuntu -- env -i HOME=/home/ubuntu HERMES_HOME=/home/ubuntu/.hermes \
+  HERMES_RUNTIME_DIR=/home/ubuntu/.hermes/tools PATH=/usr/bin:/bin \
+  /usr/bin/python3 -m pm.build_env --source /opt/candidate/hermes-agent \
+  --out /home/ubuntu/.hermes/generations/gen-<sha12>/venv
 
-# 3. Install the root-owned controller (preserves scripts/maintenance layout):
-sudo mkdir -p /opt/hermes-maintenance
+# 3. Install root-owned controller + env file + units:
+sudo mkdir -p /opt/hermes-maintenance /var/lib/hermes-cutover
 sudo cp -a scripts/maintenance /opt/hermes-maintenance/scripts-maintenance-tmp
-# (parent normalises to /opt/hermes-maintenance/scripts/maintenance + root-owned systemd units)
-sudo cp systemd/hermes-runtime-cutover.service systemd/hermes-runtime-cutover-recovery.service /etc/systemd/system/
+# (parent normalises to /opt/hermes-maintenance/scripts/maintenance, root-owned)
+cat >/var/lib/hermes-cutover/cutover.env <<'EOF'
+CANDIDATE_SHA=<CAND>
+PARENT_SHA=<PARENT>
+CANDIDATE_SRC=/opt/candidate/hermes-agent
+LIVE_TREE=/home/ubuntu/hermes-agent
+GENERATION_ROOT=/home/ubuntu/.hermes/generations
+JOURNAL=/var/lib/hermes-cutover/journal.jsonl
+EOF
+sudo cp scripts/maintenance/systemd/*.service /etc/systemd/system/
 sudo systemctl daemon-reload
 
-# 4. Dry-run the orchestrator through the journal (no restart until ordered):
-sudo PYTHONPATH=/opt/hermes-maintenance /usr/bin/python3 -I -B /opt/hermes-maintenance/scripts/maintenance/cutover.py preflight \
+# 4. Dry-run (no restart until ordered) — NO PYTHONPATH under -I:
+/usr/bin/python3 -I -B /opt/hermes-maintenance/scripts/maintenance/cutover.py preflight \
   --candidate-sha <CAND> --parent-sha <PARENT> \
   --candidate-src /opt/candidate/hermes-agent --live-tree /home/ubuntu/hermes-agent \
   --generation-root /home/ubuntu/.hermes/generations --journal /var/lib/hermes-cutover/journal.jsonl
 
 # 5. Rollback (same order the controller uses automatically on failure):
-sudo PYTHONPATH=/opt/hermes-maintenance /usr/bin/python3 -I -B /opt/hermes-maintenance/scripts/maintenance/cutover.py rollback \
+/usr/bin/python3 -I -B /opt/hermes-maintenance/scripts/maintenance/cutover.py rollback \
   --candidate-sha <CAND> --parent-sha <PARENT> \
   --candidate-src /opt/candidate/hermes-agent --live-tree /home/ubuntu/hermes-agent \
   --generation-root /home/ubuntu/.hermes/generations --journal /var/lib/hermes-cutover/journal.jsonl
-# then: sudo systemctl daemon-reload && sudo systemctl restart hermes-gateway.service hermes-dashboard.service
 ```
 
 `full` performs the cutover; `resume` is the `OnFailure=` target and the
-reboot-resume entrypoint (it refuses when the journal already holds a
-terminal receipt). No live restart happens in this change.
+reboot-resume entrypoint (refuses when the journal already holds a terminal
+receipt). No live restart happens in this change.

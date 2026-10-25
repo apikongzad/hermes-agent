@@ -103,7 +103,7 @@ def orchestrate(host: Host, config: CutoverConfig) -> CutoverResult:
             host, config, baseline, "restart", (restarted.stderr or "")[-200:]
         )
 
-    report = check_health(host, config, staged)
+    report = check_health(host, config, staged, baseline)
     if not report.ok:
         return _fail_with_rollback(host, config, baseline, "health", report.detail)
 

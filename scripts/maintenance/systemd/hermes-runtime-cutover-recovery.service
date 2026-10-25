@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/home/ubuntu
+EnvironmentFile=-/var/lib/hermes-cutover/cutover.env
 ExecStart=/usr/bin/python3 -I -B /opt/hermes-maintenance/scripts/maintenance/cutover.py resume --candidate-sha ${CANDIDATE_SHA} --parent-sha ${PARENT_SHA} --candidate-src ${CANDIDATE_SRC} --live-tree ${LIVE_TREE} --generation-root ${GENERATION_ROOT} --journal ${JOURNAL} --hermes-home /home/ubuntu/.hermes
 TimeoutStartSec=1800
 TimeoutStopSec=180

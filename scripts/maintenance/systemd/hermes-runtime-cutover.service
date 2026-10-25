@@ -7,9 +7,12 @@ StartLimitIntervalSec=0
 [Service]
 Type=oneshot
 # Root-owned copy: /opt/hermes-maintenance/scripts/maintenance/cutover.py
-# (copied from the candidate tree; PYTHONPATH points at the root-owned prefix
-# so no mutable user module is imported).
+# (copied from the candidate tree; no PYTHONPATH under -I: the facade inserts
+# /opt/hermes-maintenance at sys.path[0] itself, so no user code is imported).
+# Parent materializes /var/lib/hermes-cutover/cutover.env with
+# CANDIDATE_SHA/PARENT_SHA/CANDIDATE_SRC/LIVE_TREE/GENERATION_ROOT/JOURNAL.
 WorkingDirectory=/home/ubuntu
+EnvironmentFile=-/var/lib/hermes-cutover/cutover.env
 ExecStart=/usr/bin/python3 -I -B /opt/hermes-maintenance/scripts/maintenance/cutover.py full --candidate-sha ${CANDIDATE_SHA} --parent-sha ${PARENT_SHA} --candidate-src ${CANDIDATE_SRC} --live-tree ${LIVE_TREE} --generation-root ${GENERATION_ROOT} --journal ${JOURNAL} --hermes-home /home/ubuntu/.hermes
 TimeoutStartSec=1800
 TimeoutStopSec=180
