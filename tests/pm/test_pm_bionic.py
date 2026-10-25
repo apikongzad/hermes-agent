@@ -51,13 +51,32 @@ def _assert_pinned_bionic_row(lock, pkg, url_suffix_re):
     assert cls.fetch_url(m.group("ver"), "linux-arm64-bionic") == row["url"]
 
 
-def test_python_bionic_row_matches_supplier(lock):
-    """The Python package definition and lock must agree on the termux-main artifact."""
-    _assert_pinned_bionic_row(lock, "python", r"/p/python/python_(?P<ver>[0-9.]+(?:-[0-9]+)?)_aarch64\.deb$")
+def test_python_bionic_row_matches_supplier(lock, monkeypatch):
+    """The Python bionic row pins whatever the Termux pool serves (it lags standalone)."""
+    import re as _re
+
+    from pm import termux_libs
+    from pm.registry import get_package
+
+    row = lock["packages"]["python"]["artifacts"].get("linux-arm64-bionic")
+    assert row, "python has no linux-arm64-bionic artifact"
+    assert row["url"].startswith("https://")
+    m = _re.search(r"/p/python/python_(?P<ver>[0-9.]+(?:-[0-9]+)?)_aarch64\.deb$", row["url"])
+    assert m, f"python bionic url shape: {row['url']}"
+    assert _re.fullmatch(r"[0-9a-f]{64}", row["sha256"])
+    # Hermetic: the pool index is the supplier authority, not the network.
+    pool_url = row["url"]
+    monkeypatch.setattr(
+        termux_libs, "index", lambda: {"python": termux_libs.PoolPackage("python", m.group("ver"), pool_url, row["sha256"])}
+    )
+    assert get_package("python").fetch_url("3.14.9+20261021", "linux-arm64-bionic") == pool_url
+    assert get_package("python").fetch_url(m.group("ver"), "linux-arm64-bionic") == pool_url
+
+
 def test_node_bionic_row_matches_supplier(lock):
     """The node bionic row is an explicit pin of the termux-main nodejs .deb;
-    the row and Nodejs.fetch_url(bionic arm) must agree."""
-    _assert_pinned_bionic_row(lock, "node", r"nodejs_(?P<ver>[0-9.]+)-1_aarch64\.deb$")
+    the row and Nodejs.fetch_url(bionic arm) must agree (no Debian -1 revision)."""
+    _assert_pinned_bionic_row(lock, "node", r"nodejs_(?P<ver>[0-9.]+)_aarch64\.deb$")
 def test_termux_docker_row_pins_digest(lock):
     row = lock["packages"]["termux-docker"]["artifacts"]["linux-arm64-bionic"]
     version = lock["packages"]["termux-docker"]["version"]
@@ -66,13 +85,52 @@ def test_termux_docker_row_pins_digest(lock):
     assert row["url"] == f"docker://termux/termux-docker@{version}"
 
 
-def test_python_bionic_pin_is_independent_of_desktop_build_version(lock):
+def test_python_bionic_pin_is_independent_of_desktop_build_version(lock, monkeypatch):
+    from pm import termux_libs
     from pm.registry import get_package
 
     py = get_package("python")
     package = lock["packages"]["python"]
-    assert py.fetch_url(package["version"], "linux-arm64-bionic") == package["artifacts"]["linux-arm64-bionic"]["url"]
+    row = package["artifacts"]["linux-arm64-bionic"]
+    monkeypatch.setattr(
+        termux_libs, "index", lambda: {"python": termux_libs.PoolPackage("python", "3.14.8", row["url"], row["sha256"])}
+    )
+    assert py.fetch_url(package["version"], "linux-arm64-bionic") == row["url"]
     assert py.deb_package == "python"
+
+
+def test_retired_bionic_urls_are_not_requested(monkeypatch):
+    """The pinner must not request the retired 404 pool filenames.
+
+    Node dropped the Debian -1 revision (nodejs_26.12.1, not -1); python
+    3.14.6-1 retired and the pool serves 3.14.8. Both retired names 404.
+    """
+    from pm import termux_libs
+    from pm.package import InstallError
+    from pm.registry import get_package
+
+    node_url = get_package("node").fetch_url("26.12.1", "linux-arm64-bionic")
+    assert node_url == "https://packages.termux.dev/apt/termux-main/pool/main/n/nodejs/nodejs_26.12.1_aarch64.deb"
+    assert node_url not in (
+        "https://packages.termux.dev/apt/termux-main/pool/main/n/nodejs/nodejs_26.12.1-1_aarch64.deb",
+        "https://packages.termux.dev/apt/termux-main/pool/main/n/nodejs/nodejs_26.7.0-1_aarch64.deb",
+        "https://packages.termux.dev/apt/termux-main/pool/main/n/nodejs/nodejs_26.4.0-1_aarch64.deb",
+    )
+    assert "-1_aarch64.deb" not in node_url
+
+    live_python = "https://packages.termux.dev/apt/termux-main/pool/main/p/python/python_3.14.8_aarch64.deb"
+    monkeypatch.setattr(
+        termux_libs, "index", lambda: {"python": termux_libs.PoolPackage("python", "3.14.8", live_python, "5" * 64)}
+    )
+    python_url = get_package("python").fetch_url("3.14.9+20261021", "linux-arm64-bionic")
+    assert python_url == live_python
+    assert python_url != get_package("python")._RETIRED_BIONIC_URL
+    assert "python_3.14.6-1_aarch64.deb" not in python_url
+
+    # Failing closed: no python in the pool is an explicit error, never a 404 URL.
+    monkeypatch.setattr(termux_libs, "index", dict)
+    with pytest.raises(InstallError, match="no python archive"):
+        get_package("python").fetch_url("3.14.9+20261021", "linux-arm64-bionic")
 
 
 def test_uv_bionic_row_matches_supplier(lock):

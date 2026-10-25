@@ -956,12 +956,16 @@ def restore_interrupted_pull(project_root: Path | None = None, *, after_failure:
     conflicted path or, on git < 2.38, to a path both sides of a custom-branch merge changed.
     """
     try:
-        root = _project_root() if project_root is None else project_root
+        root = _project_root() if project_root is None else Path(project_root).resolve()
+        # Pytest owns the live checkout: return before ANY filesystem probe so the
+        # suite's real-home I/O guard never sees the worktree gitdir (which lives
+        # under the real home even when the checkout itself does not). Matches
+        # recover_if_needed's pre-I/O ownership check.
+        if _pytest_owns_live_checkout(root):
+            return False
         marker = interrupted_pull_marker(root)
         if not marker.is_file() and not (Path(root) / ZIP_SWAP_JOURNAL).is_file():
             return False  # fast path: nothing to repair, no lock taken
-        if _pytest_owns_live_checkout(root):
-            return False
         # A live `hermes update` (or its build/completion/git, after its updater died) owns the
         # checkout: its own transaction settles the tree, and repairing under it races its git.
         busy_note = "⚠ Not repairing the checkout now: {}. Launch again once it finishes."
@@ -1356,7 +1360,12 @@ def _pytest_owns_live_checkout(root: Path) -> bool:
 
     Copied installations in tmp_path remain eligible for real recovery tests.
     """
-    return "PYTEST_CURRENT_TEST" in os.environ and root == Path(__file__).resolve().parent.parent
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        return False
+    try:
+        return Path(root).resolve() == Path(__file__).resolve().parent.parent
+    except OSError:
+        return False
 
 
 def _missing_environment(root: Path) -> bool:

@@ -154,6 +154,28 @@ def test_metadata_query_never_waits_on_source_completion(tmp_path, monkeypatch, 
     assert venv_sync.prepare_launch(root, argv) is None
 
 
+def test_version_probe_returns_without_reexec(tmp_path, monkeypatch):
+    """A --version probe is not service-health proof: it must not re-exec.
+
+    Even with stale dependencies and a different store interpreter (the exact
+    state that makes a normal launch return a re-exec path), a metadata flag
+    returns None without touching PM, launchers, or the sync.
+    """
+    import pm
+    from hermes_cli import _launchers, venv_sync as _vs
+
+    root = _self_checkout(tmp_path, monkeypatch)
+    monkeypatch.setattr(pm, "venv_is_current", lambda **kw: False)
+    monkeypatch.setattr(
+        _launchers, "resolve_store_python", lambda *_a, **_k: pytest.fail("version probe resolved store python")
+    )
+    monkeypatch.setattr(
+        _vs, "publish_launchers", lambda *_a, **_k: pytest.fail("version probe published launchers")
+    )
+    monkeypatch.setattr(pm, "sync_venv", lambda *_a, **_k: pytest.fail("version probe synced venv"))
+    assert venv_sync.prepare_launch(root, ["--version"]) is None
+
+
 def test_failed_completion_tail_is_retried_without_rebuilding_dependencies(tmp_path, monkeypatch, completion_tail):
     """Dependencies committed, tail failed: the next launch owes the tail only."""
     import pm

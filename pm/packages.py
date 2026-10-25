@@ -238,11 +238,15 @@ class Python(_BionicDebArm, BinaryPackage, DebPackage):
         return self.main_bin_rel
 
     # termux-main (official termux repo) python deb. It lags python-build-
-    # standalone by one patch (3.14.6-1 vs 3.14.7), so the bionic row is a
-    # manual pin -- never derived from the node version, and pm update leaves
-    # it alone (no bionic resolver).
+    # standalone (pool serves 3.14.8 while standalone pins 3.14.9), so the
+    # bionic row is never derived from the lock version, and pm update leaves
+    # it alone (no bionic version resolver). fetch_url resolves the pool's
+    # current archive via the Termux Packages index, failing closed when the
+    # pool carries no python.
+    # RETIRED 2026-10-25: python_3.14.6-1_aarch64.deb 404s; the pool serves
+    # python_3.14.8_aarch64.deb (no Debian revision).
     deb_package = "python"
-    _BIONIC_URL = (
+    _RETIRED_BIONIC_URL = (
         "https://packages.termux.dev/apt/termux-main/pool/main/p/python/"
         "python_3.14.6-1_aarch64.deb"
     )
@@ -262,9 +266,36 @@ class Python(_BionicDebArm, BinaryPackage, DebPackage):
         if target == "win32-arm64":
             (staged / "vcruntime140_1.dll").unlink(missing_ok=True)
 
+    def _bionic_url(self) -> str:
+        """The Termux pool's current python archive, never the lock version.
+
+        The bionic supplier (termux-main) lags python-build-standalone by
+        design, so deriving the .deb filename from the standalone version
+        (e.g. pretending bionic is 3.14.9) would 404. Resolve what the pool
+        actually serves instead; fail closed when it serves no python.
+        """
+        from pm import termux_libs
+
+        try:
+            pool = termux_libs.index()
+        except Exception as exc:
+            raise InstallError(
+                self.name,
+                f"cannot resolve the Termux python archive: {exc}",
+                "retry when the Termux pool index is reachable",
+            ) from exc
+        entry = pool.get("python")
+        if entry is None:
+            raise InstallError(
+                self.name,
+                "the Termux pool carries no python archive",
+                "retry when the pool publishes python again",
+            )
+        return entry.url
+
     def fetch_url(self, version: str, target: str) -> str:
         if target == "linux-arm64-bionic":
-            return self._BIONIC_URL
+            return self._bionic_url()
         # lock version is "<python>+<release tag>", e.g. "3.14.7+20260901"
         pyver, _, tag = version.partition("+")
         if not tag:
@@ -510,8 +541,12 @@ class Nodejs(_BionicDebArm, BinaryPackage, DebPackage):
 
     def fetch_url(self, version: str, target: str) -> str:
         if target == "linux-arm64-bionic":
-            # termux's deb carries a -1 revision after the upstream version
-            return f"https://packages.termux.dev/apt/termux-main/pool/main/n/nodejs/nodejs_{version}-1_aarch64.deb"
+            # The pool dropped the Debian -1 revision: it serves
+            # nodejs_26.12.1_aarch64.deb, not nodejs_26.12.1-1_aarch64.deb
+            # (both the retired -1 names and the locked 26.4.0-1 row 404).
+            # Version-derived, so a pool lag 404s at hash time and fails
+            # closed without writing.
+            return f"https://packages.termux.dev/apt/termux-main/pool/main/n/nodejs/nodejs_{version}_aarch64.deb"
         plat = _NODE_PLAT[target]
         ext = "zip" if target.startswith("win32") else "tar.xz"
         base = (
