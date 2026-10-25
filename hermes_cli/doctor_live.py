@@ -59,7 +59,8 @@ def _browser_available() -> bool:
 
 def _launch_browser_probe(timeout: float) -> tuple:
     """Launch Chromium through browser_exec's own launcher, wait for its CDP endpoint, stop it.
-    Returns (ok, detail); the probe owns the whole lifecycle and always cleans up."""
+    The launcher opens about:blank in an ephemeral owned profile; the probe owns the whole
+    lifecycle and always cleans up. Returns (ok, detail)."""
     from tools.browser_launcher import launch_chromium, stop_browser
 
     key = "doctor-live-probe"
@@ -158,7 +159,7 @@ def run_live_checks(issues: list[str]) -> list[ProbeResult]:
         timeout = float((config.get("doctor") or {}).get("live_probe_timeout", DEFAULT_PROBE_TIMEOUT))
     except (TypeError, ValueError):
         timeout = DEFAULT_PROBE_TIMEOUT
-    timeout = max(1.0, timeout)
+    timeout = max(1.0, min(timeout, 15.0))
     _section("Live Backend Probes (opt-in, real calls)")
     results: list[ProbeResult] = [
         _run_one(name, lambda n=name, spec=spec: _keyed_probe(n, *spec, timeout), issues)
@@ -183,11 +184,13 @@ def run_live_checks(issues: list[str]) -> list[ProbeResult]:
 
 def maybe_run_live_checks(args, issues: list[str]):
     """Called from ``run_doctor`` after the static checks; no-op (None) unless ``--live`` was passed.
-    A crash anywhere in the live subsystem must never break doctor."""
+    A crash anywhere in the live subsystem must never break doctor's run, but it must
+    surface as a failure verdict so --live never reports green on a total subsystem crash."""
     if not getattr(args, "live", False):
         return None
     try:
         return run_live_checks(issues)
-    except Exception as exc:  # catch-all: doctor must survive
-        check_warn("Live backend probes crashed", f"({exc})")
+    except Exception as exc:  # catch-all: doctor must survive, but record the crash as failure
+        check_fail("Live backend probes crashed", f"({exc})")
+        issues.append(f"Live backend probes crashed: {exc}")
         return None
