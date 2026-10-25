@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -18,10 +19,9 @@ from hermes_cli.doctor_live import (
     maybe_run_live_checks,
     run_live_checks,
 )
-from tools import browser_tool_install as bt_install
 
 # Captured before the autouse fixture below stubs doctor_live._browser_available
-# to a constant, so TestBrowserAvailableNpxRung can exercise the real function.
+# to a constant, so TestBrowserAvailable can exercise the real function.
 _real_browser_available = doctor_live._browser_available
 
 # The exact environment Clash Verge / mihomo exports (issue #118159): a bracketed-IPv6
@@ -95,9 +95,6 @@ class TestConfiguredOnlySelection:
             raise AssertionError("HTTP call made for unconfigured backend")
 
         monkeypatch.setattr(doctor_live, "_http_get", _no_net)
-        # Rev6: resolver inputs False -> unconfigured-skip
-        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: False)
-        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
         results = run_live_checks([])
         assert all(r.status == "skip" for r in results)
 
@@ -177,35 +174,11 @@ class TestConfiguredOnlySelection:
 
     def test_browser_probed_when_available(self, monkeypatch):
         monkeypatch.setattr(doctor_live, "_browser_available", lambda: True)
-        # Rev6 resolver: harness runnable -> browser-use selected
-        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: True)
-        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
         monkeypatch.setattr(
             doctor_live, "_launch_browser_probe",
             lambda timeout: (True, "about:blank ok"))
         results = {r.name: r for r in run_live_checks([])}
         assert results["Browser"].status == "pass"
-
-    def test_unconfigured_browser_is_optional_skip_not_broken(self, monkeypatch):
-        """Unconfigured optional backend must be skip (never fail, never enable)."""
-        monkeypatch.setattr(doctor_live, "_browser_available", lambda: False)
-        # Rev6: genuinely-none-configured -> unconfigured-skip
-        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: False)
-        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
-        called = []
-        monkeypatch.setattr(doctor_live, "_launch_browser_probe",
-                            lambda timeout: called.append(True) or (True, "must not run"))
-        issues: list[str] = []
-        results = {r.name: r for r in run_live_checks(issues)}
-        assert results["Browser"].status == "skip"
-        assert called == []
-        assert issues == []
-        # Probes never enable services: no pm.ensure/install path is touched.
-        import pm as _pm
-        monkeypatch.setattr(_pm, "ensure", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not enable services")))
-        # Re-run: still skip without touching ensure.
-        results = {r.name: r for r in run_live_checks([])}
-        assert results["Browser"].status == "skip"
 
 
 @pytest.mark.parametrize("kind", ["NO_PROXY", "no_proxy"])
@@ -237,9 +210,6 @@ def test_run_live_checks_sanitizes_clash_env_and_probes_pass(clash_env, monkeypa
     # InvalidURL under this env; _run_one's catch-all dressed it up as
     # "(Invalid port: ':1]')" — a backend-failure verdict for a healthy service.
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test")
-    # Isolate Browser to skip (off) so Firecrawl pass yields no issues; real
-    # launch oracle would otherwise FAIL without a live browser (fail-closed).
-    monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "off")
 
     # Real HTTP origin: a 200 from an actual socket proves both client construction
     # and the request reaching a reachable origin. The remote-credential probes would
@@ -286,165 +256,42 @@ def test_run_live_checks_leaves_a_clean_environment_untouched(monkeypatch):
 
 
 class TestBrowserAvailable:
-    """Live probes use the same passive selection as browser execution."""
+    """Live probes use the launcher's own Chromium selection."""
 
-    def _block_path_and_node_modules_checks(self, monkeypatch, tmp_path):
-        monkeypatch.setattr("shutil.which", lambda *a, **k: None)
-        monkeypatch.setattr("hermes_cli.doctor.HERMES_HOME", tmp_path / "home")
-        monkeypatch.setattr("hermes_cli.doctor.PROJECT_ROOT", tmp_path / "root")
+    @pytest.mark.parametrize("found,available", [("/pm/chromium/chrome", True), (None, False)])
+    def test_follows_chromium_selection(self, monkeypatch, found, available):
+        monkeypatch.setattr(doctor_live, "chromium_executable", lambda **_kw: found)
 
-    def test_true_when_installed_browser_resolves(self, monkeypatch, tmp_path):
-        self._block_path_and_node_modules_checks(monkeypatch, tmp_path)
-
-        monkeypatch.setattr(bt_install, "_find_agent_browser", lambda **_kw: "/pm/agent-browser")
-
-        assert _real_browser_available() is True
-
-    def test_false_when_nothing_resolves(self, monkeypatch, tmp_path):
-        self._block_path_and_node_modules_checks(monkeypatch, tmp_path)
-
-        def _raise(**_kw):
-            raise FileNotFoundError("agent-browser CLI not found")
-
-        monkeypatch.setattr(bt_install, "_find_agent_browser", _raise)
-        monkeypatch.setattr("tools.browser_use_cli._find_cli", lambda: None)
-
-        assert _real_browser_available() is False
-
-    def test_true_when_harness_ready_despite_missing_agent_browser(self, monkeypatch, tmp_path):
-        self._block_path_and_node_modules_checks(monkeypatch, tmp_path)
-
-        def _raise(**_kw):
-            raise FileNotFoundError("agent-browser CLI not found")
-
-        monkeypatch.setattr(bt_install, "_find_agent_browser", _raise)
-        monkeypatch.setattr("tools.browser_use_cli._find_cli", lambda: ["python", "-m", "browser_harness.run"])
-
-        assert _real_browser_available() is True
+        assert _real_browser_available() is available
 
 
-class TestBrowserBackendProbe:
-    """Configured-backend probe honors backend and does real exec, no pm.ensure."""
+class TestLaunchBrowserProbe:
+    """The probe launches through browser_exec's launcher and always stops what it started."""
 
-    def test_harness_ready_passes_without_playwright_via_real_version_exec(self, monkeypatch):
-        """Rev6 launch-only: version string alone NEVER confers PASS (must FAIL)."""
-        monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "")
-        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: True)
-        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
-        monkeypatch.setattr("tools.browser_use_cli._find_cli",
-                            lambda: ["python", "-m", "browser_harness.run"])
-        import subprocess as _sp
-        from types import SimpleNamespace as _NS
+    def _fake_launcher(self, monkeypatch, result):
+        calls = []
+        fake = ModuleType("tools.browser_launcher")
+        fake.launch_chromium = lambda key, **kw: calls.append(("launch", key, kw)) or result
+        fake.stop_browser = lambda key: calls.append(("stop", key))
+        monkeypatch.setitem(sys.modules, "tools.browser_launcher", fake)
+        return calls
 
-        def _fake_run(*a, **k):
-            # Version-only output (no about:blank, no KNOWN-DOM) must never PASS
-            return _NS(returncode=0, stdout="0.1.13\n", stderr="")
+    def test_success_stops_the_browser(self, monkeypatch):
+        calls = self._fake_launcher(monkeypatch, (SimpleNamespace(cdp_url="ws://x"), None))
 
-        monkeypatch.setattr(_sp, "run", _fake_run)
-        import builtins as _bi
-        real_import = _bi.__import__
-
-        def _no_playwright(name, *a, **k):
-            if name.startswith("playwright"):
-                raise ImportError("No module named playwright")
-            return real_import(name, *a, **k)
-
-        monkeypatch.setattr(_bi, "__import__", _no_playwright)
-        import pm as _pm
-        monkeypatch.setattr(_pm, "ensure",
-                            lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not ensure")))
         ok, detail = doctor_live._launch_browser_probe(5.0)
-        # Version-only (no real launch) must FAIL per C-ORACLE-1
-        assert ok is False
-        assert "fail-closed" in detail
 
-    def test_harness_import_alone_does_not_pass_when_version_fails(self, monkeypatch):
-        """Rev6: launch failure must fail (no version-pass)."""
-        monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "")
-        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: True)
-        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
-        monkeypatch.setattr("tools.browser_use_cli._find_cli",
-                            lambda: ["python", "-m", "browser_harness.run"])
-        import subprocess as _sp
-        from types import SimpleNamespace as _NS
-        monkeypatch.setattr(_sp, "run", lambda *a, **k: _NS(returncode=1, stdout="", stderr="boom"))
-        import sys as _sys
-        monkeypatch.setitem(_sys.modules, "browser_harness", type(_sys)("browser_harness"))
+        assert ok is True and "CDP ready" in detail
+        assert [c[0] for c in calls] == ["launch", "stop"]
+        assert calls[0][2]["timeout"] == 5.0 and calls[0][2]["ephemeral"] is True
+
+    def test_launch_error_is_reported_and_still_stopped(self, monkeypatch):
+        calls = self._fake_launcher(monkeypatch, (None, "Chromium exited: missing libnss3"))
+
         ok, detail = doctor_live._launch_browser_probe(5.0)
-        assert ok is False
-        assert "fail-closed" in detail
 
-    def test_explicit_off_honors_backend_as_not_available(self, monkeypatch):
-        monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "off")
-        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: True)
-        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: True)
-        assert doctor_live._browser_available() is False
-        assert doctor_live._probe_configured_backend(5.0) is None
-
-    def test_explicit_browser_use_never_falls_back_to_agent_browser(self, monkeypatch, tmp_path):
-        """Explicit browser-use with missing harness fails, not agent-browser."""
-        monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "browser-use")
-        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: False)
-        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: True)
-        monkeypatch.setattr("tools.browser_use_cli._find_cli", lambda: None)
-        ok, detail = doctor_live._launch_browser_probe(5.0)
-        # Must fail for the configured backend, never silently probe another.
-        assert ok is False
-        assert "browser-use" in detail
-
-    def test_missing_backend_fails_not_passes(self, monkeypatch):
-        monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "")
-        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: False)
-        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
-        import builtins as _bi
-        real_import = _bi.__import__
-
-        def _no_playwright(name, *a, **k):
-            if name.startswith("playwright"):
-                raise ImportError("No module named playwright")
-            return real_import(name, *a, **k)
-
-        monkeypatch.setattr(_bi, "__import__", _no_playwright)
-        ok, detail = doctor_live._launch_browser_probe(5.0)
-        assert ok is False
-        assert "not configured" in detail or "fail-closed" in detail
-
-    def test_agent_browser_ready_probes_binary_bounded(self, monkeypatch, tmp_path):
-        # Fake binary echoes version only (no open/eval/close) -> must FAIL (no --help PASS)
-        fake_bin = tmp_path / "agent-browser"
-        fake_bin.write_text("#!/bin/sh\necho agent-browser-1.2.3\n")
-        fake_bin.chmod(0o755)
-        fake_chromium = tmp_path / "chromium"
-        fake_chromium.write_text("x")
-        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: False)
-        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: True)
-        monkeypatch.setattr("tools.browser_tool_install._find_agent_browser", lambda **_kw: str(fake_bin))
-        monkeypatch.setattr(doctor_live, "chromium_executable", lambda: str(fake_chromium))
-        monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "agent-browser")
-        ok, detail = doctor_live._launch_browser_probe(5.0)
-        # Help/version-only (no real open/eval/close) must FAIL per C-ORACLE-1/2
-        assert ok is False
-        assert "fail-closed" in detail
-
-    def test_no_backend_no_playwright_reports_ready_state_not_bare_import(self, monkeypatch):
-        monkeypatch.setattr(doctor_live, "_browser_use_ready", lambda: False)
-        monkeypatch.setattr(doctor_live, "_agent_browser_ready", lambda: False)
-        monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "")
-        import sys as _sys
-        monkeypatch.delitem(_sys.modules, "playwright.sync_api", raising=False)
-        # Force ImportError even if playwright happens to be installed in the env.
-        import builtins as _bi
-        real_import = _bi.__import__
-
-        def _no_playwright(name, *a, **k):
-            if name.startswith("playwright"):
-                raise ImportError("No module named playwright")
-            return real_import(name, *a, **k)
-
-        monkeypatch.setattr(_bi, "__import__", _no_playwright)
-        ok, detail = doctor_live._launch_browser_probe(5.0)
-        assert ok is False
-        assert "not configured" in detail or "fail-closed" in detail
+        assert ok is False and "libnss3" in detail
+        assert [c[0] for c in calls] == ["launch", "stop"]
 
 
 class TestFailureIsolation:
@@ -511,9 +358,7 @@ class TestTimeoutHandling:
 
 class TestReadOnly:
 
-    def test_skips_never_append_issues(self, capsys, monkeypatch):
-        # Isolate Browser to skip so clean env (no keys, local audio) yields no issues.
-        monkeypatch.setattr(doctor_live, "_configured_backend_key", lambda: "off")
+    def test_skips_never_append_issues(self, capsys):
         issues: list[str] = []
         run_live_checks(issues)
         assert issues == []
