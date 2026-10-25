@@ -37,10 +37,12 @@ class TestExecutionGuidanceText:
 
 
 class TestCodingBriefTodoGating:
-    def _brief(self, valid_tool_names):
+    def _brief(self, valid_tool_names, tmp_path):
         from agent.coding_context import CODING_PROFILE, RuntimeMode
+        # Hermetic: use an isolated tmp dir, never the checkout's cwd whose
+        # git worktree metadata lives under the real home and trips the guard.
         mode = RuntimeMode(
-            profile=CODING_PROFILE, surface="cli", cwd=Path.cwd(),
+            profile=CODING_PROFILE, surface="cli", cwd=tmp_path,
         )
         prefix, _ws, _tr = mode.system_prompt_parts(
             valid_tool_names=valid_tool_names
@@ -48,16 +50,16 @@ class TestCodingBriefTodoGating:
         assert prefix, "coding profile must emit an operating brief"
         return prefix[0]
 
-    def test_todo_kept_when_tool_available(self):
-        brief = self._brief({"todo_list", "terminal", "read_file"})
+    def test_todo_kept_when_tool_available(self, tmp_path):
+        brief = self._brief({"todo_list", "terminal", "read_file"}, tmp_path)
         assert "todo_list" in brief
 
-    def test_todo_dropped_when_tool_missing(self):
-        brief = self._brief({"terminal", "read_file"})
+    def test_todo_dropped_when_tool_missing(self, tmp_path):
+        brief = self._brief({"terminal", "read_file"}, tmp_path)
         assert "todo_list" not in brief
 
-    def test_unknown_toolset_keeps_full_brief(self):
-        brief = self._brief(None)
+    def test_unknown_toolset_keeps_full_brief(self, tmp_path):
+        brief = self._brief(None, tmp_path)
         assert "todo_list" in brief
 
 

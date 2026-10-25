@@ -256,6 +256,9 @@ def test_an_open_control_directory_names_its_path_and_mode(tmp_path):
     with tempfile.TemporaryDirectory(prefix='h-owner-') as root:
         directory = Path(root) / f'hermes-gw-{_home_hash(home)}'
         directory.mkdir(mode=0o755)
+        # mkdir mode is filtered by the process umask (077 in the test runner
+        # yields 0700); the contract needs an actually-open directory.
+        directory.chmod(0o755)
         pointer = home / 'gateway.sock.path'
         pointer.write_text(str(directory / 'control.sock'), encoding='utf-8')
         pointer.chmod(0o600)

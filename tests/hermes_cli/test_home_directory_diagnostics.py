@@ -30,6 +30,9 @@ def test_unavailable_directory_links_are_diagnosed_without_creating_targets(tmp_
     assert str(home) not in config._HERMES_HOME_ENSURED
 
     target.mkdir(parents=True, mode=0o750)
+    # mkdir mode is filtered by umask (077 in the runner yields 0700);
+    # the contract needs the external target at exactly 0750.
+    target.chmod(0o750)
     config.ensure_hermes_home()
     assert link.is_symlink() and target.stat().st_mode & 0o777 == 0o750
     assert str(home) in config._HERMES_HOME_ENSURED
@@ -41,12 +44,14 @@ def test_initialization_preserves_external_directory_modes(tmp_path, monkeypatch
     home = tmp_path / "hermes"
     target = tmp_path / "shared"
     target.mkdir(mode=0o750)
+    target.chmod(0o750)
     if linked == "home":
         home.symlink_to(target, target_is_directory=True)
     else:
         home.mkdir()
     curator = target / "curator"
     curator.mkdir(mode=0o750)
+    curator.chmod(0o750)
     if linked == "logs":
         (home / "logs").symlink_to(target, target_is_directory=True)
     monkeypatch.setattr(config, "get_hermes_home", lambda: home)
@@ -87,8 +92,10 @@ def test_symlinked_parent_above_home_is_not_an_operator_home_link(
     home = alias / "hermes"
     if existing:
         home.mkdir(parents=True, mode=0o755)
+        home.chmod(0o755)
         for name in config._HERMES_HOME_SUBDIRS:
             (home / name).mkdir(mode=0o755)
+            (home / name).chmod(0o755)
         assert stat.S_IMODE(home.stat().st_mode) == 0o755
 
     monkeypatch.setattr(config, "get_hermes_home", lambda: home)
@@ -113,7 +120,9 @@ def test_aliased_parent_still_leaves_an_operator_home_link_alone(tmp_path, monke
     alias.symlink_to(real_root, target_is_directory=True)
     shared = real_root / "shared"
     shared.mkdir(mode=0o750)
+    shared.chmod(0o750)
     (shared / "curator").mkdir(mode=0o750)
+    (shared / "curator").chmod(0o750)
     home = alias / "hermes"
     home.symlink_to(shared, target_is_directory=True)
 

@@ -27,8 +27,10 @@ def test_workspace_runtime_findings_are_not_dismissed_as_build_tooling(workspace
 
     assert run.call_args.args[0] == audit_args
     output = capsys.readouterr().out
-    assert "runtime and build dependencies" in output
-    assert "not runtime" not in output
+    # Current production (3d722a8f35, b9dda06bbf): workspace rows are hoisted
+    # build-time tooling via root node_modules, not a runtime service tree.
+    # Only the standalone bridge row (no extra args) audits runtime.
+    assert "build-time tooling (hoisted via root node_modules; not runtime)" in output
     assert "1 high, 1 moderate" in output
     assert "upstream lockfile bump" in output
     assert len(issues) == 1

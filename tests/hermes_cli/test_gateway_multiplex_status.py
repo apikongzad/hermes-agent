@@ -20,9 +20,11 @@ def _fake_multiplexer(monkeypatch, tmp_path, *, multiplex: bool, pid_file: bool 
     the identity check because its command line reads as a gateway's. ``pid_file=False`` models a
     launch-service gateway whose ``gateway.pid`` was unlinked while it kept serving."""
     import json
+    from pathlib import Path
 
     import hermes_constants
     from gateway import status
+    import hermes_cli.profiles as _profiles
 
     (tmp_path / "profiles" / "beta").mkdir(parents=True)
     # A profile dir needs an identity marker to be listed/served (bare dirs are side-effect shells).
@@ -37,6 +39,11 @@ def _fake_multiplexer(monkeypatch, tmp_path, *, multiplex: bool, pid_file: bool 
         "start_time": status._get_process_start_time(os.getpid()), "hermes_home": str(tmp_path),
     }))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "beta"))
+    # Hermetic: wrapper dir lives under the real HOME (~/.local/bin) which
+    # contains a node symlink into the real Hermes home. Point it at tmp so
+    # build_alias_map never reads the operator's bin dir.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(_profiles, "_get_wrapper_dir", lambda: tmp_path / "wrappers")
     monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None)
     monkeypatch.setattr(
         status, "_read_process_cmdline", lambda pid: "python -m hermes_cli.main gateway run --replace"

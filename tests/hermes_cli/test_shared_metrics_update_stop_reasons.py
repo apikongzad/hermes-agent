@@ -258,6 +258,12 @@ def test_an_exception_before_the_apply_names_its_exit_through_the_command_bounda
     monkeypatch.setattr(main, "_finalize_update_output", lambda state: None)
     monkeypatch.setattr(update_lock, "UpdateLock", Free)
     monkeypatch.setattr(update_cmd, "git_operation_in_progress", lambda root: None)
+    # Hermetic: release_dead_index_lock probes PROJECT_ROOT's git dir, whose
+    # worktree metadata lives under the real home. The test never reaches the
+    # apply mark, so the lock state is irrelevant.
+    import hermes_cli.gitlock as _gitlock
+
+    monkeypatch.setattr(_gitlock, "release_dead_index_lock", lambda root: False)
     monkeypatch.setattr(update_cmd._check, "clear_git_debris", lambda root: None)
     monkeypatch.setattr(update_cmd, "_resolve_update_options", lambda *_: update_cmd._UpdateOptions(
         pre_update_version=None, gw_input_fn=None, assume_yes=True, keep_stash=False,

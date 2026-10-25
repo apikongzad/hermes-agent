@@ -151,6 +151,13 @@ tidy.tidy_partial_clone_packs(Path(sys.argv[1]))
 @pytest.mark.parametrize("midx_layout", [[], ["--incremental"]])
 def test_a_refused_or_killed_erase_leaves_git_reading_and_is_finished_later(
         clone: Path, monkeypatch: pytest.MonkeyPatch, midx_layout: list) -> None:
+    # Hermetic across git versions: --incremental landed after 2.43 (this
+    # runner's git 2.43 exits 129 for it). Skip that layout where unsupported.
+    if midx_layout and "incremental" in " ".join(midx_layout):
+        probe = subprocess.run(["git", "multi-pack-index", "write", "--help"],
+                               capture_output=True, text=True, check=False)
+        if "--incremental" not in (probe.stdout + probe.stderr):
+            pytest.skip("git multi-pack-index write --incremental not supported by this git")
     pack_dir = clone / ".git" / "objects" / "pack"
     _git("multi-pack-index", "write", *midx_layout, cwd=clone)
     held, before = _objects(clone), _packs(clone)

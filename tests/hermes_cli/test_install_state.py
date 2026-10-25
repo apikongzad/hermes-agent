@@ -154,9 +154,14 @@ def test_gateway_service_definitions_name_their_homes(tmp_path, monkeypatch):
     unit.write_text(f'[Service]\nEnvironment="HERMES_HOME={home}"\n', encoding="utf-8")
     vbs = tmp_path / "Hermes_Gateway.vbs"
     vbs.write_text(f'env.Item("HERMES_HOME") = "{home}-win"\r\n', encoding="utf-8")
+    from hermes_cli import gateway_windows
     from hermes_platform.resolver import known_dirs
     monkeypatch.setattr(known_dirs, "gateway_service_definition_globs", lambda: (str(tmp_path / "*Gateway*"),
                                                                                 str(tmp_path / "*gateway*")))
+    # Hermetic: system units + scheduled-task launchers would otherwise leak
+    # the operator's real install into the set.
+    monkeypatch.setattr(known_dirs, "system_gateway_service_definition_globs", tuple)
+    monkeypatch.setattr(gateway_windows, "registered_task_launchers", list)
 
     assert set(install_state._service_homes()) == {home, Path(f"{home}-win")}
 

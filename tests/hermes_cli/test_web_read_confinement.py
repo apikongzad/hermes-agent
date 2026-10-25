@@ -61,7 +61,9 @@ def test_git_reads_filter_credentials_without_losing_safe_diffs(
     archive.mkdir()
     (archive / "auth.json").write_text("PRIVATE_EXAMPLE=archived\n", encoding="utf-8")
     (root / "safe.txt").write_text("old\n", encoding="utf-8")
-    git("add", "-A")
+    # Hermetic: a developer global gitignore often excludes .env/auth.json;
+    # force-add so the fixture tracks the credential files it intends to.
+    git("add", "-f", "-A")
     git("commit", "-qm", "initial")
     (archive / "auth.json").unlink()
     archive.rmdir()
@@ -69,12 +71,14 @@ def test_git_reads_filter_credentials_without_losing_safe_diffs(
     if change == "deleted":
         secret.unlink()
     elif change == "renamed":
-        git("mv", ".env", "auth.json")
+        # git mv fails when the source was ignored by a global excludesFile;
+        # a filesystem rename + force-add stages the same rename.
+        secret.rename(root / "auth.json")
         (root / "auth.json").write_text("PRIVATE_EXAMPLE=new\n", encoding="utf-8")
     else:
         secret.write_text("PRIVATE_EXAMPLE=new\n", encoding="utf-8")
     if change != "unstaged":
-        git("add", "-A")
+        git("add", "-f", "-A")
     if locked:
         monkeypatch.setenv("HERMES_DASHBOARD_FILES_ROOT", str(root))
     else:
