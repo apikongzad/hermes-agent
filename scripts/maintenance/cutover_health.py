@@ -167,47 +167,16 @@ def _check_unit_exe(
     return None
 
 
-def check_health(host: Host, config: CutoverConfig, staged: Staged, baseline: Baseline | None = None) -> HealthReport:
-    """Verify the running fleet is the staged candidate. Read-only (no sends)."""
-    if config.dashboard_port != 9119:
-        return HealthReport(False, "dashboard port must be 9119")
-    if not _is_active(host, config.gateway_unit):
-        return HealthReport(False, f"{config.gateway_unit} is not active")
-    if not _is_active(host, config.dashboard_unit):
-        return HealthReport(False, f"{config.dashboard_unit} is not active")
-
-    gw_show = _show(host, config.gateway_unit)
-    dash_show = _show(host, config.dashboard_unit)
-    gw_pid = _main_pid(gw_show)
-    dash_pid = _main_pid(dash_show)
-    if gw_pid <= 0:
-        return HealthReport(False, "gateway MainPID unknown")
-    if dash_pid <= 0:
-        return HealthReport(False, "dashboard MainPID unknown")
-
-    # Restart proof: PIDs must differ from baseline when a baseline is given.
+def _pids_changed(baseline: Baseline | None, gw_pid: int, dash_pid: int) -> HealthReport | None:
     if baseline is not None and baseline.live_main_pid:
         if gw_pid == baseline.live_main_pid:
             return HealthReport(False, "gateway PID unchanged after restart")
         if dash_pid == baseline.dashboard_main_pid:
             return HealthReport(False, "dashboard PID unchanged after restart")
+    return None
 
-    err = _check_unit_exe(
-        host, gw_pid, staged, str(config.hermes_home), str(config.hermes_home), "gateway"
-    )
-    if err:
-        return HealthReport(False, err)
-    err = _check_unit_exe(
-        host, dash_pid, staged, "/home/ubuntu", str(config.hermes_home), "dashboard"
-    )
-    if err:
-        return HealthReport(False, err)
 
-    head = host.run(["git", "-C", str(config.candidate_src), "rev-parse", "HEAD"], timeout=30)
-    candidate_head = (head.stdout or "").strip()
-    if head.returncode != 0 or candidate_head != config.candidate_sha:
-        return HealthReport(False, "candidate tree HEAD does not match candidate SHA")
-
+def _check_state_bind(host: Host, config: CutoverConfig, gw_pid: int) -> HealthReport | None:
     try:
         state_raw = host.read_bytes(gateway_state_path_for(config.hermes_home))
     except OSError as exc:
@@ -221,7 +190,10 @@ def check_health(host: Host, config: CutoverConfig, staged: Staged, baseline: Ba
         return HealthReport(False, "gateway_state.json updated_at stale/missing")
     if state_pid != gw_pid:
         return HealthReport(False, f"gateway_state pid {state_pid} != MainPID {gw_pid}")
+    return None
 
+
+def _check_dashboard_commit(host: Host, config: CutoverConfig) -> HealthReport | None:
     url = f"http://127.0.0.1:{config.dashboard_port}/api/health"
     try:
         status, body = host.http_get(url, timeout=10)
@@ -236,6 +208,41 @@ def check_health(host: Host, config: CutoverConfig, staged: Staged, baseline: Ba
         return HealthReport(False, "dashboard /api/health body is not JSON")
     if commit != config.candidate_sha:
         return HealthReport(False, f"dashboard commit {commit[:12]} != candidate")
+    return None
+
+
+def check_health(host: Host, config: CutoverConfig, staged: Staged, baseline: Baseline | None = None) -> HealthReport:
+    """Verify the running fleet is the staged candidate. Read-only (no sends)."""
+    if config.dashboard_port != 9119:
+        return HealthReport(False, "dashboard port must be 9119")
+    if not _is_active(host, config.gateway_unit):
+        return HealthReport(False, f"{config.gateway_unit} is not active")
+    if not _is_active(host, config.dashboard_unit):
+        return HealthReport(False, f"{config.dashboard_unit} is not active")
+
+    gw_pid = _main_pid(_show(host, config.gateway_unit))
+    dash_pid = _main_pid(_show(host, config.dashboard_unit))
+    if gw_pid <= 0:
+        return HealthReport(False, "gateway MainPID unknown")
+    if dash_pid <= 0:
+        return HealthReport(False, "dashboard MainPID unknown")
+
+    if (report := _pids_changed(baseline, gw_pid, dash_pid)) is not None:
+        return report
+
+    if (err := _check_unit_exe(host, gw_pid, staged, str(config.hermes_home), str(config.hermes_home), "gateway")) is not None:
+        return HealthReport(False, err)
+    if (err := _check_unit_exe(host, dash_pid, staged, "/home/ubuntu", str(config.hermes_home), "dashboard")) is not None:
+        return HealthReport(False, err)
+
+    head = host.run(["git", "-C", str(config.candidate_src), "rev-parse", "HEAD"], timeout=30)
+    if head.returncode != 0 or (head.stdout or "").strip() != config.candidate_sha:
+        return HealthReport(False, "candidate tree HEAD does not match candidate SHA")
+
+    if (report := _check_state_bind(host, config, gw_pid)) is not None:
+        return report
+    if (report := _check_dashboard_commit(host, config)) is not None:
+        return report
 
     append(
         host,
