@@ -101,7 +101,7 @@ def other_pid():
 
 
 def _refusal_cause(marker, partner_pid, lock) -> str:
-    """Capture why an adoption refused: holder, liveness, identity, handoff."""
+    """Capture why an adoption refused: holder, liveness, identity, handoff, runtime host."""
     from hermes_cli import update_lock as _ul
     from hermes_cli._early_recovery import _pid_is_running
 
@@ -126,9 +126,13 @@ def _refusal_cause(marker, partner_pid, lock) -> str:
         ct = process_create_time(partner_pid)
     except Exception as exc:
         ct = f"<unreadable: {exc!r}>"
+    try:
+        rhb = _ul._runtime_host_below(partner_pid)
+    except Exception as exc:
+        rhb = f"<unreadable: {exc!r}>"
     return (
         f"holder={lock.holder!r} partners={partners!r} is_partner={is_partner!r} "
-        f"handoff={handoff!r} pid_alive={alive!r} ct={ct!r} partner={partner_pid}"
+        f"handoff={handoff!r} pid_alive={alive!r} ct={ct!r} rhb={rhb!r} partner={partner_pid}"
     )
 
 
@@ -330,15 +334,23 @@ def test_v2_marker_whose_pid_was_reused_is_reclaimed(marker, other_pid):
     assert int(marker.read_text(encoding="utf-8-sig").splitlines()[0]) == os.getpid()
 
 
-def test_delegate_keeps_the_claim_live_after_the_partner_dies(marker, monkeypatch, other_pid):
+def test_delegate_keeps_the_claim_live_after_the_partner_dies(marker, monkeypatch):
     """Rule 6: `hermes update` adopting a hand-off claim names itself on line 4, restores
-    lines 1-3 byte-identical on exit, and is what keeps the claim visible if the partner dies."""
-    _claim_v2(marker, other_pid)
+    lines 1-3 byte-identical on exit, and is what keeps the claim visible if the partner dies.
+
+    The holder is our real parent (legitimate orchestrator): env handoff alone for a
+    non-parent must not be assumed to authorize adoption when a runtime host sits
+    above (then production correctly refuses via _runtime_host_below). Using ppid
+    makes the relationship legitimate and deterministic under fullsuite load.
+    """
+    parent_pid = os.getppid()
+    assert process_create_time(parent_pid) is not None, "parent must be live with readable ct"
+    _claim_v2(marker, parent_pid)
     base = marker.read_bytes()
-    monkeypatch.setenv(HANDOFF_PID_ENV, str(other_pid))
+    monkeypatch.setenv(HANDOFF_PID_ENV, str(parent_pid))
 
     lock = UpdateLock(path=marker)
-    assert lock.acquire() is True and lock.acquired is False, _refusal_cause(marker, other_pid, lock)
+    assert lock.acquire() is True and lock.acquired is False, _refusal_cause(marker, parent_pid, lock)
     lines = marker.read_text(encoding="utf-8-sig").splitlines()
     assert marker.read_bytes().startswith(base) and lines[3].startswith(f"delegate:{os.getpid()} ct:")
 
@@ -700,18 +712,21 @@ class TestHandoffFromOrchestratingUpdater:
     HANDOFF_PID_ENV; a live holder matching it is our own orchestrator.
     """
 
-    def test_child_runs_under_the_parents_live_claim(self, marker, monkeypatch, other_pid):
-        # other_pid stands in for the live parent updater.
-        _claim(marker, other_pid)
-        monkeypatch.setenv(HANDOFF_PID_ENV, str(other_pid))
+    def test_child_runs_under_the_parents_live_claim(self, marker, monkeypatch):
+        # The holder is our real parent: legitimate orchestrator relationship.
+        # A fake non-parent handoff (sleeper + env) must not be assumed to authorize
+        # when a runtime host sits above — production refuses via _runtime_host_below.
+        parent_pid = os.getppid()
+        _claim(marker, parent_pid)
+        monkeypatch.setenv(HANDOFF_PID_ENV, str(parent_pid))
 
         lock = UpdateLock(path=marker)
-        assert lock.acquire() is True, _refusal_cause(marker, other_pid, lock)
+        assert lock.acquire() is True, _refusal_cause(marker, parent_pid, lock)
         assert lock.acquired is False, "the parent's claim is not ours to own"
 
         lock.release()
         assert marker.exists(), "the parent still needs its marker after our stage ends"
-        assert int(marker.read_text(encoding="utf-8-sig").splitlines()[0]) == other_pid
+        assert int(marker.read_text(encoding="utf-8-sig").splitlines()[0]) == parent_pid
 
     def test_handoff_pid_that_is_not_the_live_holder_grants_nothing(
         self, marker, monkeypatch, other_pid
@@ -745,6 +760,74 @@ class TestHandoffFromOrchestratingUpdater:
         assert lock.acquire() is True
         assert lock.acquired is True
         assert int(marker.read_text(encoding="utf-8-sig").splitlines()[0]) == os.getpid()
+
+    def test_nonparent_handoff_refuses_when_runtime_host_below(
+        self, marker, monkeypatch, other_pid
+    ):
+        """Exact gate: a live non-parent handoff with a runtime host above refuses.
+
+        Regression for fullsuite 2 failures (holder/partners/is_partner/handoff/
+        alive/ct all live, yet acquire False): the missing decision was
+        ``_runtime_host_below == True``. Production must not adopt a fake env
+        handoff when a gateway/serve/dashboard sits above; the fixture must be a
+        legitimate parent instead (see above). NOT a flake, NOT timing.
+        """
+        from hermes_cli import update_lock as _ul
+
+        _claim_v2(marker, other_pid)
+        monkeypatch.setenv(HANDOFF_PID_ENV, str(other_pid))
+        monkeypatch.setattr(_ul, "_runtime_host_below", lambda pid: True)
+
+        assert _ul._runtime_host_below(other_pid) is True
+        assert _ul.UpdateLock._is_partner(other_pid) is True
+
+        lock = UpdateLock(path=marker)
+        assert lock.acquire() is False, _refusal_cause(marker, other_pid, lock)
+        assert lock.holder is not None and lock.holder.pid == other_pid
+        assert "rhb=True" in _refusal_cause(marker, other_pid, lock)
+
+    def test_parent_holder_adopts_even_with_host_above(
+        self, marker, monkeypatch
+    ):
+        """Legitimate parent bypasses hosts above: ``_runtime_host_below`` returns
+        False immediately for a direct parent, so adoption stands even when a
+        gateway/serve/dashboard sits higher. Deterministic under fullsuite load."""
+        from hermes_cli import update_lock as _ul
+
+        parent_pid = os.getppid()
+        ct = process_create_time(parent_pid)
+        assert ct is not None
+        marker.write_text(f"{parent_pid}\n{int(time.time())}\nct:{ct:.3f}\n", encoding="utf-8")
+        monkeypatch.setenv(HANDOFF_PID_ENV, str(parent_pid))
+
+        import psutil
+
+        real_process = psutil.Process
+        me_pid = os.getpid()
+
+        class _FakeProc:
+            def __init__(self, pid, cmd, parent=None):
+                self.pid = pid
+                self._cmd = cmd
+                self._parent = parent
+
+            def cmdline(self):
+                return self._cmd
+
+            def parent(self):
+                return self._parent
+
+        host = _FakeProc(999992, [sys.executable, "-m", "hermes_cli.main", "gateway", "run"])
+        parent_fake = _FakeProc(parent_pid, ["bash", "run_tests"], parent=host)
+        me_fake = _FakeProc(me_pid, ["python", "-m", "pytest"], parent=parent_fake)
+        monkeypatch.setattr(psutil, "Process", lambda pid=None: me_fake if pid is None else real_process(pid))
+
+        assert _ul._runtime_host_below(parent_pid) is False
+        lock = UpdateLock(path=marker)
+        assert lock.acquire() is True, _refusal_cause(marker, parent_pid, lock)
+        assert lock.acquired is False
+        lock.release()
+        assert marker.exists()
 
 
 class TestAncestryHandoff:
