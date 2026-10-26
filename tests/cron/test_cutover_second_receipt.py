@@ -126,6 +126,32 @@ class FakeHost(Host):
             return v
         raise FileNotFoundError(key)
 
+    def read_bytes_nofollow(self, path: Path) -> tuple[bytes, int, int]:
+        """No-follow bound read fake: lstat identity + fd bytes (no follow)."""
+        self.timeline.append(("read", str(path)))
+        key = str(path)
+        if key in self.files:
+            v = self.files[key]
+            if isinstance(v, Exception):
+                raise v
+            assert isinstance(v, bytes)
+            if key not in self.stats:
+                raise FileNotFoundError(key)
+            st = self.stats[key]
+            if isinstance(st, Exception):
+                raise st
+            assert isinstance(st, FileStat)
+            if st.is_symlink:
+                raise OSError(f"symlink refused: {key}")
+            if not st.is_file:
+                raise OSError(f"not a regular file: {key}")
+            dev = getattr(st, "dev", None)
+            ino = getattr(st, "ino", None)
+            if not isinstance(dev, int) or not isinstance(ino, int):
+                raise OSError(f"uncertain identity for {key}")
+            return bytes(v), int(dev), int(ino)
+        raise FileNotFoundError(key)
+
     def http_get(self, url: str, timeout: int = 10):
         self.timeline.append(("http", url))
         if url in self.http:
@@ -164,7 +190,7 @@ def _seed_external_controller(host: FakeHost, controller_facade: Path) -> dict[s
 
     ctrl_dir = Path(controller_facade).parent
     digests: dict[str, str] = {}
-    for name in EXPECTED_SIBLINGS:
+    for idx, name in enumerate(EXPECTED_SIBLINGS):
         if name == "cutover.py":
             data = b"from scripts.maintenance.cutover_orchestrate import orchestrate, resume\n"
         elif name == "cutover_orchestrate.py":
@@ -172,6 +198,11 @@ def _seed_external_controller(host: FakeHost, controller_facade: Path) -> dict[s
         else:
             data = f"# {name} external stub\n".encode()
         host.files[str(ctrl_dir / name)] = data
+        # Regular-file lstat with device/inode distinct from any planted
+        # candidate file (candidate copies carry no stats / different dev).
+        host.stats[str(ctrl_dir / name)] = FileStat(
+            uid=0, gid=0, mode=0o644, is_symlink=False, is_file=True, dev=11, ino=2000 + idx
+        )
         digests[name] = _hashlib.sha256(data).hexdigest()
     return digests
 
@@ -788,7 +819,7 @@ def test_journal_preflight_ok_carries_controller_provenance(tmp_path: Path) -> N
     assert prov.get("signed") is False
     assert prov.get("root_installed") is False
     assert prov.get("trust_limit") == "user-writable-source-untrusted-no-signature"
-    assert prov.get("stat_available") is False
+    assert prov.get("stat_available") is True
     assert "signer" not in prov
     assert "signature" not in prov
     assert "trusted" not in prov
@@ -797,6 +828,10 @@ def test_journal_preflight_ok_carries_controller_provenance(tmp_path: Path) -> N
         data = host.files[str(ctrl_dir / name)]
         assert isinstance(data, bytes)
         assert prov["sibling_sha256"].get(name) == _hashlib.sha256(data).hexdigest()
+        entry = prov.get("sibling_stat", {}).get(name)
+        assert isinstance(entry, dict)
+        assert isinstance(entry.get("dev"), int)
+        assert isinstance(entry.get("ino"), int)
 
 
 def test_symlink_controller_refused(tmp_path: Path) -> None:
@@ -806,7 +841,7 @@ def test_symlink_controller_refused(tmp_path: Path) -> None:
     _seed_receipt_success(host, config)
     _seed_live_fleet(host, config, facts_missing=True)
     host.stats[str(config.controller_path)] = FileStat(
-        uid=0, gid=0, mode=0o600, is_symlink=True, is_file=True
+        uid=0, gid=0, mode=0o600, is_symlink=True, is_file=True, dev=11, ino=9999
     )
     try:
         preflight(host, config)
@@ -815,6 +850,59 @@ def test_symlink_controller_refused(tmp_path: Path) -> None:
         link_ok = False
         assert "external controller" in str(exc).lower()
     assert not link_ok
+
+
+def test_nonfacade_sibling_uncertain_stat_refuses(tmp_path: Path) -> None:
+    """Receipt path: non-facade NotImplementedError stat refuses pre-mutation."""
+    config = _make_config(tmp_path)
+    host = FakeHost()
+    _seed_receipt_success(host, config)
+    _seed_live_fleet(host, config, facts_missing=True)
+    victim = str(Path(config.controller_path).parent / "cutover_stage.py")
+    host.stats[victim] = NotImplementedError("no lstat")
+    try:
+        preflight(host, config)
+        assert False, "NotImplementedError sibling must refuse"
+    except PreflightError as exc:
+        assert "external controller" in str(exc).lower()
+    assert not any(kind == "run" for kind, _ in host.timeline)
+    assert not any(kind == "write" for kind, _ in host.timeline)
+
+
+def test_nonfacade_sibling_oserror_stat_refuses(tmp_path: Path) -> None:
+    """Receipt path: non-facade OSError stat refuses pre-mutation."""
+    config = _make_config(tmp_path)
+    host = FakeHost()
+    _seed_receipt_success(host, config)
+    _seed_live_fleet(host, config, facts_missing=True)
+    victim = str(Path(config.controller_path).parent / "cutover_journal.py")
+    host.stats[victim] = OSError("EIO")
+    try:
+        preflight(host, config)
+        assert False, "OSError sibling must refuse"
+    except PreflightError as exc:
+        assert "external controller" in str(exc).lower()
+    assert not any(kind == "run" for kind, _ in host.timeline)
+    assert not any(kind == "write" for kind, _ in host.timeline)
+
+
+def test_nonfacade_sibling_symlink_refuses(tmp_path: Path) -> None:
+    """Receipt path: non-facade symlink FileStat refuses with valid bytes."""
+    config = _make_config(tmp_path)
+    host = FakeHost()
+    _seed_receipt_success(host, config)
+    _seed_live_fleet(host, config, facts_missing=True)
+    victim = str(Path(config.controller_path).parent / "cutover_receipt.py")
+    host.stats[victim] = FileStat(
+        uid=0, gid=0, mode=0o644, is_symlink=True, is_file=True, dev=11, ino=9999
+    )
+    try:
+        preflight(host, config)
+        assert False, "symlink sibling must refuse"
+    except PreflightError as exc:
+        assert "external controller" in str(exc).lower()
+    assert not any(kind == "run" for kind, _ in host.timeline)
+    assert not any(kind == "write" for kind, _ in host.timeline)
 
 
 def test_cli_accepts_baseline_receipt_flag(tmp_path: Path) -> None:

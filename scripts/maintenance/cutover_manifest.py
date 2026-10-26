@@ -90,34 +90,220 @@ def _facade_and_dir(controller_path: Path | None) -> tuple[Path, Path]:
     return facade, ctrl_dir
 
 
-def external_controller_provenance(host, controller_path: Path | None) -> dict:
-    """Prove the EXTERNAL controller via host.read_bytes only (stdlib only).
+def _strict_sibling_identity(host, sibling: Path) -> tuple[int, int]:
+    """No-follow lstat for one sibling; fail closed on any uncertainty.
 
-    Reads every EXPECTED_SIBLINGS file beside the facade, checks the
-    orchestrator/facade content markers, and records only honest fields.
-    No signature is verified (none exists); digests are self-measured.
+    Returns (st_dev, st_ino). Refuses NotImplementedError, OSError (other
+    than FileNotFoundError which the caller maps to missing), a missing
+    stat method, a non-FileStat result, non-bool is_symlink/is_file, any
+    exception while reading identity fields, non-int dev/ino, symlinks,
+    and non-regular files. FileNotFoundError propagates for missing.
     """
-    facade, ctrl_dir = _facade_and_dir(controller_path)
-    sibling_sha256: dict[str, str] = {}
-    contents: dict[str, bytes] = {}
-    for name in EXPECTED_SIBLINGS:
-        sibling = ctrl_dir / name
+    from scripts.maintenance.cutover_types import FileStat as _FileStat
+
+    stat_fn = getattr(host, "stat_file", None)
+    if stat_fn is None or not callable(stat_fn):
+        raise ManifestError(
+            f"external controller refused: no lstat for {sibling}"
+        )
+    try:
+        st = stat_fn(sibling)
+    except FileNotFoundError:
+        raise
+    except NotImplementedError as exc:
+        raise ManifestError(
+            f"external controller refused: uncertain identity for {sibling}: {exc}"
+        ) from exc
+    except OSError as exc:
+        raise ManifestError(
+            f"external controller refused: uncertain identity for {sibling}: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise ManifestError(
+            f"external controller refused: uncertain identity for {sibling}: {exc}"
+        ) from exc
+    try:
+        if not isinstance(st, _FileStat):
+            raise ManifestError(
+                f"external controller refused: bad stat type for {sibling}"
+            )
         try:
-            data = host.read_bytes(sibling)
-        except FileNotFoundError as exc:
+            raw_link = st.is_symlink
+            raw_file = st.is_file
+        except Exception as exc:
             raise ManifestError(
-                f"external controller missing: {sibling}: {exc}"
+                f"external controller refused: bad stat for {sibling}: {exc}"
             ) from exc
-        except OSError as exc:
+        if not isinstance(raw_link, bool) or not isinstance(raw_file, bool):
             raise ManifestError(
-                f"external controller unreadable: {sibling}: {exc}"
+                f"external controller refused: bad stat fields for {sibling}"
+            )
+        try:
+            raw_dev = st.dev
+            raw_ino = st.ino
+        except Exception as exc:
+            raise ManifestError(
+                f"external controller refused: bad identity for {sibling}: {exc}"
             ) from exc
+        if not isinstance(raw_dev, int) or not isinstance(raw_ino, int):
+            raise ManifestError(
+                f"external controller refused: uncertain device/inode for {sibling}"
+            )
+        if raw_link:
+            raise ManifestError(
+                f"external controller refused: symlink at {sibling}"
+            )
+        if not raw_file:
+            raise ManifestError(
+                f"external controller refused: not a regular file at {sibling}"
+            )
+        return int(raw_dev), int(raw_ino)
+    except ManifestError:
+        raise
+    except Exception as exc:
+        raise ManifestError(
+            f"external controller refused: bad stat for {sibling}: {exc}"
+        ) from exc
+
+
+def _bound_sibling_bytes(host, sibling: Path) -> tuple[bytes, int, int]:
+    """Read one sibling via the explicit no-follow bound read only.
+
+    Never falls back to host.read_bytes. Missing method or
+    NotImplementedError fails closed. FileNotFoundError propagates for
+    missing. Other OSError fails closed as unreadable/identity failure.
+    """
+    bound = getattr(host, "read_bytes_nofollow", None)
+    if bound is None or not callable(bound):
+        raise ManifestError(
+            f"external controller refused: no no-follow bound read for {sibling}"
+        )
+    try:
+        result = bound(sibling)
+    except FileNotFoundError:
+        raise
+    except NotImplementedError as exc:
+        raise ManifestError(
+            f"external controller refused: no-follow bound read unavailable for {sibling}: {exc}"
+        ) from exc
+    except OSError as exc:
+        raise ManifestError(
+            f"external controller refused: no-follow read failed for {sibling}: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise ManifestError(
+            f"external controller refused: no-follow read failed for {sibling}: {exc}"
+        ) from exc
+    try:
+        if not isinstance(result, tuple) or len(result) != 3:
+            raise ManifestError(
+                f"external controller refused: bad bound read for {sibling}"
+            )
+        data, bdev, bino = result
         if not isinstance(data, (bytes, bytearray)):
             raise ManifestError(
                 f"external controller refused: {sibling} did not return bytes"
             )
-        raw = bytes(data)
+        if not isinstance(bdev, int) or not isinstance(bino, int):
+            raise ManifestError(
+                f"external controller refused: bad bound identity for {sibling}"
+            )
+        return bytes(data), int(bdev), int(bino)
+    except ManifestError:
+        raise
+    except Exception as exc:
+        raise ManifestError(
+            f"external controller refused: bad bound read for {sibling}: {exc}"
+        ) from exc
+
+
+def _refuse_candidate_alias(
+    host, sibling: Path, name: str, dev: int, ino: int, candidate_src: Path
+) -> None:
+    """Refuse resolved-inside-candidate and same-name hardlink aliases."""
+    try:
+        cand_res = Path(candidate_src).resolve()
+    except OSError as exc:
+        raise ManifestError(
+            f"external controller missing: cannot resolve candidate {candidate_src}: {exc}"
+        ) from exc
+    try:
+        sib_res = Path(sibling).resolve()
+    except OSError as exc:
+        raise ManifestError(
+            f"external controller refused: cannot resolve {sibling}: {exc}"
+        ) from exc
+    try:
+        inside = sib_res == cand_res or sib_res.is_relative_to(cand_res)
+    except (OSError, RuntimeError, ValueError):
+        c_str = str(cand_res)
+        f_str = str(sib_res)
+        inside = f_str == c_str or f_str.startswith(c_str.rstrip("/") + "/")
+    if inside:
+        raise ManifestError(
+            f"external controller refused: resolved path inside candidate_src: {sib_res}"
+        )
+    candidate_same = Path(candidate_src) / "scripts" / "maintenance" / name
+    stat_fn = getattr(host, "stat_file", None)
+    if stat_fn is None or not callable(stat_fn):
+        return
+    try:
+        cst = stat_fn(candidate_same)
+    except FileNotFoundError:
+        return
+    except (NotImplementedError, OSError, Exception):
+        return
+    try:
+        cdev = getattr(cst, "dev", None)
+        cino = getattr(cst, "ino", None)
+    except Exception:
+        return
+    if isinstance(cdev, int) and isinstance(cino, int):
+        if int(cdev) == int(dev) and int(cino) == int(ino):
+            raise ManifestError(
+                f"external controller refused: same device/inode as candidate {candidate_same}"
+            )
+
+
+def external_controller_provenance(
+    host, controller_path: Path | None, candidate_src: Path | None = None
+) -> dict:
+    """Prove the EXTERNAL controller via no-follow bound reads only.
+
+    Every EXPECTED_SIBLINGS name is identity-bound before its bytes are
+    accepted: no-follow lstat plus O_NOFOLLOW open/fstat/read, with
+    lstat dev/ino == fd dev/ino, regular file, never a symlink. Uncertain
+    lstat fails closed for every sibling. Candidate copies/aliases never
+    satisfy the gate. Digests bind the fd bytes; signed is always False.
+    This measurement is not a kernel-immutable generation: a same-UID
+    writer can replace an inode after preflight and before a later import.
+    """
+    facade, ctrl_dir = _facade_and_dir(controller_path)
+    sibling_sha256: dict[str, str] = {}
+    sibling_stat: dict[str, dict[str, int]] = {}
+    contents: dict[str, bytes] = {}
+    for name in EXPECTED_SIBLINGS:
+        sibling = ctrl_dir / name
+        try:
+            dev, ino = _strict_sibling_identity(host, sibling)
+        except FileNotFoundError as exc:
+            raise ManifestError(
+                f"external controller missing: {sibling}: {exc}"
+            ) from exc
+        try:
+            raw, bdev, bino = _bound_sibling_bytes(host, sibling)
+        except FileNotFoundError as exc:
+            raise ManifestError(
+                f"external controller missing: {sibling}: {exc}"
+            ) from exc
+        if int(bdev) != int(dev) or int(bino) != int(ino):
+            raise ManifestError(
+                f"external controller refused: identity changed for {sibling}"
+            )
+        if candidate_src is not None and str(candidate_src) not in ("", "."):
+            _refuse_candidate_alias(host, sibling, name, int(dev), int(ino), Path(candidate_src))
         sibling_sha256[name] = hashlib.sha256(raw).hexdigest()
+        sibling_stat[name] = {"dev": int(dev), "ino": int(ino)}
         contents[name] = raw
     orch = contents.get("cutover_orchestrate.py", b"")
     fac = contents.get("cutover.py", b"")
@@ -129,30 +315,6 @@ def external_controller_provenance(host, controller_path: Path | None) -> dict:
         raise ManifestError(
             "external controller refused: facade sibling lacks 'orchestrate'"
         )
-    stat_available = False
-    try:
-        st = host.stat_file(facade)
-    except NotImplementedError:
-        stat_available = False
-    except OSError:
-        stat_available = False
-    else:
-        stat_available = True
-        try:
-            is_link = bool(getattr(st, "is_symlink", False))
-            is_file = bool(getattr(st, "is_file", True))
-        except Exception as exc:
-            raise ManifestError(
-                f"external controller refused: bad stat for {facade}: {exc}"
-            ) from exc
-        if is_link:
-            raise ManifestError(
-                f"external controller refused: symlink at {facade}"
-            )
-        if not is_file:
-            raise ManifestError(
-                f"external controller refused: not a regular file at {facade}"
-            )
     root_installed = is_root_installed(facade)
     trust_limit = (
         "operator-install-snapshot-not-signature"
@@ -162,8 +324,9 @@ def external_controller_provenance(host, controller_path: Path | None) -> dict:
     return {
         "controller_path": str(facade),
         "sibling_sha256": dict(sibling_sha256),
+        "sibling_stat": {k: dict(v) for k, v in sibling_stat.items()},
         "root_installed": bool(root_installed),
         "signed": False,
         "trust_limit": trust_limit,
-        "stat_available": bool(stat_available),
+        "stat_available": True,
     }

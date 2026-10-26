@@ -163,22 +163,46 @@ receipts live in §8.
   have no `scripts/maintenance`. The facade resolves from
   `config.controller_path` when set, else the running maintenance module
   file (the imported `cutover_preflight.py` package sibling `cutover.py`);
-  CLI sets it to the executing `cutover.py`. A resolved facade path inside
-  `candidate_src` (equality or relative containment) is refused. Every
-  `EXPECTED_SIBLINGS` name must be readable beside the facade via
-  `host.read_bytes` only; `cutover_orchestrate.py` must contain
-  `def orchestrate` and `cutover.py` must contain `orchestrate` (candidate
-  copies are never consulted). Missing/unreadable/tampered external
-  siblings fail closed before any mutation. Provenance
-  (`controller_provenance` in the `preflight-ok` journal detail) records
-  only `controller_path`, self-measured `sibling_sha256`,
-  `root_installed` (`/opt/hermes-maintenance` only; `-next` is not a
-  recognized prefix), `signed:false` always, `trust_limit`
+  CLI sets it to the executing `cutover.py`. Identity is the executing
+  facade plus its sibling set, never `candidate_src`. Every
+  `EXPECTED_SIBLINGS` name must be identity-bound before its bytes are
+  accepted; missing remains a missing-controller refusal. The digest binds
+  the file actually opened: no-follow lstat of the final component AND
+  open with `O_NOFOLLOW` (never follow the final symlink), fstat the fd,
+  read bytes from that fd, `sha256` those bytes. Refusal unless the
+  pre-open lstat `(st_dev, st_ino)` equals the fd fstat `(st_dev, st_ino)`,
+  the object is a regular file, and it is not a symlink.
+  `ProductionHost.read_bytes` stays a following read for journals,
+  receipts, dropins and other callers; controller provenance uses only the
+  explicit no-follow bound read, and a missing method or
+  `NotImplementedError` fails closed with no fallback to `read_bytes`.
+  Uncertain lstat fails closed for every sibling including the facade:
+  `NotImplementedError`, `OSError` other than the distinct missing-file
+  error, a missing stat method, a non-`FileStat` result, non-`bool`
+  `is_symlink`/`is_file`, non-`int` device/inode, and any exception while
+  reading identity fields all refuse; success has `stat_available:true`
+  and records the measured device/inode per sibling (`sibling_stat`).
+  `FileNotFoundError` on an absent sibling is refusal, not success. No
+  candidate alias: every sibling symlink refuses even when its target is
+  outside `candidate_src`; any sibling whose resolved path is inside
+  `candidate_src` (parent-directory symlink/containment) refuses; the
+  opened sibling whose `(st_dev, st_ino)` equals the no-follow identity of
+  `candidate_src/scripts/maintenance/<same sibling name>` when that path
+  exists refuses (same-name hardlink; the whole tree is not walked and
+  differently-named hardlinks are not claimed closed). A candidate copy is
+  never accepted as a substitute when the external sibling is missing,
+  unreadable, or aliased. Provenance (`controller_provenance` in the
+  `preflight-ok` journal detail) records only `controller_path`,
+  self-measured `sibling_sha256` plus `sibling_stat`,
+  `root_installed` (`/opt/hermes-maintenance` path-prefix observation
+  only, not a trust upgrade; `-next` is not a recognized prefix),
+  `signed:false` always (no verifier), `trust_limit`
   (`user-writable-source-untrusted-no-signature` when not root-installed,
   `operator-install-snapshot-not-signature` when root-installed),
-  `stat_available` (true only when `host.stat_file` succeeds; symlink or
-  non-file refuses; `NotImplementedError`/`OSError` yields false without
-  failing the byte gate). No signature, signer, or `trusted:true` exists.
+  `stat_available:true`. No signature, signer, or `trusted:true` exists.
+  Ownership and mode are not attestation. This is not a kernel-immutable
+  generation: a same-UID writer can replace an inode after preflight and
+  before a later import (honest residual window, not race-free/atomic).
 - I3 `candidate_dropin_name > zz-runtime-3.14.9.conf` (lexicographic win).
 - I4 Staging argv is EXACTLY the documented PM entrypoint
   (`pm.build_env --source <abs candidate> --out <abs side>/venv [--python <abs>]`)

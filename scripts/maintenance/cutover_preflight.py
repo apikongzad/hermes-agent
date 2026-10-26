@@ -354,29 +354,49 @@ def _resolve_external_facade(config: CutoverConfig) -> Path:
 
 
 def _refuse_controller_inside_candidate(facade: Path, candidate_src: Path) -> None:
-    """A copy planted in the candidate must not satisfy the gate."""
-    try:
-        fac_res = Path(facade).resolve()
-    except OSError as exc:
-        raise PreflightError(
-            f"external controller missing: cannot resolve {facade}: {exc}"
-        ) from exc
+    """A copy planted in the candidate must not satisfy the gate.
+
+    Resolves the facade AND every EXPECTED_SIBLINGS path beside it. A
+    parent-directory symlink or containment for any sibling refuses. This
+    check is necessary but not sufficient: symlinks to outside and
+    same-name hardlinks are refused by the no-follow fd bind in
+    external_controller_provenance.
+    """
+    from scripts.maintenance.cutover_manifest import EXPECTED_SIBLINGS
+
     try:
         cand_res = Path(candidate_src).resolve()
     except OSError as exc:
         raise PreflightError(
             f"external controller missing: cannot resolve candidate {candidate_src}: {exc}"
         ) from exc
-    try:
-        inside = fac_res == cand_res or fac_res.is_relative_to(cand_res)
-    except (OSError, RuntimeError, ValueError):
-        c_str = str(cand_res)
-        f_str = str(fac_res)
-        inside = f_str == c_str or f_str.startswith(c_str.rstrip("/") + "/")
-    if inside:
-        raise PreflightError(
-            f"external controller refused: resolved path inside candidate_src: {fac_res}"
-        )
+    facade_path = Path(facade)
+    if facade_path.suffix != ".py":
+        ctrl_dir = facade_path
+    else:
+        ctrl_dir = facade_path.parent
+    names: list[Path] = [facade_path]
+    for _name in EXPECTED_SIBLINGS:
+        _p = ctrl_dir / _name
+        if _p not in names:
+            names.append(_p)
+    for _candidate in names:
+        try:
+            res = Path(_candidate).resolve()
+        except OSError as exc:
+            raise PreflightError(
+                f"external controller missing: cannot resolve {_candidate}: {exc}"
+            ) from exc
+        try:
+            inside = res == cand_res or res.is_relative_to(cand_res)
+        except (OSError, RuntimeError, ValueError):
+            c_str = str(cand_res)
+            f_str = str(res)
+            inside = f_str == c_str or f_str.startswith(c_str.rstrip("/") + "/")
+        if inside:
+            raise PreflightError(
+                f"external controller refused: resolved path inside candidate_src: {res}"
+            )
 
 
 def preflight(host: Host, config: CutoverConfig) -> Baseline:
@@ -393,13 +413,16 @@ def preflight(host: Host, config: CutoverConfig) -> Baseline:
         raise PreflightError("dropin name must not imply HERMES_EXE selects the interpreter")
 
     # External controller gate (never the candidate tree): stock candidates have
-    # no scripts/maintenance. Verify the executing tool's sibling set via
-    # host.read_bytes only. Missing/unreadable/tampered external siblings fail
+    # no scripts/maintenance. Verify the executing tool's sibling set via the
+    # no-follow fd bind only (never host.read_bytes, never candidate bytes).
+    # Missing/unreadable/tampered/aliased/uncertain external siblings fail
     # closed before any mutation. Candidate copies are never consulted.
     facade = _resolve_external_facade(config)
     _refuse_controller_inside_candidate(facade, Path(config.candidate_src))
     try:
-        controller_provenance = external_controller_provenance(host, facade)
+        controller_provenance = external_controller_provenance(
+            host, facade, Path(config.candidate_src)
+        )
     except ManifestError as exc:
         raise PreflightError(str(exc)) from exc
 

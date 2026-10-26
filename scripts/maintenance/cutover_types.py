@@ -36,6 +36,19 @@ class Host:
     def read_bytes(self, path: Path) -> bytes:
         raise NotImplementedError
 
+    def read_bytes_nofollow(self, path: Path) -> tuple[bytes, int, int]:
+        """No-follow bound read for controller identity only.
+
+        Must lstat the final component (no follow), open with O_NOFOLLOW,
+        fstat the fd, refuse unless lstat dev/ino == fstat dev/ino and the
+        object is a regular file (never a symlink), then read bytes from
+        that fd and return (bytes, st_dev, st_ino). Production implements
+        the O_NOFOLLOW bind; read_bytes stays a following read for journals,
+        receipts, dropins and other callers. Missing/NotImplementedError
+        must fail the controller gate closed (no fallback to read_bytes).
+        """
+        raise NotImplementedError
+
     def write_bytes(self, path: Path, data: bytes) -> None:
         raise NotImplementedError
 
@@ -182,7 +195,56 @@ class ProductionHost(Host):
             mode=int(st.st_mode),
             is_symlink=_stat.S_ISLNK(st.st_mode),
             is_file=_stat.S_ISREG(st.st_mode),
+            dev=int(st.st_dev),
+            ino=int(st.st_ino),
         )
+
+    def read_bytes_nofollow(self, path: Path) -> tuple[bytes, int, int]:
+        """Bind the digest to the fd actually opened (O_NOFOLLOW, no follow).
+
+        lstat (no follow) the final component, open with O_NOFOLLOW, fstat
+        the fd, refuse unless lstat dev/ino == fstat dev/ino and the object
+        is a regular file (never a symlink), then read bytes from that fd.
+        This is the controller-identity gate only; read_bytes stays a
+        following read for journals/receipts/dropins.
+        """
+        import errno as _errno
+        import stat as _stat
+
+        target = Path(path)
+        try:
+            lst = os.lstat(target)
+        except FileNotFoundError:
+            raise
+        except OSError:
+            raise
+        if _stat.S_ISLNK(lst.st_mode):
+            raise OSError(_errno.ELOOP, f"symlink refused: {target}")
+        if not _stat.S_ISREG(lst.st_mode):
+            raise OSError(_errno.EINVAL, f"not a regular file: {target}")
+        fd = os.open(str(target), os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            fst = os.fstat(fd)
+            if int(fst.st_dev) != int(lst.st_dev) or int(fst.st_ino) != int(
+                lst.st_ino
+            ):
+                raise OSError(_errno.EINVAL, f"identity changed: {target}")
+            if _stat.S_ISLNK(fst.st_mode):
+                raise OSError(_errno.ELOOP, f"symlink refused: {target}")
+            if not _stat.S_ISREG(fst.st_mode):
+                raise OSError(_errno.EINVAL, f"not a regular file: {target}")
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return b"".join(chunks), int(fst.st_dev), int(fst.st_ino)
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     def http_get(self, url: str, timeout: int = 10) -> tuple[int, str]:
         with urllib.request.urlopen(url, timeout=timeout) as response:
@@ -199,6 +261,8 @@ class FileStat:
     mode: int
     is_symlink: bool
     is_file: bool
+    dev: int | None = None
+    ino: int | None = None
 
 
 @dataclass(frozen=True)
