@@ -269,6 +269,18 @@ def _seed_success_host(host: FakeHost, config: CutoverConfig) -> Path:
                 return RunResult(0, json.dumps(payload), "")
             if "importlib.util" in blob and "find_spec" in blob:
                 # Staged extras anchor inventory (find_spec only, no import).
+                # Dynamic: report every requested anchor present so the test
+                # exercises the REAL anchor set the validator requests
+                # (boto3/faster_whisper/...), not a synthetic fixed subset.
+                import re as _re
+
+                _m = _re.search(r"_anchors=(\[.*?\])", blob)
+                if _m:
+                    try:
+                        _asked = json.loads(_m.group(1))
+                    except Exception:
+                        _asked = []
+                    return RunResult(0, json.dumps({str(_a): True for _a in _asked}), "")
                 return RunResult(0, json.dumps({"fastapi": True, "telegram": True, "discord": True, "slack_bolt": True, "googleapiclient": True, "mcp": True, "acp": True, "aiohttp": True, "youtube_transcript_api": True}), "")
             return RunResult(1, "", "probe must use real Hermes launch prep")
         # Candidate --help (isolated, no outbound): proves CLI + plugins load.
@@ -1335,6 +1347,125 @@ def test_stage_carries_live_selection_extras_not_core_only(tmp_path: Path) -> No
     except Exception:
         gate_real = True
     assert gate_real
+
+
+def test_verify_staged_extras_uses_real_pm_anchors_not_invented(tmp_path: Path) -> None:
+    """Validator must use the PM anchor contract, never extra.replace('-','_').
+
+    Regression for gen-134a568025ee: PM built --all-extras fine, but
+    verify_staged_extras failed on invented anchors
+    ['audio_io','bedrock','computer_use','doc_extract','stt_whisper',
+     'trace_upload','vertex','vision','wecom'].
+    Real mapping (pm/extras.py ANCHORS + sourced mcp/sms/uvloop):
+    bedrock->boto3, stt-whisper->faster_whisper, vertex->google.auth,
+    vision->PIL, wecom->defusedxml, audio-io->sounddevice+numpy,
+    doc-extract->anydoc, computer-use->mcp, trace-upload->huggingface_hub.
+    Empty/meta extras (cron/pty/nemo-relay/all/termux*) carry no anchor.
+    """
+    import json as _json
+
+    from scripts.maintenance.cutover_stage import (
+        _EXTRA_ANCHORS,
+        _NO_ANCHOR_EXTRAS,
+        extras_anchors_for,
+        verify_staged_extras,
+    )
+
+    invented = [
+        "audio_io", "bedrock", "computer_use", "doc_extract", "stt_whisper",
+        "trace_upload", "vertex", "vision", "wecom",
+    ]
+    failing_extras = [
+        "audio-io", "bedrock", "computer-use", "doc-extract", "stt-whisper",
+        "trace-upload", "vertex", "vision", "wecom",
+    ]
+    anchors = extras_anchors_for(failing_extras)
+    # Real sourced anchors must be present...
+    for real in (
+        "sounddevice", "numpy", "boto3", "mcp", "anydoc", "faster_whisper",
+        "google.auth", "PIL", "huggingface_hub", "defusedxml",
+    ):
+        assert real in anchors, f"missing real anchor {real} in {anchors}"
+    # ...and invented module names must never be requested.
+    for bogus in invented:
+        assert bogus not in anchors, f"invented anchor {bogus!r} requested"
+    # Empty/meta extras contribute no anchors (no invented `sms`/`cron`/`pty`).
+    assert extras_anchors_for(["cron", "pty", "nemo-relay"]) == []
+    assert extras_anchors_for(["all", "termux", "termux-all"]) == []
+    assert extras_anchors_for(["sms"]) == ["aiohttp"]
+    assert extras_anchors_for(["mcp"]) == ["mcp"]
+    assert extras_anchors_for(["uvloop"]) == ["uvloop"]
+    # Unknown extras fail closed instead of inventing an import.
+    try:
+        extras_anchors_for(["not-a-real-extra-xyz"])
+        unknown_ok = True
+    except Exception:
+        unknown_ok = False
+    assert not unknown_ok
+    # Contract: validator mirrors pm/extras.py ANCHORS exactly where PM names one.
+    import pm.extras as _pm_extras
+
+    def _norm(v: object) -> tuple[str, ...]:
+        return v if isinstance(v, tuple) else (v,)  # type: ignore[return-value]
+
+    for extra, anchor in _pm_extras.ANCHORS.items():
+        assert extra in _EXTRA_ANCHORS, f"validator missing PM anchor {extra!r}"
+        assert tuple(_EXTRA_ANCHORS[extra]) == _norm(anchor), (
+            f"validator anchor for {extra!r} drifted from pm/extras.py"
+        )
+    # Declared-but-unanchored in PM must be explicitly covered (no silent invent).
+    assert {"mcp", "sms", "uvloop"} <= set(_EXTRA_ANCHORS)
+    assert {"cron", "pty", "nemo-relay", "all", "termux", "termux-all"} <= set(
+        _NO_ANCHOR_EXTRAS
+    )
+    # End-to-end through the staged probe: the 9 previously-failing extras
+    # verify against a probe that reports their REAL anchors present.
+    config = _make_config(tmp_path)
+    host = FakeHost()
+    venv_python = _seed_success_host(host, config)
+    from scripts.maintenance.cutover_types import Staged as _Staged
+
+    staged = _Staged(
+        generation_dir=config.generation_root / "gen-aaaaaaaaaaaa",
+        venv_dir=config.generation_root / "gen-aaaaaaaaaaaa" / "venv",
+        venv_python=venv_python,
+        store_home=Path("/opt/store/python/bin"),
+        store_exe=Path("/opt/store/python/bin/python3.14"),
+    )
+    verify_staged_extras(host, config, staged, failing_extras, False)
+    # The probe must have been asked for real anchors (capture the request).
+    # Re-run with a capturing probe to assert the exact requested set.
+    import re as _re
+
+    captured: dict[str, list[str]] = {}
+
+    def _capture(argv: list[str]) -> RunResult:
+        blob = " ".join(argv)
+        if "find_spec" in blob:
+            m = _re.search(r"_anchors=(\[.*?\])", blob)
+            if m:
+                captured["anchors"] = sorted(_json.loads(m.group(1)))
+                return RunResult(
+                    0, _json.dumps({a: True for a in captured["anchors"]}), ""
+                )
+        return RunResult(0, "", "")
+
+    host2 = FakeHost()
+    _seed_success_host(host2, config)
+    host2.run_handlers = [
+        h for h in host2.run_handlers if str(venv_python) not in h[0]
+    ]
+    host2.on_run(str(venv_python), _capture)
+    verify_staged_extras(host2, config, staged, failing_extras, False)
+    assert captured.get("anchors") == sorted(
+        {
+            "sounddevice", "numpy", "boto3", "mcp", "anydoc",
+            "faster_whisper", "huggingface_hub", "google.auth",
+            "PIL", "defusedxml",
+        }
+    )
+    for bogus in invented:
+        assert bogus not in (captured.get("anchors") or [])
 
 
 def test_candidate_web_dist_rejects_fake_and_requires_ignored(tmp_path: Path) -> None:

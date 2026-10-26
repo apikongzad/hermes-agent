@@ -236,28 +236,89 @@ def stage(host: Host, config: CutoverConfig, baseline: Baseline | None = None) -
     )
 
 
-# Stdlib anchor copy (pm/extras.py ANCHORS subset for production extras).
-# Root stays stdlib-only: unknown extras fall back to dashes->underscores,
-# matching pm's default. find_spec only, never import (no side effects).
+# Exact mirror of pm/extras.py ANCHORS (the PM anchor contract), plus three
+# sourced additions for declared extras that ANCHORS does not name:
+#   mcp -> ("mcp",)          # pyproject [mcp] names mcp==2.3.0; same dist as
+#                            # [computer-use]'s anchor (already "mcp").
+#   sms -> ("aiohttp",)       # pyproject [sms] is exactly ["aiohttp==..."].
+#   uvloop -> ("uvloop",)     # pyproject [uvloop] names uvloop>=... .
+# Empty extras (cron/pty/nemo-relay == []) and meta bundles
+# (all/termux/termux-all == hermes-agent[...] self-refs) carry NO anchor:
+# they must never invent an import (no `sms`, no `cron`, no `pty`).
+# Root stays stdlib-only: unknown extras raise StageError (fail-closed
+# pre-mutation) instead of inventing `extra.replace("-", "_")`.
 _EXTRA_ANCHORS: dict[str, tuple[str, ...]] = {
-    "web": ("fastapi",),
-    "telegram": ("telegram",),
-    "discord": ("discord",),
-    "slack": ("slack_bolt",),
-    "messaging": ("telegram",),
-    "google": ("googleapiclient",),
-    "mcp": ("mcp",),
     "acp": ("acp",),
+    "anthropic": ("anthropic",),
+    "audio-io": ("sounddevice", "numpy"),
+    "azure-identity": ("azure.identity",),
+    "bedrock": ("boto3",),
+    "computer-use": ("mcp",),
+    "daytona": ("daytona",),
+    "ddgs": ("ddgs",),
+    "dingtalk": ("dingtalk_stream",),
+    "discord": ("discord",),
+    "doc-extract": ("anydoc",),
+    "edge-tts": ("edge_tts",),
+    "exa": ("exa_py",),
+    "fal": ("fal_client",),
+    "feishu": ("lark_oapi",),
+    "firecrawl": ("firecrawl",),
+    "google": (
+        "googleapiclient",
+        "google.auth",
+        "google_auth_oauthlib.flow",
+        "google_auth_httplib2",
+    ),
+    "google-chat": ("google.cloud.pubsub_v1",),
+    "google-meet": ("playwright.sync_api", "websockets"),
+    "kittentts": ("kittentts", "soundfile"),
+    "matrix": ("mautrix", "asyncpg", "aiosqlite", "markdown", "aiohttp_socks"),
+    "mcp": ("mcp",),
+    "messaging": ("telegram",),
+    "mistral": ("mistralai",),
+    "modal": ("modal",),
+    "neutts": ("neutts",),
+    "otlp": ("opentelemetry.sdk",),
+    "parallel-web": ("parallel",),
+    "piper": ("piper",),
+    "silk": ("pilk",),
+    "slack": ("slack_bolt",),
     "sms": ("aiohttp",),
+    "stt-whisper": ("faster_whisper",),
+    "teams": ("microsoft_teams.apps",),
+    "telegram": ("telegram",),
+    "trace-upload": ("huggingface_hub",),
+    "tts-premium": ("elevenlabs",),
+    "uvloop": ("uvloop",),
+    "vercel": ("vercel",),
+    "vertex": ("google.auth",),
+    "vision": ("PIL",),
+    "voice": ("faster_whisper",),
+    "wake": ("pyopen_wakeword",),
+    "wake-openwakeword": ("pyopen_wakeword",),
+    "wake-porcupine": ("pvporcupine",),
+    "wake-sherpa": ("sherpa_onnx",),
+    "web": ("fastapi",),
+    "wecom": ("defusedxml",),
     "youtube": ("youtube_transcript_api",),
 }
+
+# Declared extras with no importable anchor (sourced from pyproject
+# optional-dependencies): empty back-compat aliases (cron/pty/nemo-relay == [])
+# and meta bundles (all/termux/termux-all == hermes-agent[...] self-refs).
+_NO_ANCHOR_EXTRAS: frozenset[str] = frozenset(
+    {"cron", "pty", "nemo-relay", "all", "termux", "termux-all"}
+)
 
 
 def _anchors_for_extra(extra: str) -> tuple[str, ...]:
     got = _EXTRA_ANCHORS.get(extra)
     if got is not None:
         return got
-    return (extra.replace("-", "_"),)
+    if extra in _NO_ANCHOR_EXTRAS:
+        return ()
+    raise StageError(f"unknown extra {extra!r} (no anchor contract; refusing to invent)")
 
 
 def extras_anchors_for(extras: list[str]) -> list[str]:
