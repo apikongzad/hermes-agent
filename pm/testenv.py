@@ -19,8 +19,11 @@ NAME = "test-environment"
 # fal is included by default because tests/tools/test_fal_sdk.py exercises the
 # real SDK wire contract (managed FAL adapter); CI passes fal explicitly, and a
 # local default of ("all",) alone leaves the import failing locally (strict,
-# no skip guard).
-DEFAULT_TEST_EXTRAS = ("all", "fal")
+# no skip guard). keychain is included for the same reason: the vault-key
+# storage/CLI suites import keyring unconditionally (no skip guard), while the
+# [keychain] extra stays out of [all] by policy (lazy opt-in) and is only
+# present when CI passes it explicitly.
+DEFAULT_TEST_EXTRAS = ("all", "fal", "keychain")
 GROUPS = ("dev", "test")
 
 
