@@ -233,7 +233,10 @@ downgrading an invariant to an assumption.
   erofs, or squashfs). `chmod` is not immutability. The snapshot mount
   must deny writes by uid 1001 at the kernel level, including via
   same-UID rename, hardlink, and symlink tricks inside the mounted tree.
-  Owner/mode bits alone do not satisfy I1.
+  Owner/mode bits alone do not satisfy I1. A read-only bind mount of a
+  uid-1001 directory is not immutability if that directory or its backing
+  remains writable. Denial must hold through any second mount of the same
+  backing.
 - I2 — ExecStart interpreter and script/module are both inside that
   snapshot. No uid-1001 worktree path appears in ExecStart. No
   `PYTHONPATH`. No `sitecustomize` outside the snapshot. `python -I` or an
@@ -300,9 +303,11 @@ to retry.
 
 | State | Physical evidence required to claim it | Only legal next states |
 |---|---|---|
-| `observed` | Journal opened; boot id, `systemctl show` for both units, live `MainPID`/`starttime`/`exe`/`cmdline`/`cgroup`, unit/drop-in bytes + sha256 recorded; unread 0600 drop-ins still block onward movement per I8 | `snapshotted`, `stopped-unresolved` (if observation itself shows mismatch/unreadable) |
-| `snapshotted` | Kernel read-only snapshot mounted; mount flags show read-only; uid-1001 write attempt denied (see acceptance probe); snapshot byte digest recorded in root-owned location outside snapshot and outside uid-1001 trees; digest recorded as unsigned (`signed=false`) | `candidate-materialized`, `rolling-back` (abort before publish), `durable-state-unknown` (fsync/digest failure) |
-| `candidate-materialized` | Owner placeholder target SHA bound by separate review; staged bytes equal that SHA; both interpreter and entry module inside snapshot; no worktree path, no `PYTHONPATH`, sitecustomize disposition proven or blocked per I2; user-data backup completed and verified per I6 | `units-published`, `rolling-back`, `durable-state-unknown` |
+| `observed` | Journal opened; boot id, `systemctl show` for both units, live `MainPID`/`starttime`/`exe`/`cmdline`/`cgroup`, unit/drop-in bytes + sha256 recorded (record live identity and unit bytes); unread 0600 drop-ins still block onward movement per I8 — the only onward state on unread is `blocked-unread`, not `snapshotted` | `dropins-read`, `blocked-unread` (if drop-ins unread/unreadable), `stopped-unresolved` (if observation itself shows mismatch/unreadable) |
+| `dropins-read` | Root has hashed both 0600 files (gateway 0600/74 and dashboard counterpart 0600/124) recorded in journal per I8; if still unreadable, terminal `blocked-unread` | `target-bound`, `blocked-unread`, `stopped-unresolved` |
+| `target-bound` | Owner placeholder target SHA bound by separate review and recorded in journal; not `daec3cd4` and not `1c12738` by assumption | `backup-verified`, `rolling-back` (abort before publish), `stopped-unresolved` |
+| `backup-verified` | Full user-data backup completed and verified fail-closed per I6, stored separately; failure stops before publish | `candidate-materialized`, `rolling-back` (abort before publish), `stopped-unresolved` |
+| `candidate-materialized` | Bound SHA bytes equal staged bytes in a kernel read-only snapshot whose backing is not also mounted writable; a read-only bind of a still-writable uid-1001 tree fails I1; mount flags show read-only; uid-1001 write attempt denied including via any second mount of the same backing (see acceptance probe); both interpreter and entry module inside snapshot; no worktree path, no `PYTHONPATH`, sitecustomize disposition proven or blocked per I2; snapshot byte digest recorded in root-owned location outside snapshot and outside uid-1001 trees; digest recorded as unsigned (`signed=false`) | `units-published`, `rolling-back` (abort before publish), `durable-state-unknown` (fsync/digest failure) |
 | `units-published` | Exact prior unit bytes preserved; replacement `zzz-candidate.conf` bytes (in-place, no stacked drop-in per I10) written with file + directory fsync; post-write readback bytes equal intended bytes; `ExecStop`/`ExecStopPost` disposition resolved per I9 | `reloaded`, `rolling-back`, `durable-state-unknown` (any fsync error or readback mismatch) |
 | `reloaded` | `daemon-reload` completed; post-reload `systemctl show` effective `ExecStart`/`ExecStop`/`ExecStopPost`/`WorkingDirectory`/`User`/environment keys equal journaled intent | `restarted`, `rolling-back`, `durable-state-unknown` |
 | `restarted` | Restart issued once by operator; new `MainPID`/`starttime` read; `exe`/`cmdline`/`cgroup`/boot id read back per I4 | `health-verified`, `rolling-back`, `durable-state-unknown`, `stopped-unresolved` (identity unreadable) |
@@ -312,6 +317,7 @@ to retry.
 | `rolled-back` | Prior unit bytes byte-equal to pre-transaction copies; reloaded; restarted; I4 identity readback plus external health check against pre-stop identity both pass | (terminal for this transaction) |
 | `durable-state-unknown` | File or directory `fsync` raised `OSError`, or post-write readback mismatched, or crash between rename and directory fsync | `rolling-back` (only after durability re-established by root readback), `stopped-unresolved`; never direct to `committed` or `rolled-back` |
 | `stopped-unresolved` | Services left stopped because rollback identity could not be verified or identity is ambiguous; journal records last known physical bytes + identity; no further start attempted by this transaction | (terminal; requires new human-directed recovery, not silent retry) |
+| `blocked-unread` | Unread 0600 drop-ins remain unreadable; activation blocked per I8 with no unit write performed; journal records the denial | (terminal; requires new human-directed recovery, not silent retry) |
 
 Interruption rule: the next invocation reads the journal and the physical
 unit bytes and process identity (`systemctl show`, `/proc`-independent
@@ -485,8 +491,10 @@ Remaining blockers today:
 
 Explicitly unauthorized now: install, `daemon-reload`, restart, drop-in
 write, `chmod`, controller start (`/opt` or staged copies),
-`hermes update` (including `--backup --yes` and `--plan` as action),
-plugin enable/install, `state.db` migration or restore, and any merge.
+`hermes update` (including `--backup --yes`), plugin enable/install,
+`state.db` migration or restore, and any merge. A10 is a later read-only
+`hermes update --plan` probe, still UNEXECUTED, and is not authorization
+to run it now.
 
 ## 10. Acceptance matrix
 
@@ -495,7 +503,7 @@ health is claimed, no immutability is claimed.
 
 | ID | Invariant | Probe | Expected result | Status |
 |---|---|---|---|---|
-| A1 | I1 ro snapshot | As uid 1001, attempt write/rename/hardlink inside the mounted snapshot | Kernel denies; bytes unchanged | UNEXECUTED |
+| A1 | I1 ro snapshot | As uid 1001, attempt write/rename/hardlink inside the mounted snapshot and through any second mount of the same backing; a read-only bind mount of a uid-1001 directory whose backing remains writable fails I1 | Kernel denies in both mounts; bytes unchanged | UNEXECUTED |
 | A2 | I2 confinement | Inspect effective ExecStart: both interpreter and entry under snapshot mount; check env for `PYTHONPATH` and `sitecustomize` disposition; confirm `python -I` or reviewed equivalent | No worktree path; no `PYTHONPATH`; no outside `sitecustomize` or documented blocker | UNEXECUTED |
 | A3 | I3 durability | Publish path with injected file-`fsync` `OSError`; then directory-`fsync` `OSError` | State `durable-state-unknown`; no restart; no success claim | UNEXECUTED |
 | A4 | I4/I5 publish-crash | Kill operator after publish before restart; re-invoke; read journal + unit bytes + identity | Resume without second restart while ambiguous; no journal deletion | UNEXECUTED |
