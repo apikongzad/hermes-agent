@@ -62,20 +62,31 @@ def stage_argv(config: CutoverConfig) -> list[str]:
     ]
 
 
+# Trusted absolute spawn helpers (verified on this host):
+# /usr/sbin/runuser exists, /usr/bin/runuser does not; isolated staging env
+# carries PATH=/usr/bin:/bin so a bare `runuser` fails with ENOENT before any
+# live effect. Absolute paths keep the root spawn working under env -i.
+_RUNUSER = "/usr/sbin/runuser"
+_ENV = "/usr/bin/env"
+
+
 def _wrap_for_user(argv: list[str], env: dict[str, str]) -> list[str]:
     """Wrap for root-owned spawn: run as ubuntu with env -i when root.
 
     Non-root callers (tests, ubuntu dev) run the argv directly with the
-    isolated env; root inserts `runuser -u ubuntu -- env -i …` so the
-    candidate build never runs as root and never inherits root's env.
+    isolated env; root inserts `/usr/sbin/runuser -u ubuntu -- /usr/bin/env
+    -i …` so the candidate build never runs as root and never inherits
+    root's env. Absolute paths are load-bearing: the isolated env sets
+    PATH=/usr/bin:/bin (no /usr/sbin), so bare `runuser` would raise
+    FileNotFoundError before any live effect.
     """
     try:
         is_root = os.geteuid() == 0
     except AttributeError:
         is_root = False
-    env_args = ["env", "-i"] + [f"{k}={v}" for k, v in sorted(env.items())]
+    env_args = [_ENV, "-i"] + [f"{k}={v}" for k, v in sorted(env.items())]
     if is_root:
-        return ["runuser", "-u", "ubuntu", "--", *env_args, *argv]
+        return [_RUNUSER, "-u", "ubuntu", "--", *env_args, *argv]
     return [*env_args, *argv]
 
 

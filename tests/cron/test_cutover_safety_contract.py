@@ -924,6 +924,153 @@ def test_controller_boundary_no_mutable_import_and_manifest(tmp_path: Path) -> N
     assert hasattr(_facade, "save_baseline") and hasattr(_facade, "load_baseline")
 
 
+def test_stage_root_layout_uses_trusted_absolute_spawn(tmp_path: Path, monkeypatch) -> None:
+    """Root staging must exec via absolute /usr/sbin/runuser + /usr/bin/env.
+
+    Regression for the live `stage failed BEFORE live effects` transport:
+    isolated env carries PATH=/usr/bin:/bin (no /usr/sbin), so bare
+    `runuser` raises FileNotFoundError. Simulates root via euid==0 (no root
+    needed in the worker); asserts absolute argv, real host binaries, and
+    that the bare name is unresolvable under the isolated PATH while the
+    absolute env still executes. Also drives real stage() plumbing.
+    """
+    import os as _os
+    import shutil as _shutil
+
+    from scripts.maintenance import cutover_stage as _stage_mod
+    from scripts.maintenance.cutover_stage import (
+        _ENV,
+        _RUNUSER,
+        _isolated_env,
+        _wrap_for_user,
+        stage_argv,
+    )
+
+    assert _RUNUSER == "/usr/sbin/runuser"
+    assert _ENV == "/usr/bin/env"
+    # Trusted binaries verified on this host (not mocked).
+    assert _os.path.isfile(_RUNUSER) and _os.access(_RUNUSER, _os.X_OK)
+    assert _os.path.isfile(_ENV) and _os.access(_ENV, _os.X_OK)
+
+    config = _make_config(tmp_path)
+    env = _isolated_env(config)
+    assert env["PATH"] == "/usr/bin:/bin"
+    # Bare `runuser` is unresolvable under the isolated PATH: the exact
+    # pre-fix failure mode (`[Errno 2] runuser`) before any live effect.
+    assert _shutil.which("runuser", path=env["PATH"]) is None
+    assert _shutil.which("runuser", path="/usr/sbin:/usr/bin:/bin") is not None
+    # Absolute /usr/bin/env still executes under the restricted PATH (no root).
+    probed = subprocess.run(
+        [_ENV, "-i", f"PATH={env['PATH']}", "true"],
+        capture_output=True, text=True, timeout=30,
+        env={"PATH": env["PATH"]}, check=False,
+    )
+    assert probed.returncode == 0
+    # Bare `runuser` under the same restricted env raises ENOENT (no exec).
+    try:
+        subprocess.run(
+            ["runuser", "-u", "ubuntu", "--", "true"],
+            capture_output=True, text=True, timeout=30,
+            env={"PATH": env["PATH"]}, check=False,
+        )
+        bare_resolves = True
+    except FileNotFoundError:
+        bare_resolves = False
+    assert not bare_resolves
+
+    argv = stage_argv(config)
+    monkeypatch.setattr(_os, "geteuid", lambda: 0)
+    wrapped = _wrap_for_user(argv, env)
+    assert wrapped[0] == "/usr/sbin/runuser"
+    assert wrapped[1:4] == ["-u", "ubuntu", "--"]
+    assert wrapped[4] == "/usr/bin/env" and wrapped[5] == "-i"
+    assert wrapped[0] != "runuser" and "runuser" not in wrapped[1:4]
+    # Non-root path also uses the absolute env (no PATH lookup).
+    monkeypatch.setattr(_os, "geteuid", lambda: 1000)
+    plain = _wrap_for_user(argv, env)
+    assert plain[0] == "/usr/bin/env" and plain[1] == "-i"
+
+    # Real stage() plumbing under simulated root carries the absolute spawn.
+    monkeypatch.setattr(_os, "geteuid", lambda: 0)
+    host = FakeHost()
+    _seed_success_host(host, config)
+    staged = _stage_mod.stage(host, config)
+    assert staged.venv_python.name == "python3"
+    run_cmds = [detail for kind, detail in host.timeline if kind == "run"]
+    stage_cmds = [c for c in run_cmds if "pm.build_env" in c]
+    assert stage_cmds, "expected a staged pm.build_env spawn"
+    assert any(c.startswith("/usr/sbin/runuser ") for c in stage_cmds)
+    assert any("/usr/bin/env -i" in c for c in stage_cmds)
+    assert env["PATH"] == "/usr/bin:/bin"
+
+
+def test_cutover_service_unit_arms_recovery_via_systemd_analyze() -> None:
+    """systemd template arms recovery: OnFailure in [Unit], verified live.
+
+    Parent finding: OnFailure under [Service] is an unknown key so systemd
+    ignores it and recovery NEVER arms. Runs real `systemd-analyze verify`
+    (read-only, no enable/start); unknown-key output for OUR template fails
+    the test. A deliberately broken copy proves the gate is real.
+    """
+    import configparser as _configparser
+    import shutil as _shutil
+    import tempfile as _tempfile
+
+    if _shutil.which("systemd-analyze") is None:
+        import pytest as _pytest
+
+        _pytest.skip("systemd-analyze not available")
+    repo_root = Path(__file__).resolve().parents[2]
+    unit = repo_root / "scripts" / "maintenance" / "systemd" / "hermes-runtime-cutover.service"
+    assert unit.is_file()
+
+    parser = _configparser.ConfigParser(interpolation=None, strict=True)
+    parser.optionxform = str  # type: ignore[assignment]
+    parser.read_string(unit.read_text(encoding="utf-8"))
+    assert "Unit" in parser.sections()
+    assert "Service" in parser.sections()
+    # Recovery arms ONLY from [Unit].
+    assert parser.get("Unit", "OnFailure").strip() == "hermes-runtime-cutover-recovery.service"
+    assert not parser.has_option("Service", "OnFailure")
+    # Explicit slice; mandatory env (no `-` prefix); no boot-enabling installer.
+    assert parser.get("Service", "Slice").strip() == "system.slice"
+    assert parser.get("Service", "EnvironmentFile").strip() == "/var/lib/hermes-cutover/cutover.env"
+    assert "Install" not in parser.sections()
+
+    def _verify(path: Path) -> str:
+        done = subprocess.run(
+            ["systemd-analyze", "verify", str(path)],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        return (done.stdout or "") + (done.stderr or "")
+
+    output = _verify(unit)
+    own = [ln for ln in output.splitlines() if "hermes-runtime-cutover" in ln]
+    assert not any("Unknown key name" in ln for ln in own), "".join(own[:5])
+    assert not any("Unknown section" in ln for ln in own), "".join(own[:5])
+    assert not any("OnFailure" in ln and "Unknown" in ln for ln in output.splitlines())
+
+    # The gate is real: the old layout (OnFailure under [Service]) IS flagged.
+    broken = unit.read_text(encoding="utf-8").replace(
+        "OnFailure=hermes-runtime-cutover-recovery.service\nStartLimitIntervalSec=0",
+        "StartLimitIntervalSec=0",
+    ).replace(
+        "RemainAfterExit=no\n# Interruption resumes",
+        "RemainAfterExit=no\nOnFailure=hermes-runtime-cutover-recovery.service\n# Interruption resumes",
+    )
+    assert "[Service]\nType=oneshot" in broken
+    with _tempfile.NamedTemporaryFile(
+        "w", suffix=".service", delete=False, encoding="utf-8"
+    ) as handle:
+        handle.write(broken)
+        broken_path = Path(handle.name)
+    try:
+        broken_out = _verify(broken_path)
+    finally:
+        broken_path.unlink(missing_ok=True)
+    assert "Unknown key name 'OnFailure' in section 'Service'" in broken_out
+
+
 def test_actual_cli_resume_subprocess_no_snapshot_is_unknown(tmp_path: Path) -> None:
     """Actual `cutover.py resume -I` subprocess with no snapshot is fail-closed unknown."""
     repo_root = Path(__file__).resolve().parents[2]

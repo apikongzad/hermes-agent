@@ -2,23 +2,24 @@
 Description=Hermes runtime cutover to staged candidate generation
 After=network-online.target
 Wants=network-online.target
+# Recovery arms ONLY from [Unit]; OnFailure under [Service] is an unknown key
+# and systemd ignores it (recovery NEVER armed). Kept here so a failed
+# `full` run durably resumes via the journal.
+OnFailure=hermes-runtime-cutover-recovery.service
 StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
+Slice=system.slice
 # Root-owned copy: /opt/hermes-maintenance/scripts/maintenance/cutover.py
 # (copied from the candidate tree; no PYTHONPATH under -I: the facade inserts
 # /opt/hermes-maintenance at sys.path[0] itself, so no user code is imported).
 # Parent materializes /var/lib/hermes-cutover/cutover.env with
 # CANDIDATE_SHA/PARENT_SHA/CANDIDATE_SRC/LIVE_TREE/GENERATION_ROOT/JOURNAL.
 WorkingDirectory=/home/ubuntu
-EnvironmentFile=-/var/lib/hermes-cutover/cutover.env
+EnvironmentFile=/var/lib/hermes-cutover/cutover.env
 ExecStart=/usr/bin/python3 -I -B /opt/hermes-maintenance/scripts/maintenance/cutover.py full --candidate-sha ${CANDIDATE_SHA} --parent-sha ${PARENT_SHA} --candidate-src ${CANDIDATE_SRC} --live-tree ${LIVE_TREE} --generation-root ${GENERATION_ROOT} --journal ${JOURNAL} --hermes-home /home/ubuntu/.hermes
 TimeoutStartSec=1800
 TimeoutStopSec=180
 RemainAfterExit=no
 # Interruption resumes durably via the journal; hard failure pages the recovery unit.
-OnFailure=hermes-runtime-cutover-recovery.service
-
-[Install]
-WantedBy=multi-user.target
