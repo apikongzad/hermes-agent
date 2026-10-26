@@ -11,6 +11,7 @@ import subprocess
 import traceback
 
 from scripts.maintenance.cutover_dropin import remove_candidate_dropins
+from scripts.maintenance.cutover_git import run_owner_git
 from scripts.maintenance.cutover_health import check_rollback_health
 from scripts.maintenance.cutover_journal import append
 from scripts.maintenance.cutover_types import (
@@ -38,18 +39,19 @@ def _check_provenance(config: CutoverConfig, baseline: Baseline) -> None:
 
 
 def _restore_source(host: Host, config: CutoverConfig, baseline: Baseline) -> None:
+    """Restore live source only when mutated; untouched fleets never checkout."""
     try:
-        res = host.run(
-            ["git", "-C", str(config.live_tree), "rev-parse", "HEAD"], timeout=30
-        )
+        res = run_owner_git(host, config.live_tree, ["rev-parse", "HEAD"], timeout=30)
     except (OSError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as exc:
         raise RestoreError(f"source HEAD read failed: {type(exc).__name__}: {exc}") from exc
     current = (res.stdout or "").strip() if res.returncode == 0 else ""
     if current == config.parent_sha:
         return
     try:
-        back = host.run(
-            ["git", "-C", str(config.live_tree), "checkout", "--detach", config.parent_sha],
+        back = run_owner_git(
+            host,
+            config.live_tree,
+            ["checkout", "--detach", config.parent_sha],
             timeout=120,
         )
     except (OSError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as exc:

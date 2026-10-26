@@ -29,6 +29,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from scripts.maintenance.cutover_git import run_owner_git
 from scripts.maintenance.cutover_journal import append
 from scripts.maintenance.cutover_types import (
     Baseline,
@@ -306,7 +307,7 @@ def _check_once(
         return HealthReport(False, err), {}
     if (err := _check_unit_exe(host, dash_pid, staged, "/home/ubuntu", str(config.hermes_home), "dashboard")) is not None:
         return HealthReport(False, err), {}
-    head = host.run(["git", "-C", str(config.candidate_src), "rev-parse", "HEAD"], timeout=30)
+    head = run_owner_git(host, config.candidate_src, ["rev-parse", "HEAD"], timeout=30)
     if head.returncode != 0 or (head.stdout or "").strip() != config.candidate_sha:
         return HealthReport(False, "candidate tree HEAD does not match candidate SHA"), {}
     if (report := _check_state_bind(host, config, gw_pid)) is not None:

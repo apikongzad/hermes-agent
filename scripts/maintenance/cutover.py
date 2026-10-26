@@ -66,6 +66,12 @@ from scripts.maintenance.cutover_dropin import (
 )
 from scripts.maintenance.cutover_health import check_health, check_rollback_health, wait_for_health
 from scripts.maintenance.cutover_journal import append, has_terminal_receipt, read_all
+from scripts.maintenance.cutover_git import (
+    git_inner_argv,
+    owner_git_env,
+    run_owner_git,
+    wrap_owner_git,
+)
 from scripts.maintenance.cutover_manifest import (
     EXPECTED_SIBLINGS,
     ManifestError,
@@ -115,17 +121,20 @@ __all__ = [
     "assert_no_candidate_import",
     "check_health",
     "check_rollback_health",
+    "git_inner_argv",
     "has_terminal_receipt",
     "is_hex_sha",
     "is_root_installed",
     "load_baseline",
     "orchestrate",
+    "owner_git_env",
     "preflight",
     "read_all",
     "render_dashboard_dropin",
     "render_gateway_dropin",
     "resume",
     "rollback",
+    "run_owner_git",
     "save_baseline",
     "selected_extras_from_facts",
     "snapshot_path_for",
@@ -135,6 +144,7 @@ __all__ = [
     "verify_isolated_launch",
     "verify_staged_extras",
     "wait_for_health",
+    "wrap_owner_git",
 ]
 
 

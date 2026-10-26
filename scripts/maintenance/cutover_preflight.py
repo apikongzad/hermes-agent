@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from scripts.maintenance.cutover_git import run_owner_git
 from scripts.maintenance.cutover_journal import append
 from scripts.maintenance.cutover_types import (
     Baseline,
@@ -33,6 +34,17 @@ def _run_ok_text(
     if res.returncode != 0:
         raise PreflightError(
             f"preflight command failed: {' '.join(argv)}: {(res.stderr or '').strip()[:300]}"
+        )
+    return (res.stdout or "").strip()
+
+
+def _run_git_ok_text(host: Host, repo: Path, args: list[str], timeout: int = 30) -> str:
+    """rev-parse etc as the repo owner (never bare root git)."""
+    res = run_owner_git(host, repo, args, timeout=timeout)
+    if res.returncode != 0:
+        joined = " ".join([*args])
+        raise PreflightError(
+            f"preflight command failed: git -C {repo} {joined}: {(res.stderr or '').strip()[:300]}"
         )
     return (res.stdout or "").strip()
 
@@ -184,9 +196,9 @@ def preflight(host: Host, config: CutoverConfig) -> Baseline:
         dash_restarts,
     ) = _capture_unit(host, config.dashboard_unit)
 
-    live_head = _run_ok_text(host, ["git", "-C", str(config.live_tree), "rev-parse", "HEAD"])
-    candidate_head = _run_ok_text(
-        host, ["git", "-C", str(config.candidate_src), "rev-parse", "HEAD"]
+    live_head = _run_git_ok_text(host, Path(config.live_tree), ["rev-parse", "HEAD"])
+    candidate_head = _run_git_ok_text(
+        host, Path(config.candidate_src), ["rev-parse", "HEAD"]
     )
     if live_head != config.parent_sha:
         raise PreflightError(f"live tree HEAD {live_head[:12]} != parent {config.parent_sha[:12]}")

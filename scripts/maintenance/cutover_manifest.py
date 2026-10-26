@@ -17,6 +17,7 @@ EXPECTED_SIBLINGS = (
     "cutover_journal.py",
     "cutover_snapshot.py",
     "cutover_manifest.py",
+    "cutover_git.py",
     "cutover_preflight.py",
     "cutover_stage.py",
     "cutover_dropin.py",

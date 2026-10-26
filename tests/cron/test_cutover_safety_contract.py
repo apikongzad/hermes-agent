@@ -342,8 +342,10 @@ def test_parent_must_equal_live_main_via_controller_preflight(tmp_path: Path) ->
     stale_host.run_handlers = [h for h in stale_host.run_handlers if "git -C" not in h[0]]
     stale_host.on_run("git -C", _stale_git)
     stale_result = orchestrate(stale_host, stale)
-    assert stale_result.status == "unknown"
+    # Pre-mutation preflight is failed (fleet untouched, no recovery), never unknown.
+    assert stale_result.status == "failed"
     assert "preflight" in stale_result.reason
+    assert "fleet untouched" in stale_result.reason
 
 
 def test_no_cgroup_gate_controller_ignores_worker_invisible_path(tmp_path: Path) -> None:
@@ -1562,3 +1564,236 @@ def test_stage_all_extras_alone_passes_pm_build_env_contract(tmp_path: Path, mon
     assert _build_env.main(cli_args2) == 0
     assert calls.get("all_extras") is False
     assert sorted(calls.get("extras") or []) == ["telegram", "web"]
+
+
+def test_owner_git_never_runs_as_root_and_needs_no_safe_directory(tmp_path: Path, monkeypatch) -> None:
+    """Systemd root must run git as ubuntu via absolute runuser/env -i, never safe.directory.
+
+    Regression for the external `FAILED PRE-MUTATION` where systemd root
+    (clean env, no SUDO_UID) hit `fatal: detected dubious ownership` on
+    `git -C … rev-parse HEAD` while the sudo shell passed. The fix never
+    sets `safe.directory=*` and never runs git as root directly.
+    """
+    import os as _os
+
+    from scripts.maintenance import cutover_git as _git
+
+    assert _git._RUNUSER == "/usr/sbin/runuser"
+    assert _git._ENV == "/usr/bin/env"
+    assert _git._GIT == "/usr/bin/git"
+    assert _git._OWNER == "ubuntu"
+    assert _git._OWNER_HOME == "/home/ubuntu"
+    assert _git.owner_git_env() == {
+        "HOME": "/home/ubuntu",
+        "PATH": "/usr/bin:/bin",
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+
+    repo = tmp_path / "repo"
+    inner = _git.git_inner_argv(repo, "rev-parse", "HEAD")
+    assert inner[0] == "/usr/bin/git"
+    assert inner[1:3] == ["-C", str(repo.absolute())]
+    assert "safe.directory" not in " ".join(inner)
+
+    env = _git.owner_git_env()
+    monkeypatch.setattr(_os, "geteuid", lambda: 0)
+    wrapped_root = _git.wrap_owner_git(inner, env)
+    assert wrapped_root[0] == "/usr/sbin/runuser"
+    assert wrapped_root[1:4] == ["-u", "ubuntu", "--"]
+    assert wrapped_root[4] == "/usr/bin/env" and wrapped_root[5] == "-i"
+    assert "HOME=/home/ubuntu" in wrapped_root
+    assert "PATH=/usr/bin:/bin" in wrapped_root
+    assert "GIT_CONFIG_NOSYSTEM=1" in wrapped_root
+    assert "/usr/bin/git" in wrapped_root
+    assert "safe.directory" not in " ".join(wrapped_root)
+    assert wrapped_root[0] != "git" and wrapped_root[0] != "/usr/bin/git"
+
+    monkeypatch.setattr(_os, "geteuid", lambda: 1000)
+    wrapped_user = _git.wrap_owner_git(inner, env)
+    assert wrapped_user[0] == "/usr/bin/env" and wrapped_user[1] == "-i"
+    assert "/usr/sbin/runuser" not in wrapped_user
+    assert "safe.directory" not in " ".join(wrapped_user)
+
+    # run_owner_git carries explicit cwd + env + bounded timeout, no inheritance.
+    timeouts: list[int] = []
+    seen: dict[str, object] = {}
+
+    class _TimeoutHost(FakeHost):
+        def run(self, argv, timeout=60, cwd=None, env=None):  # type: ignore[override]
+            timeouts.append(int(timeout))
+            seen["cwd"] = str(cwd) if cwd is not None else None
+            seen["env"] = dict(env) if env is not None else None
+            return super().run(argv, timeout=timeout, cwd=cwd, env=env)
+
+    monkeypatch.setattr(_os, "geteuid", lambda: 0)
+    host = _TimeoutHost()
+    host.on_run("rev-parse", RunResult(0, "a" * 40, ""))
+    res = _git.run_owner_git(host, repo, ["rev-parse", "HEAD"], timeout=30)
+    assert res.returncode == 0
+    assert timeouts == [30]
+    assert seen["cwd"] == str(repo.absolute())
+    assert seen["env"] == _git.owner_git_env()
+    assert host.run_cwds[-1] == str(repo.absolute())
+    assert host.run_envs[-1] == _git.owner_git_env()
+    argv_text = host.timeline[-1][1]
+    assert argv_text.startswith("/usr/sbin/runuser -u ubuntu -- /usr/bin/env -i")
+    assert "/usr/bin/git -C" in argv_text
+
+
+def test_all_controller_git_routes_use_owner_wrapper_under_systemd_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Every git route (preflight live/candidate, web-dist, health, restore) is owner-scoped.
+
+    Simulates systemd root (euid 0, clean env without SUDO_UID) and drives the
+    full orchestrator plus an explicit untouched restore. Parent retries the
+    systemd preflight against these exact argv/owner/cwd/env bindings.
+    """
+    import os as _os
+
+    from scripts.maintenance import cutover_git as _git
+
+    monkeypatch.setattr(_os, "geteuid", lambda: 0)
+    config = _make_config(tmp_path)
+
+    records: list[tuple[list[str], int, object, object]] = []
+
+    class _RecordHost(FakeHost):
+        def run(self, argv, timeout=60, cwd=None, env=None):  # type: ignore[override]
+            records.append((list(argv), int(timeout), cwd, dict(env) if env is not None else None))
+            return super().run(argv, timeout=timeout, cwd=cwd, env=env)
+
+    host = _RecordHost()
+    _seed_success_host(host, config)
+    result = orchestrate(host, config)
+    assert result.status == "success"
+
+    git_runs = [
+        (argv, timeout, cwd, env)
+        for argv, timeout, cwd, env in records
+        if any("rev-parse" in str(a) or "check-ignore" in str(a) for a in argv)
+    ]
+    # preflight live + candidate, web-dist check-ignore, health candidate HEAD.
+    assert len(git_runs) >= 4
+    for argv, timeout, cwd, env in git_runs:
+        detail = " ".join(argv)
+        assert detail.startswith("/usr/sbin/runuser -u ubuntu -- /usr/bin/env -i"), detail
+        assert "/usr/bin/git" in argv
+        assert "-C" in argv
+        assert "HOME=/home/ubuntu" in detail
+        assert "GIT_CONFIG_NOSYSTEM=1" in detail
+        assert "safe.directory" not in detail
+        assert env == _git.owner_git_env()
+        assert str(cwd) in (
+            str(config.live_tree.absolute()),
+            str(config.candidate_src.absolute()),
+        )
+        assert timeout in (30, 120)
+        assert argv[0] == "/usr/sbin/runuser"
+    # Both repos are covered: live rev-parse and candidate rev-parse/check-ignore.
+    texts = [" ".join(argv) for argv, _, _, _ in git_runs]
+    assert any(str(config.live_tree) in d for d in texts)
+    assert any(str(config.candidate_src) in d for d in texts)
+    assert any("check-ignore" in d for d in texts)
+
+    # Untouched restore: rev-parse as owner, no checkout when HEAD == parent.
+    from scripts.maintenance.cutover_restore import _restore_source
+    from scripts.maintenance.cutover_snapshot import load_baseline
+
+    baseline = load_baseline(host, config)
+    before = len(host.timeline)
+    _restore_source(host, config, baseline)
+    tail = host.timeline[before:]
+    assert any(kind == "run" and "rev-parse" in detail for kind, detail in tail)
+    assert not any("checkout" in detail for _, detail in tail)
+    last_git = next(detail for kind, detail in reversed(tail) if kind == "run")
+    assert last_git.startswith("/usr/sbin/runuser -u ubuntu --")
+
+
+def test_preflight_failure_is_failed_with_no_recovery_not_unknown(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Pre-mutation preflight refusal is failed/fleet-untouched, never unknown.
+
+    The external cutover hit dubious-ownership preflight failure (fleet
+    untouched, Gateway 15839 / Dashboard 15683 still active) but the receipt
+    was unknown, so OnFailure resume refused on the terminal receipt. Failed
+    signals no recovery is needed; the parent retries with a NEW journal
+    while the previous unknown receipt is preserved.
+    """
+    from scripts.maintenance.cutover_journal import has_terminal_receipt, read_all
+
+    import os as _os
+
+    # Simulate systemd root clean env (no SUDO_UID): owner wrapper uses runuser.
+    monkeypatch.setattr(_os, "geteuid", lambda: 0)
+    config = _make_config(tmp_path)
+    host = FakeHost()
+    _seed_success_host(host, config)
+    # Remove the seeded success git handler (matches "git -C") so the
+    # dubious-ownership failure is the one that runs. Handlers match by
+    # substring in order, so the old handler must go first.
+    host.run_handlers = [
+        h
+        for h in host.run_handlers
+        if "git -C" not in h[0] and "/usr/bin/git" not in h[0] and "rev-parse" not in h[0]
+    ]
+
+    def _dubious(argv: list[str]) -> RunResult:
+        if "rev-parse" in " ".join(argv):
+            return RunResult(128, "", "fatal: detected dubious ownership in repository")
+        return RunResult(0, "", "")
+
+    host.on_run("runuser", _dubious)
+    host.on_run("/usr/bin/git", _dubious)
+    host.on_run("rev-parse", _dubious)
+    result = orchestrate(host, config)
+    assert result.status == "failed"
+    assert "fleet untouched" in result.reason
+    assert "preflight" in result.reason
+    assert result.status != "unknown"
+    assert has_terminal_receipt(host, config.journal_path)
+    rows = read_all(host, config.journal_path)
+    assert any(r.get("phase") == "receipt-failed" for r in rows)
+    assert not any(r.get("phase") == "receipt-unknown" for r in rows)
+    # No live lifecycle: untouched Gateway/Dashboard are never restarted.
+    assert not any(
+        kind == "run" and ("systemctl restart" in detail or "daemon-reload" in detail)
+        for kind, detail in host.timeline
+    )
+
+
+def test_real_clean_env_git_as_owner_needs_no_safe_directory(tmp_path: Path) -> None:
+    """Real clean-env git (systemd-like, no SUDO_*, no GIT_*) succeeds as the owner.
+
+    Feasible without root: run the exact owner env through absolute
+    `/usr/bin/env -i` against this checkout. Proves no `safe.directory`
+    exception is needed when the owner runs git. Skipped for root (root
+    clean-env on an ubuntu-owned tree is the dubious-ownership failure the
+    wrapper fixes via runuser; that path is covered by the injected test).
+    """
+    import os as _os
+    import subprocess as _subprocess
+
+    try:
+        euid = _os.geteuid()
+    except AttributeError:
+        euid = 1000
+    if euid == 0:
+        import pytest as _pytest
+
+        _pytest.skip("owner clean-env probe is only meaningful as non-root")
+    repo_root = Path(__file__).resolve().parents[2]
+    done = _subprocess.run(
+        [
+            "/usr/bin/env", "-i",
+            "HOME=/home/ubuntu", "PATH=/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM=1",
+            "/usr/bin/git", "-C", str(repo_root), "rev-parse", "HEAD",
+        ],
+        capture_output=True, text=True, timeout=30, check=False,
+        cwd=str(repo_root),
+        env={"PATH": "/usr/bin:/bin"},
+    )
+    assert done.returncode == 0, (done.stdout or "") + (done.stderr or "")
+    assert len((done.stdout or "").strip()) == 40
+    assert "dubious ownership" not in (done.stderr or "")

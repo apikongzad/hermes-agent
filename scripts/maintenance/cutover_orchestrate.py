@@ -102,9 +102,9 @@ def orchestrate(host: Host, config: CutoverConfig) -> CutoverResult:
     try:
         baseline = preflight(host, config)
     except PreflightError as exc:
-        return _receipt(host, config, "unknown", f"preflight fail-closed: {exc}")
+        return _fail_no_rollback(host, config, "preflight", str(exc))
     except (OSError, RuntimeError) as exc:
-        return _receipt(host, config, "unknown", f"preflight IO fail-closed: {exc}")
+        return _fail_no_rollback(host, config, "preflight", f"IO fail-closed: {exc}")
 
     try:
         save_baseline(host, config, baseline)

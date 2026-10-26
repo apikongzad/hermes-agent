@@ -15,6 +15,7 @@ import os
 import subprocess
 from pathlib import Path
 
+from scripts.maintenance.cutover_git import run_owner_git
 from scripts.maintenance.cutover_journal import append
 from scripts.maintenance.cutover_types import (
     Baseline,
@@ -385,8 +386,10 @@ def verify_candidate_web_dist(host: Host, config: CutoverConfig) -> None:
         host.read_bytes(candidate / "web" / "package.json")
     except OSError as exc:
         raise StageError(f"candidate web source missing: {exc}") from exc
-    ignored = host.run(
-        ["git", "-C", str(candidate), "check-ignore", "-q", str(index)],
+    ignored = run_owner_git(
+        host,
+        candidate,
+        ["check-ignore", "-q", str(index)],
         timeout=30,
     )
     if ignored.returncode != 0:

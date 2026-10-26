@@ -371,3 +371,25 @@ health, missing reset):
   `git check-ignore` proves product, `web/package.json` proves npm-built,
   no fake artifacts). All three are pre-mutation (fail `failed`, fleet
   untouched); only dropin/reload/restart/health route to rollback.
+
+## 11. Owner-scoped git amendment (v2.3, systemd-root dubious ownership)
+
+External `full f18a8677…` FAILED PRE-MUTATION under systemd root (clean
+env, no `SUDO_UID`; Gateway 15839 / Dashboard 15683 stayed `active`,
+`NRestarts=0`): `git -C … rev-parse HEAD` as root on ubuntu-owned trees
+fails `fatal: detected dubious ownership`, while the sudo-shell preflight
+passed. Fix: `cutover_git.py` (stdlib only, in manifest + facade) runs
+EVERY git route as `ubuntu` via absolute
+`/usr/sbin/runuser -u ubuntu -- /usr/bin/env -i HOME=/home/ubuntu
+PATH=/usr/bin:/bin GIT_CONFIG_NOSYSTEM=1 /usr/bin/git -C <repo> …` with
+explicit bounded `timeout` and `cwd=<repo>`; non-root uses the same
+absolute `env -i` without the runuser prefix. No `safe.directory=*` and
+no global root git exception. Routes: candidate/live `rev-parse` in
+preflight, `check-ignore` for the web dist, `rev-parse` in health,
+`rev-parse` + conditional `checkout --detach` in restore (already a no-op
+when `HEAD == parent`, so untouched fleets never checkout). Preflight
+refusal is now `failed` (fleet untouched, no recovery) instead of
+`unknown`; the prior `unknown` receipt is preserved and the parent retries
+with a NEW journal path. Regression: simulated systemd-root (`euid==0`)
+asserts exact argv/owner/cwd/env/bounds on all routes plus a real
+clean-env owner `rev-parse` (no safe.directory).
