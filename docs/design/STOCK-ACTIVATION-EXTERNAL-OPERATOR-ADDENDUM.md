@@ -270,14 +270,7 @@ alternate order.
 
 ## 8. Rollback execution
 
-Stop-fenced again if the units are not already inactive, restore exact
-prior unit bytes, but the restored ExecStart must already point at the
-known-good snapshot, or the operator must publish snapshot-bound
-prior-identity unit bytes while inactive. Restoring unit bytes that name
-`gen-1d9a377fa00c` or the worktree is not a legal rollback start. If the
-known-good snapshot is missing or writable, leave services stopped and
-report stopped-unresolved. Do not `git checkout` the live worktree. Do
-not restore `state.db`.
+While stop-fenced inactive, the only legal rollback start is one in-place zzz-candidate.conf whose ExecStart interpreter and entry are inside the pre-stop known-good snapshot. Preserve the pre-transaction unit bytes in the journal as evidence. Do not start those pre-transaction bytes: they name gen-1d9a377fa00c and the worktree. If the known-good snapshot is missing or writable, leave both units stopped and report stopped-unresolved. Do not git checkout the live worktree. Do not restore state.db.
 
 ## 9. Withdraw the stale denial
 
