@@ -64,7 +64,7 @@ from scripts.maintenance.cutover_dropin import (
     render_dashboard_dropin,
     render_gateway_dropin,
 )
-from scripts.maintenance.cutover_health import check_health, check_rollback_health
+from scripts.maintenance.cutover_health import check_health, check_rollback_health, wait_for_health
 from scripts.maintenance.cutover_journal import append, has_terminal_receipt, read_all
 from scripts.maintenance.cutover_manifest import (
     EXPECTED_SIBLINGS,
@@ -76,7 +76,15 @@ from scripts.maintenance.cutover_orchestrate import orchestrate, resume
 from scripts.maintenance.cutover_preflight import PreflightError, preflight
 from scripts.maintenance.cutover_restore import RestoreError, rollback
 from scripts.maintenance.cutover_snapshot import SnapshotError, load_baseline, save_baseline
-from scripts.maintenance.cutover_stage import StageError, stage, verify_isolated_launch
+from scripts.maintenance.cutover_stage import (
+    StageError,
+    selected_extras_from_facts,
+    stage,
+    verify_candidate_help,
+    verify_candidate_web_dist,
+    verify_isolated_launch,
+    verify_staged_extras,
+)
 from scripts.maintenance.cutover_types import (
     Baseline,
     CutoverConfig,
@@ -119,9 +127,14 @@ __all__ = [
     "resume",
     "rollback",
     "save_baseline",
+    "selected_extras_from_facts",
     "snapshot_path_for",
     "stage",
+    "verify_candidate_help",
+    "verify_candidate_web_dist",
     "verify_isolated_launch",
+    "verify_staged_extras",
+    "wait_for_health",
 ]
 
 
@@ -185,8 +198,12 @@ def _cmd_preflight(host: Host, config: CutoverConfig) -> int:
 def _cmd_stage(host: Host, config: CutoverConfig) -> int:
     try:
         baseline = preflight(host, config)
-        staged = stage(host, config)
+        staged = stage(host, config, baseline)
         verify_isolated_launch(host, config, staged, baseline.live_main_exe)
+        verify_candidate_web_dist(host, config)
+        extras, use_all = selected_extras_from_facts(baseline.facts_bytes)
+        verify_staged_extras(host, config, staged, extras, use_all)
+        verify_candidate_help(host, config, staged)
     except (PreflightError, StageError, OSError, RuntimeError) as exc:
         print(f"stage failed: {exc}", file=sys.stderr)
         return 1
@@ -197,7 +214,7 @@ def _cmd_stage(host: Host, config: CutoverConfig) -> int:
 def _cmd_health(host: Host, config: CutoverConfig) -> int:
     try:
         baseline = preflight(host, config)
-        staged = stage(host, config)
+        staged = stage(host, config, baseline)
     except (PreflightError, StageError, OSError, RuntimeError) as exc:
         print(f"health setup failed: {exc}", file=sys.stderr)
         return 2

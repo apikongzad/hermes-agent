@@ -1,6 +1,6 @@
 """Read-only health: BOTH units + state + /api/health. No --version probe.
 
-DESIGN v2 (fail-closed):
+DESIGN v2 (fail-closed) + readiness polling:
 - Both gateway and dashboard must be active, MainPID>0.
 - /proc/PID/exe must EXACTLY equal the staged store interpreter
   (pyvenv.cfg home/executable, resolved), NOT a substring of the generation.
@@ -8,18 +8,24 @@ DESIGN v2 (fail-closed):
 - /proc/PID/cmdline[0] must be the staged venv python (exact).
 - /proc/PID/cwd must equal the unit WorkingDirectory (exact).
 - /proc/PID/environ HERMES_HOME must equal config.hermes_home.
-- PIDs/start_times must differ from the preflight baseline (proves restart).
+- PIDs/start_times/ActiveEnter must differ from the preflight baseline
+  (proves restart); NRestarts must equal the baseline (no crash loop).
 - gateway_state.json code_sha MUST be present and == candidate (missing fails).
   updated_at must be fresh (<=120s, same TTL as gateway.status), pid must
   equal the gateway MainPID.
 - Dashboard /api/health must be 200 with commit == candidate (verified live:
   /health is 302 SPA, /api/health is the real contract).
+- Type=simple returns before readiness: orchestrate polls via
+  wait_for_health (bounded 120s, restart-stability PID/start/counter)
+  without weakening SHA/exe; transport exceptions stay retryable until
+  the bound, then fail for automatic rollback.
 """
 
 from __future__ import annotations
 
 import datetime
 import json
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,6 +36,16 @@ from scripts.maintenance.cutover_types import (
     Host,
     Staged,
     gateway_state_path_for,
+)
+
+# Bounded readiness: Type=simple `restart` returns before the new fleet is
+# ready (state stamp + /api/health lag). Poll, never weaken SHA/exe.
+POLL_TIMEOUT_S = 120
+POLL_INTERVAL_S = 2
+
+_FATAL_SUBSTRINGS = (
+    "dashboard port must be 9119",
+    "candidate tree HEAD does not match",
 )
 
 
@@ -176,6 +192,61 @@ def _pids_changed(baseline: Baseline | None, gw_pid: int, dash_pid: int) -> Heal
     return None
 
 
+def _restart_proof(
+    host: Host,
+    baseline: Baseline | None,
+    gw_pid: int,
+    dash_pid: int,
+    gw_show: dict[str, str],
+    dash_show: dict[str, str],
+) -> HealthReport | None:
+    """Prove restart happened and no crash loop: PID/start/enter differ, counter stable."""
+    if baseline is None or not baseline.live_main_pid:
+        return None
+    if (report := _pids_changed(baseline, gw_pid, dash_pid)) is not None:
+        return report
+    try:
+        gw_start = host.proc_start_time(gw_pid)
+    except OSError as exc:
+        return HealthReport(False, f"gateway start_time unreadable: {exc}")
+    try:
+        dash_start = host.proc_start_time(dash_pid)
+    except OSError as exc:
+        return HealthReport(False, f"dashboard start_time unreadable: {exc}")
+    if gw_start is None or dash_start is None:
+        return HealthReport(False, "start_time unknown after restart (PID-reuse guard)")
+    if gw_start == baseline.live_main_start_time:
+        return HealthReport(False, "gateway start_time unchanged after restart")
+    if dash_start == baseline.dashboard_main_start_time:
+        return HealthReport(False, "dashboard start_time unchanged after restart")
+    gw_enter = (gw_show.get("ActiveEnterTimestamp") or "").strip()
+    dash_enter = (dash_show.get("ActiveEnterTimestamp") or "").strip()
+    if not gw_enter or not dash_enter:
+        return HealthReport(False, "ActiveEnterTimestamp missing after restart")
+    if gw_enter == (baseline.gateway_active_enter or "").strip():
+        return HealthReport(False, "gateway ActiveEnter unchanged after restart")
+    if dash_enter == (baseline.dashboard_active_enter or "").strip():
+        return HealthReport(False, "dashboard ActiveEnter unchanged after restart")
+    gw_n = (gw_show.get("NRestarts") or "").strip()
+    dash_n = (dash_show.get("NRestarts") or "").strip()
+    if gw_n != (baseline.gateway_nrestarts or "").strip():
+        return HealthReport(False, f"gateway NRestarts {gw_n!r} != baseline (crash loop?)")
+    if dash_n != (baseline.dashboard_nrestarts or "").strip():
+        return HealthReport(False, f"dashboard NRestarts {dash_n!r} != baseline (crash loop?)")
+    return None
+
+
+def _is_fatal_detail(detail: str) -> bool:
+    return any(token in detail for token in _FATAL_SUBSTRINGS)
+
+
+def _sleep_between_attempts(host: Host, interval_s: int) -> None:
+    try:
+        host.run(["sleep", str(int(interval_s))], timeout=int(interval_s) + 5)
+    except (OSError, RuntimeError, TimeoutError, subprocess.TimeoutExpired):
+        pass
+
+
 def _check_state_bind(host: Host, config: CutoverConfig, gw_pid: int) -> HealthReport | None:
     try:
         state_raw = host.read_bytes(gateway_state_path_for(config.hermes_home))
@@ -211,47 +282,167 @@ def _check_dashboard_commit(host: Host, config: CutoverConfig) -> HealthReport |
     return None
 
 
-def check_health(host: Host, config: CutoverConfig, staged: Staged, baseline: Baseline | None = None) -> HealthReport:
-    """Verify the running fleet is the staged candidate. Read-only (no sends)."""
+def _check_once(
+    host: Host, config: CutoverConfig, staged: Staged, baseline: Baseline | None
+) -> tuple[HealthReport, dict[str, object]]:
+    """Single readiness attempt. Returns (report, snapshot for stability)."""
     if config.dashboard_port != 9119:
-        return HealthReport(False, "dashboard port must be 9119")
+        return HealthReport(False, "dashboard port must be 9119"), {}
     if not _is_active(host, config.gateway_unit):
-        return HealthReport(False, f"{config.gateway_unit} is not active")
+        return HealthReport(False, f"{config.gateway_unit} is not active"), {}
     if not _is_active(host, config.dashboard_unit):
-        return HealthReport(False, f"{config.dashboard_unit} is not active")
-
-    gw_pid = _main_pid(_show(host, config.gateway_unit))
-    dash_pid = _main_pid(_show(host, config.dashboard_unit))
+        return HealthReport(False, f"{config.dashboard_unit} is not active"), {}
+    gw_show = _show(host, config.gateway_unit)
+    dash_show = _show(host, config.dashboard_unit)
+    gw_pid = _main_pid(gw_show)
+    dash_pid = _main_pid(dash_show)
     if gw_pid <= 0:
-        return HealthReport(False, "gateway MainPID unknown")
+        return HealthReport(False, "gateway MainPID unknown"), {}
     if dash_pid <= 0:
-        return HealthReport(False, "dashboard MainPID unknown")
-
-    if (report := _pids_changed(baseline, gw_pid, dash_pid)) is not None:
-        return report
-
+        return HealthReport(False, "dashboard MainPID unknown"), {}
+    if (report := _restart_proof(host, baseline, gw_pid, dash_pid, gw_show, dash_show)) is not None:
+        return report, {}
     if (err := _check_unit_exe(host, gw_pid, staged, str(config.hermes_home), str(config.hermes_home), "gateway")) is not None:
-        return HealthReport(False, err)
+        return HealthReport(False, err), {}
     if (err := _check_unit_exe(host, dash_pid, staged, "/home/ubuntu", str(config.hermes_home), "dashboard")) is not None:
-        return HealthReport(False, err)
-
+        return HealthReport(False, err), {}
     head = host.run(["git", "-C", str(config.candidate_src), "rev-parse", "HEAD"], timeout=30)
     if head.returncode != 0 or (head.stdout or "").strip() != config.candidate_sha:
-        return HealthReport(False, "candidate tree HEAD does not match candidate SHA")
-
+        return HealthReport(False, "candidate tree HEAD does not match candidate SHA"), {}
     if (report := _check_state_bind(host, config, gw_pid)) is not None:
-        return report
+        return report, {}
     if (report := _check_dashboard_commit(host, config)) is not None:
-        return report
+        return report, {}
+    try:
+        gw_start = host.proc_start_time(gw_pid)
+    except OSError:
+        gw_start = None
+    try:
+        dash_start = host.proc_start_time(dash_pid)
+    except OSError:
+        dash_start = None
+    snapshot = {
+        "gw_pid": gw_pid,
+        "dash_pid": dash_pid,
+        "gw_show": dict(gw_show),
+        "dash_show": dict(dash_show),
+        "gw_start": gw_start,
+        "dash_start": dash_start,
+    }
+    return HealthReport(True, "candidate healthy"), snapshot
 
+
+def _verify_stable(
+    host: Host,
+    config: CutoverConfig,
+    snapshot: dict[str, object],
+) -> HealthReport | None:
+    """Confirm the healthy fleet did not flap: same PID/start/counter."""
+    try:
+        gw_show = _show(host, config.gateway_unit)
+        dash_show = _show(host, config.dashboard_unit)
+        gw_pid = _main_pid(gw_show)
+        dash_pid = _main_pid(dash_show)
+        gw_start = host.proc_start_time(gw_pid)
+        dash_start = host.proc_start_time(dash_pid)
+    except (OSError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as exc:
+        return HealthReport(False, f"stability transport: {type(exc).__name__}: {exc}"[-300:])
+    if gw_pid != snapshot.get("gw_pid") or dash_pid != snapshot.get("dash_pid"):
+        return HealthReport(False, "fleet PIDs changed during stability window (flapping)")
+    if gw_start != snapshot.get("gw_start") or dash_start != snapshot.get("dash_start"):
+        return HealthReport(False, "fleet start_time changed during stability window")
+    if (gw_show.get("NRestarts") or "") != (snapshot["gw_show"].get("NRestarts") or ""):
+        return HealthReport(False, "gateway NRestarts changed during stability window")
+    if (dash_show.get("NRestarts") or "") != (snapshot["dash_show"].get("NRestarts") or ""):
+        return HealthReport(False, "dashboard NRestarts changed during stability window")
+    if (gw_show.get("ActiveEnterTimestamp") or "") != (snapshot["gw_show"].get("ActiveEnterTimestamp") or ""):
+        return HealthReport(False, "gateway ActiveEnter changed during stability window")
+    if (dash_show.get("ActiveEnterTimestamp") or "") != (snapshot["dash_show"].get("ActiveEnterTimestamp") or ""):
+        return HealthReport(False, "dashboard ActiveEnter changed during stability window")
+    return None
+
+
+def check_health(host: Host, config: CutoverConfig, staged: Staged, baseline: Baseline | None = None) -> HealthReport:
+    """Verify the running fleet is the staged candidate. Read-only (no sends)."""
+    report, snapshot = _check_once(host, config, staged, baseline)
+    if not report.ok:
+        return report
     append(
         host,
         config.journal_path,
         "health-ok",
         True,
-        {"gateway_pid": gw_pid, "dashboard_pid": dash_pid, "candidate": config.candidate_sha},
+        {
+            "gateway_pid": snapshot.get("gw_pid"),
+            "dashboard_pid": snapshot.get("dash_pid"),
+            "candidate": config.candidate_sha,
+        },
     )
-    return HealthReport(True, "candidate healthy")
+    return report
+
+
+def wait_for_health(
+    host: Host,
+    config: CutoverConfig,
+    staged: Staged,
+    baseline: Baseline | None = None,
+    timeout_s: int = POLL_TIMEOUT_S,
+    interval_s: int = POLL_INTERVAL_S,
+) -> HealthReport:
+    """Bounded readiness poll after restart: Type=simple returns early.
+
+    Retries retryable unreadiness (inactive, PID/start/enter lag, stale state,
+    9119 lag, crash-loop counter) until timeout_s; fatal config (port, HEAD)
+    fails fast. SHA/exe bindings are checked on EVERY attempt (no weakening).
+    Transport exceptions are retryable until the bound, then fail for
+    automatic rollback. On first ok, one stability interval confirms the
+    PIDs/start/counter did not flap before reporting success.
+    """
+    interval = max(1, int(interval_s))
+    attempts = max(1, int(timeout_s) // interval)
+    last = HealthReport(False, "health polling never attempted")
+    for attempt in range(attempts):
+        try:
+            report, snapshot = _check_once(host, config, staged, baseline)
+        except (OSError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as exc:
+            last = HealthReport(False, f"health transport {type(exc).__name__}: {exc}"[-300:])
+            if attempt + 1 < attempts:
+                _sleep_between_attempts(host, interval)
+            continue
+        if not report.ok:
+            last = report
+            if _is_fatal_detail(report.detail):
+                return report
+            if attempt + 1 < attempts:
+                _sleep_between_attempts(host, interval)
+            continue
+        # First ok: stability window (no flap) before success.
+        if attempt + 1 >= attempts:
+            append(
+                host, config.journal_path, "health-ok", True,
+                {
+                    "gateway_pid": snapshot.get("gw_pid"),
+                    "dashboard_pid": snapshot.get("dash_pid"),
+                    "candidate": config.candidate_sha,
+                    "stable": False,
+                },
+            )
+            return report
+        _sleep_between_attempts(host, interval)
+        if (stable_err := _verify_stable(host, config, snapshot)) is not None:
+            last = stable_err
+            continue
+        append(
+            host, config.journal_path, "health-ok", True,
+            {
+                "gateway_pid": snapshot.get("gw_pid"),
+                "dashboard_pid": snapshot.get("dash_pid"),
+                "candidate": config.candidate_sha,
+                "stable": True,
+            },
+        )
+        return HealthReport(True, "candidate healthy (stable)")
+    return last
 
 
 def check_rollback_health(host: Host, config: CutoverConfig) -> HealthReport:

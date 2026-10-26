@@ -4,7 +4,9 @@ DESIGN v2: root NEVER imports candidate pm. The build runs as `ubuntu` with
 explicit cwd=candidate_src, absolute /usr/bin/python3, isolated
 HOME/HERMES_HOME/HERMES_RUNTIME_DIR, env -i, no PYTHONPATH. Re-exec probe
 invokes REAL Hermes launch preparation (hermes_bootstrap + version identity),
-not `python -c sys.executable`.
+not `python -c sys.executable`. The build carries the LIVE selection extras
+(from baseline facts, secret-free) — core-only would drop messaging/telegram
+— and the dashboard --skip-build requires a prebuilt source-ignored web dist.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from pathlib import Path
 
 from scripts.maintenance.cutover_journal import append
 from scripts.maintenance.cutover_types import (
+    Baseline,
     CutoverConfig,
     Host,
     Staged,
@@ -48,10 +51,58 @@ def _isolated_env(config: CutoverConfig) -> dict[str, str]:
     }
 
 
-def stage_argv(config: CutoverConfig) -> list[str]:
-    """Documented PM build; the Host adds cwd/env isolation at spawn."""
+def selected_extras_from_facts(facts_bytes: bytes) -> tuple[list[str], bool]:
+    """Parse the LIVE selection extras (secret-free) from baseline facts.
+
+    Returns (extras_without_all, use_all_extras). Empty means core-only
+    (legacy test seeds); production carries web/telegram/etc. Raises
+    StageError on malformed facts (fail-closed, pre-mutation).
+    """
+    import json as _json
+    import re as _re
+
+    try:
+        payload = _json.loads(facts_bytes.decode("utf-8", "replace"))
+    except ValueError as exc:
+        raise StageError(f"selection facts are not JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise StageError("selection facts are not an object")
+    packages = payload.get("packages")
+    if not isinstance(packages, dict):
+        raise StageError("selection facts have no packages")
+    venv_fact = packages.get("venv")
+    if not isinstance(venv_fact, dict):
+        raise StageError("selection facts have no venv selection")
+    raw_extras = venv_fact.get("extras", [])
+    if not isinstance(raw_extras, list):
+        raise StageError("selection facts venv.extras is not a list")
+    cleaned: list[str] = []
+    for item in raw_extras:
+        if not isinstance(item, str) or not item.strip():
+            raise StageError("selection facts contain a non-string extra")
+        name = item.strip()
+        if not _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+            raise StageError(f"selection facts contain an invalid extra {name!r}")
+        cleaned.append(name)
+    # Dedupe, sorted for deterministic argv + journal.
+    cleaned = sorted(set(cleaned))
+    use_all = "all" in cleaned
+    extras = [e for e in cleaned if e != "all"]
+    return extras, use_all
+
+
+def stage_argv(
+    config: CutoverConfig,
+    extras: list[str] | None = None,
+    all_extras: bool = False,
+) -> list[str]:
+    """Documented PM build; the Host adds cwd/env isolation at spawn.
+
+    extras/all_extras mirror the LIVE selection (baseline facts): core-only
+    (None/[]) drops messaging/telegram and breaks the cutover fleet.
+    """
     out = venv_dir_for(config)
-    return [
+    argv = [
         "/usr/bin/python3",
         "-m",
         "pm.build_env",
@@ -60,6 +111,11 @@ def stage_argv(config: CutoverConfig) -> list[str]:
         "--out",
         str(out.absolute()),
     ]
+    if all_extras:
+        argv.append("--all-extras")
+    for extra in sorted(set(extras or [])):
+        argv += ["--extra", extra]
+    return argv
 
 
 # Trusted absolute spawn helpers (verified on this host):
@@ -102,8 +158,12 @@ def _forbidden_staging_argv(argv: list[str]) -> bool:
     )
 
 
-def stage(host: Host, config: CutoverConfig) -> Staged:
-    argv = stage_argv(config)
+def stage(host: Host, config: CutoverConfig, baseline: Baseline | None = None) -> Staged:
+    extras: list[str] = []
+    use_all = False
+    if baseline is not None and baseline.facts_bytes:
+        extras, use_all = selected_extras_from_facts(baseline.facts_bytes)
+    argv = stage_argv(config, extras, use_all)
     if _forbidden_staging_argv(argv):
         raise StageError("staging uses a forbidden entrypoint")
     # The inner argv must stay the documented entrypoint; the wrapper only
@@ -155,7 +215,13 @@ def stage(host: Host, config: CutoverConfig) -> Staged:
         config.journal_path,
         "stage-ok",
         True,
-        {"generation": str(generation), "venv_python": str(venv_python), "home": home},
+        {
+            "generation": str(generation),
+            "venv_python": str(venv_python),
+            "home": home,
+            "extras": extras,
+            "all_extras": use_all,
+        },
     )
     return Staged(
         generation_dir=generation,
@@ -163,6 +229,180 @@ def stage(host: Host, config: CutoverConfig) -> Staged:
         venv_python=venv_python,
         store_home=Path(home),
         store_exe=Path(exe) if exe else Path(home) / "python3",
+    )
+
+
+# Stdlib anchor copy (pm/extras.py ANCHORS subset for production extras).
+# Root stays stdlib-only: unknown extras fall back to dashes->underscores,
+# matching pm's default. find_spec only, never import (no side effects).
+_EXTRA_ANCHORS: dict[str, tuple[str, ...]] = {
+    "web": ("fastapi",),
+    "telegram": ("telegram",),
+    "discord": ("discord",),
+    "slack": ("slack_bolt",),
+    "messaging": ("telegram",),
+    "google": ("googleapiclient",),
+    "mcp": ("mcp",),
+    "acp": ("acp",),
+    "sms": ("aiohttp",),
+    "youtube": ("youtube_transcript_api",),
+}
+
+
+def _anchors_for_extra(extra: str) -> tuple[str, ...]:
+    got = _EXTRA_ANCHORS.get(extra)
+    if got is not None:
+        return got
+    return (extra.replace("-", "_"),)
+
+
+def extras_anchors_for(extras: list[str]) -> list[str]:
+    seen: dict[str, None] = {}
+    for extra in extras:
+        for anchor in _anchors_for_extra(extra):
+            seen[anchor] = None
+    return sorted(seen)
+
+
+def _extras_probe_code(anchors: list[str]) -> str:
+    import json as _json
+
+    return (
+        "import importlib.util, json\n"
+        f"_anchors={_json.dumps(anchors)}\n"
+        "_result={}\n"
+        "for _a in _anchors:\n"
+        " try:\n"
+        "  _result[_a]=importlib.util.find_spec(_a) is not None\n"
+        " except (ImportError, ValueError):\n"
+        "  _result[_a]=False\n"
+        "print(json.dumps(_result))"
+    )
+
+
+def verify_candidate_web_dist(host: Host, config: CutoverConfig) -> None:
+    """Require a prebuilt source-ignored web dist (dashboard --skip-build).
+
+    Fail-closed pre-mutation: index.html + hermes-build.json (product web)
+    must exist, be non-fake, and be git-ignored (source product, never
+    committed). Built fresh via npm scripts (scripts/build/web.mjs), not
+    hand-crafted.
+    """
+    candidate = Path(config.candidate_src).absolute()
+    dist = candidate / "hermes_cli" / "web_dist"
+    index = dist / "index.html"
+    receipt = dist / "hermes-build.json"
+    try:
+        index_bytes = host.read_bytes(index)
+    except OSError as exc:
+        raise StageError(f"candidate web dist missing index.html: {exc}") from exc
+    if len(index_bytes) < 100:
+        raise StageError("candidate web dist index.html too small (fake artifact?)")
+    text = index_bytes.decode("utf-8", "replace")
+    if "<" not in text or "fake" in text.lower() and len(text) < 500:
+        raise StageError("candidate web dist index.html looks fake (refusing)")
+    try:
+        receipt_bytes = host.read_bytes(receipt)
+    except OSError as exc:
+        raise StageError(f"candidate web dist missing hermes-build.json: {exc}") from exc
+    try:
+        import json as _json
+
+        payload = _json.loads(receipt_bytes.decode("utf-8", "replace"))
+    except ValueError as exc:
+        raise StageError(f"candidate web receipt is not JSON: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("product") != "web":
+        raise StageError("candidate web receipt is not a web product (fake?)")
+    if payload.get("schema") != 1:
+        raise StageError("candidate web receipt schema mismatch (stale build?)")
+    # Source must exist (npm build inputs), dist must be ignored (product).
+    try:
+        host.read_bytes(candidate / "web" / "package.json")
+    except OSError as exc:
+        raise StageError(f"candidate web source missing: {exc}") from exc
+    ignored = host.run(
+        ["git", "-C", str(candidate), "check-ignore", "-q", str(index)],
+        timeout=30,
+    )
+    if ignored.returncode != 0:
+        raise StageError("candidate web dist is not git-ignored (must be a built product)")
+    append(
+        host, config.journal_path, "web-dist-ok", True,
+        {"dist": str(dist), "index_bytes": len(index_bytes)},
+    )
+
+
+def verify_staged_extras(
+    host: Host, config: CutoverConfig, staged: Staged,
+    extras: list[str], all_extras: bool,
+) -> None:
+    """Prove the staged venv carries the LIVE selection (telegram/web/etc).
+
+    find_spec only (no import side effects, no network), isolated home,
+    cwd=candidate. Empty selection (legacy tests) is a no-op; production
+    always names extras. Pre-mutation failure (no rollback needed).
+    """
+    anchors = extras_anchors_for(extras)
+    if all_extras:
+        anchors = sorted(set(anchors) | {"fastapi"})
+    if not anchors:
+        return
+    code = _extras_probe_code(anchors)
+    env = _isolated_env(config)
+    if env.get("HERMES_HOME") == str(config.hermes_home):
+        raise StageError("extras probe HERMES_HOME must be isolated")
+    argv = [str(staged.venv_python), "-I", "-B", "-c", code]
+    wrapped = _wrap_for_user(argv, env)
+    try:
+        res = host.run(
+            wrapped, timeout=60,
+            cwd=Path(config.candidate_src).absolute(), env=env,
+        )
+    except (OSError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as exc:
+        raise StageError(f"staged extras probe transport failed: {exc}") from exc
+    if res.returncode != 0:
+        raise StageError(f"staged extras probe failed: {(res.stderr or '')[-500:]}")
+    try:
+        import json as _json
+
+        payload = _json.loads((res.stdout or "").strip().splitlines()[-1])
+    except Exception as exc:
+        raise StageError(f"staged extras probe unparseable: {exc}") from exc
+    missing = [a for a in anchors if not payload.get(a)]
+    if missing:
+        raise StageError(f"staged venv missing extras anchors {missing} (built core-only?)")
+    append(
+        host, config.journal_path, "extras-ok", True,
+        {"extras": sorted(set(extras)), "all_extras": all_extras, "anchors": anchors},
+    )
+
+
+def verify_candidate_help(host: Host, config: CutoverConfig, staged: Staged) -> None:
+    """Prove the staged venv boots the REAL candidate CLI (--help, isolated).
+
+    Catches missing platform deps / native plugins that prepare_launch alone
+    misses. No live outbound (--help only), isolated home, cwd=candidate.
+    """
+    env = _isolated_env(config)
+    if env.get("HERMES_HOME") == str(config.hermes_home):
+        raise StageError("help probe HERMES_HOME must be isolated")
+    argv = [
+        str(staged.venv_python), "-I", "-B",
+        f"{Path(config.candidate_src).absolute()}/hermes_cli/main.py", "--help",
+    ]
+    wrapped = _wrap_for_user(argv, env)
+    try:
+        res = host.run(
+            wrapped, timeout=60,
+            cwd=Path(config.candidate_src).absolute(), env=env,
+        )
+    except (OSError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as exc:
+        raise StageError(f"candidate --help transport failed: {exc}") from exc
+    if res.returncode != 0:
+        raise StageError(f"candidate --help failed: {(res.stderr or '')[-500:]}")
+    append(
+        host, config.journal_path, "help-ok", True,
+        {"venv_python": str(staged.venv_python)},
     )
 
 

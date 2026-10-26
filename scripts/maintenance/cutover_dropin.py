@@ -37,6 +37,10 @@ def render_gateway_dropin(config: CutoverConfig, staged: Staged) -> str:
     hermes_home = str(config.hermes_home)
     return (
         "[Service]\n"
+        # Reset BEFORE assign: base Type=simple already has ExecStart, and
+        # systemd rejects multiple ExecStart lines without a preceding empty
+        # reset (verified: `more than one ExecStart` + bad-setting refuse).
+        "ExecStart=\n"
         f"ExecStart={staged.venv_python} {config.candidate_src}/hermes_cli/main.py gateway run\n"
         f"WorkingDirectory={hermes_home}\n"
         f'Environment="PATH={_path_for(staged_bin)}"\n'
@@ -49,6 +53,8 @@ def render_dashboard_dropin(config: CutoverConfig, staged: Staged) -> str:
     hermes_home = str(config.hermes_home)
     return (
         "[Service]\n"
+        # Same reset: dashboard base is also Type=simple with ExecStart.
+        "ExecStart=\n"
         f"ExecStart={staged.venv_python} {config.candidate_src}/hermes_cli/main.py "
         f"dashboard --port {config.dashboard_port} --host 127.0.0.1 --no-open --skip-build\n"
         "WorkingDirectory=/home/ubuntu\n"
@@ -79,6 +85,8 @@ def write_candidate_dropins(
             raise RuntimeError("dropin must not rely on HERMES_EXE")
         if "ExecStart=" not in body or "WorkingDirectory=" not in body or "PATH=" not in body:
             raise RuntimeError("dropin must bind ExecStart + WorkingDirectory + explicit PATH")
+        if "ExecStart=\nExecStart=" not in body:
+            raise RuntimeError("dropin must reset ExecStart before assigning (Type=simple)")
         if str(staged.venv_python) not in body:
             raise RuntimeError("dropin ExecStart must name the staged venv python")
         host.write_bytes(target, body.encode("utf-8"))

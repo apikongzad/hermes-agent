@@ -202,18 +202,37 @@ def _seed_success_host(host: FakeHost, config: CutoverConfig) -> Path:
     state = {"restarted": False}
 
     def _show_gw(argv: list[str]) -> RunResult:
-        pid = new_gw if state["restarted"] else gw_pid
-        return RunResult(0, f"MainPID={pid}\nActiveEnterTimestamp=2026-10-25 12:00:00\nNRestarts=0", "")
+        if state["restarted"]:
+            return RunResult(0, f"MainPID={new_gw}\nActiveEnterTimestamp=2026-10-25 12:05:00\nNRestarts=0", "")
+        return RunResult(0, f"MainPID={gw_pid}\nActiveEnterTimestamp=2026-10-25 12:00:00\nNRestarts=0", "")
 
     def _show_dash(argv: list[str]) -> RunResult:
-        pid = new_dash if state["restarted"] else dash_pid
-        return RunResult(0, f"MainPID={pid}\nActiveEnterTimestamp=2026-10-25 12:00:01\nNRestarts=0", "")
+        if state["restarted"]:
+            return RunResult(0, f"MainPID={new_dash}\nActiveEnterTimestamp=2026-10-25 12:05:01\nNRestarts=0", "")
+        return RunResult(0, f"MainPID={dash_pid}\nActiveEnterTimestamp=2026-10-25 12:00:01\nNRestarts=0", "")
 
     host.on_run("systemctl show hermes-gateway", _show_gw)
     host.on_run("systemctl show hermes-dashboard", _show_dash)
 
+    # Candidate web dist (dashboard --skip-build): prebuilt source-ignored product.
+    candidate = config.candidate_src
+    dist = candidate / "hermes_cli" / "web_dist"
+    host.files[str(dist / "index.html")] = (
+        b"<!doctype html><html><head></head><body>"
+        b"<div id=\"root\"></div><script src=\"assets/index.js\"></script>"
+        b"</body></html>" + b"<!-- pad -->" * 20
+    )
+    host.files[str(dist / "hermes-build.json")] = json.dumps(
+        {"schema": 1, "product": "web", "platform": "linux", "arch": "x64",
+         "node": "24.0.0", "inputs": {}, "outputHash": "abc"}
+    ).encode()
+    host.files[str(candidate / "web" / "package.json")] = b'{"name": "web"}'
+
     def _git_head(argv: list[str]) -> RunResult:
         text = " ".join(argv)
+        if "check-ignore" in text:
+            # web dist is a git-ignored built product.
+            return RunResult(0, "", "")
         if str(config.live_tree) in text:
             return RunResult(0, PARENT_SHA, "")
         if str(config.candidate_src) in text:
@@ -248,7 +267,13 @@ def _seed_success_host(host: FakeHost, config: CutoverConfig) -> Path:
                     "relaunch_error": None,
                 }
                 return RunResult(0, json.dumps(payload), "")
+            if "importlib.util" in blob and "find_spec" in blob:
+                # Staged extras anchor inventory (find_spec only, no import).
+                return RunResult(0, json.dumps({"fastapi": True, "telegram": True, "discord": True, "slack_bolt": True, "googleapiclient": True, "mcp": True, "acp": True, "aiohttp": True, "youtube_transcript_api": True}), "")
             return RunResult(1, "", "probe must use real Hermes launch prep")
+        # Candidate --help (isolated, no outbound): proves CLI + plugins load.
+        if str(venv_python) in argv and "--help" in argv:
+            return RunResult(0, "usage: hermes", "")
         return RunResult(0, "", "")
 
     host.on_run(str(venv_python), _staged_probe)
@@ -454,6 +479,8 @@ def test_dropin_binds_execstart_workdir_path_and_sorts_after_runtime(tmp_path: P
         text = body.decode()
         assert "HERMES_EXE" not in text
         assert "ExecStart=" in text and str(venv_python) in text
+        # Type=simple reset: empty ExecStart= must precede the assignment.
+        assert "ExecStart=\nExecStart=" in text
         assert "WorkingDirectory=" in text
         assert "PATH=" in text and "venv/bin" in text
 
@@ -470,25 +497,40 @@ def test_restore_order_is_source_facts_dropins_reload_restart_verify(tmp_path: P
     live_marker = str(config.live_tree)
     first_http = next(i for i, e in enumerate(order) if e.startswith("http:"))
     tail = order[first_http + 1 :]
+    # Rollback starts at the first source restore AFTER polling began.
+    # Polling retries (http/sleep/show) sit between first_http and rollback;
+    # verify is the rollback liveness http AFTER restart, not a polling retry.
     positions: dict[str, int] = {}
     for offset, entry in enumerate(tail):
         index = first_http + 1 + offset
         if "git -C" in entry and live_marker in entry and "source" not in positions:
             positions["source"] = index
-        if entry.startswith("write:") and "installs" in entry and "facts" not in positions:
-            # Selection facts restore (installs/<key>/facts.json), not tools/facts.json.
-            positions["facts"] = index
-        if entry.startswith("remove:") and "zzz-candidate" in entry and "dropins" not in positions:
-            positions["dropins"] = index
-        if "systemctl daemon-reload" in entry and "reload" not in positions:
-            positions["reload"] = index
-        if "systemctl restart" in entry and "restart" not in positions:
-            positions["restart"] = index
-        if entry.startswith("http:") and "verify" not in positions:
-            positions["verify"] = index
-    assert set(positions) == {"source", "facts", "dropins", "reload", "restart", "verify"}
-    assert positions["source"] < positions["facts"] < positions["dropins"]
-    assert positions["dropins"] < positions["reload"] < positions["restart"] < positions["verify"]
+    assert "source" in positions
+    rollback_tail = order[positions["source"] :]
+    base = positions["source"]
+    rpos: dict[str, int] = {"source": base}
+    for offset, entry in enumerate(rollback_tail):
+        index = base + offset
+        if entry.startswith("write:") and "installs" in entry and "facts" not in rpos:
+            rpos["facts"] = index
+        if entry.startswith("remove:") and "zzz-candidate" in entry and "dropins" not in rpos:
+            rpos["dropins"] = index
+        if "systemctl daemon-reload" in entry and "reload" not in rpos:
+            rpos["reload"] = index
+        if "systemctl restart" in entry and "restart" not in rpos:
+            rpos["restart"] = index
+    # Verify is the first http AFTER the rollback restart (liveness probe).
+    assert set(rpos) == {"source", "facts", "dropins", "reload", "restart"}
+    after_restart = order[rpos["restart"] + 1 :]
+    verify_idx = next(
+        (rpos["restart"] + 1 + i for i, e in enumerate(after_restart) if e.startswith("http:")),
+        None,
+    )
+    assert verify_idx is not None
+    rpos["verify"] = verify_idx
+    assert set(rpos) == {"source", "facts", "dropins", "reload", "restart", "verify"}
+    assert rpos["source"] < rpos["facts"] < rpos["dropins"]
+    assert rpos["dropins"] < rpos["reload"] < rpos["restart"] < rpos["verify"]
 
 
 def test_start_health_failure_triggers_rollback_not_success(tmp_path: Path) -> None:
@@ -1095,3 +1137,230 @@ def test_actual_cli_resume_subprocess_no_snapshot_is_unknown(tmp_path: Path) -> 
     )
     assert done.returncode != 0
     assert "unknown" in ((done.stdout or "") + (done.stderr or ""))
+
+
+def test_dropin_execstart_reset_verified_by_systemd_analyze(tmp_path: Path) -> None:
+    """Actual systemd-analyze verify: reset dropin passes, missing reset is refused.
+
+    Renders BOTH gateway/dashboard via the ACTUAL renderers into a temp
+    base+override fixture (Type=simple with ExecStart). Catches the
+    multiple-ExecStart refuse, not just a string assert.
+    """
+    import shutil as _shutil
+
+    if _shutil.which("systemd-analyze") is None:
+        import pytest as _pytest
+
+        _pytest.skip("systemd-analyze not available")
+    from scripts.maintenance.cutover_dropin import (
+        render_dashboard_dropin,
+        render_gateway_dropin,
+    )
+    from scripts.maintenance.cutover_types import Staged
+
+    config = _make_config(tmp_path)
+    fake_python = tmp_path / "fake-python"
+    fake_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_python.chmod(0o755)
+    staged = Staged(
+        generation_dir=tmp_path / "gen",
+        venv_dir=tmp_path / "venv",
+        venv_python=fake_python,
+        store_home=Path("/opt/store"),
+        store_exe=Path("/opt/store/python3.14"),
+    )
+    # Fix Staged venv_dir/bin for PATH rendering (not executed).
+    object.__setattr__(staged, "venv_dir", tmp_path / "venv")
+
+    def _verify_unit(base_text: str, dropin_text: str) -> tuple[int, str]:
+        unit_dir = tmp_path / f"verify-{abs(hash(dropin_text)) % 100000}"
+        unit_dir.mkdir(exist_ok=True)
+        base = unit_dir / "verifycut.service"
+        base.write_text(base_text, encoding="utf-8")
+        dropin_dir = unit_dir / "verifycut.service.d"
+        dropin_dir.mkdir(exist_ok=True)
+        (dropin_dir / "zzz-candidate.conf").write_text(dropin_text, encoding="utf-8")
+        done = subprocess.run(
+            ["systemd-analyze", "verify", str(base)],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        return done.returncode, (done.stdout or "") + (done.stderr or "")
+
+    base_simple = (
+        "[Unit]\nDescription=verify\n"
+        "[Service]\nType=simple\nExecStart=/usr/bin/sleep infinity\n"
+        "WorkingDirectory=/tmp\n"
+        "[Install]\nWantedBy=multi-user.target\n"
+    )
+    for render in (render_gateway_dropin, render_dashboard_dropin):
+        good = render(config, staged)
+        assert "ExecStart=\nExecStart=" in good
+        # Good uses a fake python that exists but is not the real sleep;
+        # point ExecStart at real binaries for verify (keep the reset shape).
+        good_real = good.replace(str(fake_python), "/usr/bin/python3")
+        _rc, out = _verify_unit(base_simple, good_real)
+        own = [ln for ln in out.splitlines() if "verifycut" in ln]
+        assert not any("more than one ExecStart" in ln for ln in own), "".join(own[:5])
+        assert not any("bad unit file setting" in ln.lower() for ln in own), "".join(own[:5])
+        broken = good_real.replace("ExecStart=\nExecStart=", "ExecStart=")
+        assert "ExecStart=\nExecStart=" not in broken
+        rc_b, out_b = _verify_unit(base_simple, broken)
+        assert rc_b != 0
+        assert "more than one ExecStart" in out_b
+
+
+def test_wait_for_health_polls_through_transient_9119(tmp_path: Path) -> None:
+    """Bounded poll: transient 9119/state lag after restart still succeeds stable."""
+    from scripts.maintenance.cutover_health import wait_for_health
+
+    config = _make_config(tmp_path)
+    host = FakeHost()
+    _seed_success_host(host, config)
+    # Simulate Type=simple early return: first 2 health polls see 500/stale,
+    # then the fleet is ready. wait_for_health must poll, not fail fast.
+    calls = {"n": 0}
+    orig_http = dict(host.http)
+
+    def _flaky_http(url: str, timeout: int = 10) -> tuple[int, str]:
+        calls["n"] += 1
+        host.timeline.append(("http", url))
+        if calls["n"] <= 2:
+            return (500, "not ready yet")
+        return orig_http[url]
+
+    host.http_get = _flaky_http  # type: ignore[method-assign]
+    from scripts.maintenance.cutover_orchestrate import orchestrate as _orch
+
+    # Drive via orchestrate to prove end-to-end polling + stability + rollback
+    # preservation (no weakening: SHA/exe still bound on every attempt).
+    result = _orch(host, config)
+    assert result.status == "success"
+    assert calls["n"] >= 3
+    # Stability: polling happened (sleep between attempts) and PIDs stayed.
+    assert any(k == "run" and "sleep" in d for k, d in host.timeline)
+
+
+def test_wait_for_health_rejects_crash_loop_counter(tmp_path: Path) -> None:
+    """Restart stability: NRestarts change after restart is a crash loop, never success."""
+    from scripts.maintenance.cutover_health import wait_for_health
+    from scripts.maintenance.cutover_stage import stage
+
+    config = _make_config(tmp_path)
+    host = FakeHost()
+    _seed_success_host(host, config)
+    # Preflight FIRST on the healthy old fleet (baseline NRestarts=0).
+    from scripts.maintenance.cutover_preflight import preflight as _pre
+
+    baseline = _pre(host, config)
+    # Crash loop: after restart NRestarts flips 0 -> 1 (no weakening to PID-only).
+    # Override show AFTER baseline so preflight still sees the old fleet.
+    host.run_handlers = [h for h in host.run_handlers if "systemctl show" not in h[0]]
+    host.on_run(
+        "systemctl show hermes-gateway",
+        RunResult(0, "MainPID=4342\nActiveEnterTimestamp=2026-10-25 12:05:00\nNRestarts=1", ""),
+    )
+    host.on_run(
+        "systemctl show hermes-dashboard",
+        RunResult(0, "MainPID=4343\nActiveEnterTimestamp=2026-10-25 12:05:01\nNRestarts=0", ""),
+    )
+    # Seed new-fleet proc bindings so the test isolates the counter gate.
+    host.exes[4342] = "/opt/store/python/bin/python3.14"
+    host.exes[4343] = "/opt/store/python/bin/python3.14"
+    host.start_times[4342] = 200
+    host.start_times[4343] = 200
+    staged = stage(host, config, baseline)
+    report = wait_for_health(host, config, staged, baseline, timeout_s=6, interval_s=2)
+    assert not report.ok
+    assert "NRestarts" in report.detail
+
+
+def test_stage_carries_live_selection_extras_not_core_only(tmp_path: Path) -> None:
+    """Runtime extras: stage mirrors baseline facts (web/telegram), never core-only."""
+    import json as _json
+
+    from scripts.maintenance.cutover_stage import (
+        extras_anchors_for,
+        selected_extras_from_facts,
+        stage_argv,
+        verify_staged_extras,
+    )
+
+    config = _make_config(tmp_path)
+    facts = _json.dumps(
+        {"packages": {"venv": {"stamp": "x", "extras": ["web", "telegram"], "environment": "y"}}}
+    ).encode()
+    extras, use_all = selected_extras_from_facts(facts)
+    assert extras == ["telegram", "web"] and not use_all
+    argv = stage_argv(config, extras, use_all)
+    assert "--extra" in argv and "web" in argv and "telegram" in argv
+    assert "pm.build_env" in " ".join(argv)
+    # all-meta maps to --all-extras + remaining extras.
+    facts_all = _json.dumps(
+        {"packages": {"venv": {"stamp": "x", "extras": ["all", "telegram"], "environment": "y"}}}
+    ).encode()
+    extras2, use_all2 = selected_extras_from_facts(facts_all)
+    assert use_all2 and extras2 == ["telegram"]
+    assert "--all-extras" in stage_argv(config, extras2, use_all2)
+    # Anchors cover messaging/telegram platform deps (no live outbound).
+    anchors = extras_anchors_for(["telegram", "web"])
+    assert "telegram" in anchors and "fastapi" in anchors
+    # Staged probe proves the venv carries them (FakeHost seeded true).
+    host = FakeHost()
+    venv_python = _seed_success_host(host, config)
+    from scripts.maintenance.cutover_types import Staged as _Staged
+
+    staged = _Staged(
+        generation_dir=config.generation_root / "gen-aaaaaaaaaaaa",
+        venv_dir=config.generation_root / "gen-aaaaaaaaaaaa" / "venv",
+        venv_python=venv_python,
+        store_home=Path("/opt/store/python/bin"),
+        store_exe=Path("/opt/store/python/bin/python3.14"),
+    )
+    verify_staged_extras(host, config, staged, ["web", "telegram"], False)
+    # Core-only build would miss them: empty anchors pass, but a strict
+    # missing-anchor payload must fail (proves the gate is real).
+    def _missing_probe(argv: list[str]) -> RunResult:
+        if str(venv_python) in argv and "-c" in argv and "find_spec" in " ".join(argv):
+            return RunResult(0, _json.dumps({"fastapi": False, "telegram": False}), "")
+        return RunResult(0, "", "")
+
+    host2 = FakeHost()
+    _seed_success_host(host2, config)
+    host2.run_handlers = [h for h in host2.run_handlers if str(venv_python) not in h[0]]
+    host2.on_run(str(venv_python), _missing_probe)
+    try:
+        verify_staged_extras(host2, config, staged, ["web", "telegram"], False)
+        gate_real = False
+    except Exception:
+        gate_real = True
+    assert gate_real
+
+
+def test_candidate_web_dist_rejects_fake_and_requires_ignored(tmp_path: Path) -> None:
+    """Dashboard --skip-build: dist must be prebuilt, receipted, ignored, not fake."""
+    from scripts.maintenance.cutover_stage import verify_candidate_web_dist
+
+    config = _make_config(tmp_path)
+    host = FakeHost()
+    _seed_success_host(host, config)
+    # Seeded good dist passes.
+    verify_candidate_web_dist(host, config)
+    # Fake (tiny) index is refused.
+    candidate = config.candidate_src
+    host.files[str(candidate / "hermes_cli" / "web_dist" / "index.html")] = b"fake"
+    try:
+        verify_candidate_web_dist(host, config)
+        fake_ok = True
+    except Exception:
+        fake_ok = False
+    assert not fake_ok
+    # Missing receipt is refused (no fake artifacts).
+    host2 = FakeHost()
+    _seed_success_host(host2, config)
+    host2.files.pop(str(candidate / "hermes_cli" / "web_dist" / "hermes-build.json"), None)
+    try:
+        verify_candidate_web_dist(host2, config)
+        receipt_ok = True
+    except Exception:
+        receipt_ok = False
+    assert not receipt_ok

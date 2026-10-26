@@ -13,7 +13,7 @@ from __future__ import annotations
 import subprocess
 
 from scripts.maintenance.cutover_dropin import write_candidate_dropins
-from scripts.maintenance.cutover_health import check_health
+from scripts.maintenance.cutover_health import wait_for_health
 from scripts.maintenance.cutover_journal import append, has_terminal_receipt
 from scripts.maintenance.cutover_manifest import assert_no_candidate_import
 from scripts.maintenance.cutover_preflight import PreflightError, preflight
@@ -25,8 +25,12 @@ from scripts.maintenance.cutover_snapshot import (
 )
 from scripts.maintenance.cutover_stage import (
     StageError,
+    selected_extras_from_facts,
     stage,
+    verify_candidate_help,
+    verify_candidate_web_dist,
     verify_isolated_launch,
+    verify_staged_extras,
 )
 from scripts.maintenance.cutover_types import Baseline, CutoverConfig, CutoverResult, Host
 
@@ -115,7 +119,7 @@ def orchestrate(host: Host, config: CutoverConfig) -> CutoverResult:
     )
 
     try:
-        staged = stage(host, config)
+        staged = stage(host, config, baseline)
     except (StageError, OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         return _fail_no_rollback(host, config, "staging", str(exc))
 
@@ -123,6 +127,22 @@ def orchestrate(host: Host, config: CutoverConfig) -> CutoverResult:
         verify_isolated_launch(host, config, staged, baseline.live_main_exe)
     except (StageError, OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         return _fail_no_rollback(host, config, "launch verify", str(exc))
+
+    try:
+        verify_candidate_web_dist(host, config)
+    except (StageError, OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        return _fail_no_rollback(host, config, "web dist", str(exc))
+
+    try:
+        extras, use_all = selected_extras_from_facts(baseline.facts_bytes)
+        verify_staged_extras(host, config, staged, extras, use_all)
+    except (StageError, OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        return _fail_no_rollback(host, config, "extras verify", str(exc))
+
+    try:
+        verify_candidate_help(host, config, staged)
+    except (StageError, OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        return _fail_no_rollback(host, config, "help verify", str(exc))
 
     live_mutated = False
     try:
@@ -159,7 +179,10 @@ def orchestrate(host: Host, config: CutoverConfig) -> CutoverResult:
             )
 
         try:
-            report = check_health(host, config, staged, baseline)
+            # Bounded readiness poll: Type=simple restart returns before the
+            # new fleet stamps state + serves /api/health. SHA/exe stay bound
+            # on every attempt; failure still triggers automatic rollback.
+            report = wait_for_health(host, config, staged, baseline)
         except _TIMEOUT_TYPES as exc:
             return _fail_with_rollback(
                 host, config, baseline, "health", f"{type(exc).__name__}: {exc}"[-300:]

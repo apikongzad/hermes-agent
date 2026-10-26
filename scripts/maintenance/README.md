@@ -65,15 +65,26 @@ absolute `/usr/bin/python3`, isolated `HOME/HERMES_HOME/HERMES_RUNTIME_DIR`,
 sudo runuser -u ubuntu -- env -i HOME=<gen>/probe-home-<sha12> HERMES_HOME=<gen>/probe-home-<sha12> \
   HERMES_RUNTIME_DIR=/home/ubuntu/.hermes/tools PATH=/usr/bin:/bin \
   /usr/bin/python3 -m pm.build_env \
-  --source /opt/candidate/hermes-agent --out /home/ubuntu/.hermes/generations/gen-<sha12>/venv
+  --source /opt/candidate/hermes-agent --out /home/ubuntu/.hermes/generations/gen-<sha12>/venv \
+  --extra web --extra telegram  # LIVE selection from baseline facts, never core-only
 ```
 
 That CLI wraps `pm.build_environment(source, out)` (`pm/build_env.py`,
 `pm/operations.py:28-65`; `cwd=source` for `uv sync`). Tests assert
 `pm.build_env` + `--source` appear and reject `pm.py` /
-`scripts/sync_venv.py` / `scripts/publish_launcher.py`. The snapshot
+`scripts/sync_venv.py` / `scripts/publish_launcher.py`. The build mirrors
+the LIVE `installs/<key>/facts.json` extras (secret-free `venv.extras`;
+`all` → `--all-extras`); core-only would drop messaging/telegram. Staged
+anchors are proven via `find_spec` in the staged venv (isolated, no import
+side effects) plus `<staged>/bin/python …/main.py --help` (real CLI +
+native plugins, no outbound). The snapshot
 `<journal>.baseline.json` (root-owned `0600`, fsynced) is persisted BEFORE
 `stage()`; `resume` uses ONLY that snapshot, never a live recapture.
+
+Dashboard `--skip-build` requires a prebuilt source-ignored web dist:
+`candidate/hermes_cli/web_dist/index.html` + `hermes-build.json`
+(`product: web`, `schema: 1`, built via `scripts/build/web.mjs`, git-ignored).
+Missing/fake/stale dist fails closed pre-mutation (no rollback needed).
 
 Re-exec verify uses REAL Hermes launch prep (not `sys.executable`):
 
@@ -91,6 +102,7 @@ Re-exec verify uses REAL Hermes launch prep (not `sys.executable`):
 ```ini
 # /etc/systemd/system/hermes-gateway.service.d/zzz-candidate.conf
 [Service]
+ExecStart=
 ExecStart=<generation>/venv/bin/python3 <candidate_src>/hermes_cli/main.py gateway run
 WorkingDirectory=/home/ubuntu/.hermes
 Environment="PATH=<generation>/venv/bin:/home/ubuntu/.local/bin:/opt/node24/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -100,18 +112,24 @@ Environment="HERMES_HOME=/home/ubuntu/.hermes"
 ```ini
 # /etc/systemd/system/hermes-dashboard.service.d/zzz-candidate.conf
 [Service]
+ExecStart=
 ExecStart=<generation>/venv/bin/python3 <candidate_src>/hermes_cli/main.py dashboard --port 9119 --host 127.0.0.1 --no-open --skip-build
 WorkingDirectory=/home/ubuntu
 Environment="PATH=<generation>/venv/bin:/home/ubuntu/.local/bin:/opt/node24/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="HERMES_HOME=/home/ubuntu/.hermes"
 ```
 
+The empty `ExecStart=` reset is load-bearing: both bases are `Type=simple`
+with an existing `ExecStart`, and systemd refuses a second assignment
+without it (`more than one ExecStart` + bad-setting).
+
 `HERMES_EXE` never selects the interpreter. Prior bytes saved; rollback
 restores them.
 
-## Health (read-only, BOTH units + state + /api/health)
+## Health (read-only, BOTH units + state + /api/health, bounded poll)
 
-- `is-active` both; `MainPID>0` both; PIDs differ from baseline (restart proof).
+- `is-active` both; `MainPID>0` both; PIDs/start_times/ActiveEnter differ
+  from baseline (restart proof); NRestarts equals baseline (no crash loop).
 - `/proc/PID/exe` EXACTLY equals staged `pyvenv.cfg:home/executable`
   (resolved), NOT a substring of the generation.
 - `/proc/PID/cmdline[0]` exactly equals staged venv python.
@@ -120,6 +138,11 @@ restores them.
   `updated_at` fresh ≤120s, `pid==gateway MainPID`.
 - `GET http://127.0.0.1:9119/api/health` must be 200 with `commit==candidate`
   (`/health` 302 is SPA, not health). Port always 9119. No `--version`, no sends.
+- `Type=simple` returns before readiness: orchestrate polls via
+  `wait_for_health` (bounded 120s, `sleep` via Host so FakeHost stays fast)
+  with one stability re-read (PID/start/counter unchanged, no flap).
+  SHA/exe stay bound on every attempt (no weakening); transport exceptions
+  retry until the bound, then fail for automatic rollback.
 
 ## Rollback (provenance-bound, mandated order)
 

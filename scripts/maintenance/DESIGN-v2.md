@@ -341,3 +341,33 @@ after restart before receipt (new PIDs + candidate state but no receipt):
 facts bytes + healthy old fleet (`is-active` both, old exes), never the
 candidate. Fullsuite `update_lock` 2 failures remain documented flaky
 (isolated pass, load-induced); no fullsuite rerun in this slice.
+
+## 10. Readiness + runtime-extras amendment (v2.2, operator-gated restart)
+
+Parent findings on the staged `gen-ba1e19` candidate (core-only, immediate
+health, missing reset):
+
+- C1 Dropins missed the `ExecStart=` reset. Both bases are `Type=simple`
+  with an existing `ExecStart`; a dropin with only `ExecStart=<new>` is
+  refused (`more than one ExecStart`, bad-setting). Fix: both renders emit
+  `ExecStart=` (empty reset) then `ExecStart=<new>`; `write_candidate_dropins`
+  refuses without the reset shape; `systemd-analyze verify` on a temp
+  base+override fixture proves the refuse (broken) vs pass (fixed).
+- C2 `Type=simple` restart returns before readiness (state stamp +
+  `/api/health` lag). Fix: `wait_for_health` polls bounded 120s
+  (`sleep` via Host, attempt-count bound so FakeHost stays fast) with
+  restart proof PID/start/ActiveEnter differ + NRestarts equal (no crash
+  loop) and one stability re-read (no flap). SHA/exe stay exact on every
+  attempt; transport exceptions retry until the bound, then fail for
+  automatic rollback. Fatal config (port, HEAD) fails fast.
+- C3 Staging built core-only (`pm.build_env` without extras) while live
+  carries messaging/telegram + `web` (dashboard). Fix: `stage` mirrors the
+  LIVE `installs/<key>/facts.json` extras (secret-free `venv.extras`;
+  `all` → `--all-extras`), journals them, proves them via staged
+  `find_spec` (no import side effects, isolated, no outbound) plus
+  `<staged>/bin/python …/main.py --help` (real CLI + native plugins).
+  Dashboard `--skip-build` needs a prebuilt source-ignored
+  `hermes_cli/web_dist` (`index.html` + `hermes-build.json` product web,
+  `git check-ignore` proves product, `web/package.json` proves npm-built,
+  no fake artifacts). All three are pre-mutation (fail `failed`, fleet
+  untouched); only dropin/reload/restart/health route to rollback.
