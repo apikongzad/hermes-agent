@@ -97,6 +97,20 @@ def _fail_no_rollback(
     )
 
 
+def _extras_for_orchestrate(baseline: Baseline) -> tuple[list[str], bool]:
+    """Extras for verify: facts win, else prior receipt stage-ok."""
+    if baseline.facts_bytes:
+        return selected_extras_from_facts(baseline.facts_bytes)
+    if str(getattr(baseline, "prior_generation", "") or "") not in ("", "."):
+        # Receipt migration: facts empty by design, extras from prior stage-ok.
+        extras = sorted(set(str(x) for x in (baseline.prior_extras or ())))
+        use_all = bool(baseline.prior_all_extras)
+        if not extras and not use_all:
+            raise StageError("prior receipt carries no extras (refusing core-only)")
+        return extras, use_all
+    return ([], False)
+
+
 def orchestrate(host: Host, config: CutoverConfig) -> CutoverResult:
     try:
         assert_no_candidate_import(config.candidate_src)
@@ -137,7 +151,7 @@ def orchestrate(host: Host, config: CutoverConfig) -> CutoverResult:
         return _fail_no_rollback(host, config, "web dist", str(exc))
 
     try:
-        extras, use_all = selected_extras_from_facts(baseline.facts_bytes)
+        extras, use_all = _extras_for_orchestrate(baseline)
         verify_staged_extras(host, config, staged, extras, use_all)
     except (StageError, OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         return _fail_no_rollback(host, config, "extras verify", str(exc))

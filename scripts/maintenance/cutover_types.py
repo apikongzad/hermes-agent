@@ -61,6 +61,10 @@ class Host:
     def proc_start_time(self, pid: int) -> int | None:
         raise NotImplementedError
 
+    def stat_file(self, path: Path) -> FileStat:
+        """lstat without following symlinks (receipt owner/mode/type bind)."""
+        raise NotImplementedError
+
     def http_get(self, url: str, timeout: int = 10) -> tuple[int, str]:
         raise NotImplementedError
 
@@ -163,10 +167,38 @@ class ProductionHost(Host):
         except (OSError, ValueError, IndexError):
             return None
 
+    def stat_file(self, path: Path) -> FileStat:
+        import stat as _stat
+
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            raise
+        except OSError:
+            raise
+        return FileStat(
+            uid=int(st.st_uid),
+            gid=int(st.st_gid),
+            mode=int(st.st_mode),
+            is_symlink=_stat.S_ISLNK(st.st_mode),
+            is_file=_stat.S_ISREG(st.st_mode),
+        )
+
     def http_get(self, url: str, timeout: int = 10) -> tuple[int, str]:
         with urllib.request.urlopen(url, timeout=timeout) as response:
             body = response.read(65536).decode("utf-8", "replace")
             return int(response.status), body
+
+
+@dataclass(frozen=True)
+class FileStat:
+    """lstat result for root-authorized receipt binding (no follow)."""
+
+    uid: int
+    gid: int
+    mode: int
+    is_symlink: bool
+    is_file: bool
 
 
 @dataclass(frozen=True)
@@ -187,6 +219,7 @@ class CutoverConfig:
     candidate_dropin_name: str = "zzz-candidate.conf"
     dashboard_port: int = 9119
     controller_path: Path | None = None
+    baseline_receipt: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -215,6 +248,15 @@ class Baseline:
     facts_bytes: bytes = b""
     selection_facts_path: Path = Path("")
     gateway_state_path: Path = Path("")
+    # Second-cutover migration: prior activation receipt (first cutover) that
+    # proves the running fleet is the parent side-generation. Empty when the
+    # generic facts path is used (first cutover / normal operation).
+    prior_receipt_path: Path = Path("")
+    prior_generation: Path = Path("")
+    prior_venv_python: Path = Path("")
+    prior_home: str = ""
+    prior_extras: tuple[str, ...] = ()
+    prior_all_extras: bool = False
 
 
 @dataclass(frozen=True)

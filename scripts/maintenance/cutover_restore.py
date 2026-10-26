@@ -3,6 +3,12 @@
 DESIGN v2: provenance-bound (baseline must name parent/candidate SHAs),
 restores the REAL selection facts (installs/<key>/facts.json), never
 start-before-restore, every error journaled + returned.
+
+Second-cutover migration (v2.4): when the baseline carries a verified prior
+receipt (facts_bytes empty by design), rollback restores ONLY the captured
+dropin bytes. It never invents blank facts, never rewrites unrelated PM
+facts, and never checks out the source tree: a drifted live HEAD refuses
+instead of resetting someone's work.
 """
 
 from __future__ import annotations
@@ -25,6 +31,13 @@ class RestoreError(RuntimeError):
     pass
 
 
+def _has_prior_receipt(baseline: Baseline) -> bool:
+    try:
+        return str(getattr(baseline, "prior_generation", "") or "") not in ("", ".")
+    except (ValueError, TypeError):
+        return False
+
+
 def _check_provenance(config: CutoverConfig, baseline: Baseline) -> None:
     if baseline.live_head != config.parent_sha:
         raise RestoreError(
@@ -32,37 +45,50 @@ def _check_provenance(config: CutoverConfig, baseline: Baseline) -> None:
         )
     if baseline.candidate_head != config.candidate_sha:
         raise RestoreError("baseline candidate HEAD != candidate SHA")
-    if not baseline.facts_bytes:
+    if not baseline.facts_bytes and not _has_prior_receipt(baseline):
         raise RestoreError("baseline has no selection facts bytes to restore")
     if not baseline.selection_facts_path or str(baseline.selection_facts_path) in ("", "."):
         raise RestoreError("baseline has no selection facts path")
 
 
 def _restore_source(host: Host, config: CutoverConfig, baseline: Baseline) -> None:
-    """Restore live source only when mutated; untouched fleets never checkout."""
+    """Verify live source is unchanged; never checkout, never reset work.
+
+    The controller never mutates the source tree (staging writes only the
+    side generation). If the live HEAD drifted from parent, refuse instead
+    of `checkout --detach` so rollback never resets someone's work. This
+    holds for both the generic facts path and the receipt migration path
+    (external staged candidate: no source checkout mutation).
+    """
     try:
         res = run_owner_git(host, config.live_tree, ["rev-parse", "HEAD"], timeout=30)
     except (OSError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as exc:
         raise RestoreError(f"source HEAD read failed: {type(exc).__name__}: {exc}") from exc
     current = (res.stdout or "").strip() if res.returncode == 0 else ""
-    if current == config.parent_sha:
-        return
-    try:
-        back = run_owner_git(
-            host,
-            config.live_tree,
-            ["checkout", "--detach", config.parent_sha],
-            timeout=120,
-        )
-    except (OSError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as exc:
+    if not current:
+        raise RestoreError("source HEAD unreadable (refusing to reset work)")
+    if current != config.parent_sha:
         raise RestoreError(
-            f"source restore transport failed: {type(exc).__name__}: {exc}"
-        ) from exc
-    if back.returncode != 0:
-        raise RestoreError(f"source restore failed: {(back.stderr or '')[-300:]}")
+            f"source drift {current[:12]} != parent {config.parent_sha[:12]} "
+            "(refusing to checkout; manual recovery required)"
+        )
 
 
 def _restore_facts(host: Host, config: CutoverConfig, baseline: Baseline) -> None:
+    # Receipt migration: facts_bytes is empty by design (old worktree key
+    # was never installed). Skip instead of inventing blank facts or
+    # rewriting unrelated PM facts for the side generation.
+    if not baseline.facts_bytes:
+        if _has_prior_receipt(baseline):
+            append(
+                host,
+                config.journal_path,
+                "restore-facts-skipped",
+                True,
+                {"reason": "prior receipt migration: no facts to restore"},
+            )
+            return
+        raise RestoreError("baseline has no selection facts bytes to restore")
     try:
         host.write_bytes(baseline.selection_facts_path, baseline.facts_bytes)
     except OSError as exc:

@@ -19,6 +19,7 @@ EXPECTED_SIBLINGS = (
     "cutover_manifest.py",
     "cutover_git.py",
     "cutover_preflight.py",
+    "cutover_receipt.py",
     "cutover_stage.py",
     "cutover_dropin.py",
     "cutover_health.py",

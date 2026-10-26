@@ -197,3 +197,36 @@ sudo systemctl daemon-reload
 `full` performs the cutover; `resume` is the `OnFailure=` target and the
 reboot-resume entrypoint (refuses when the journal already holds a terminal
 receipt). No live restart happens in this change.
+
+## Second cutover via prior activation receipt (no live edit in this tree)
+
+After the first cutover the fleet runs from a side generation
+(`gen-<parent12>/venv` via `zzz-candidate.conf`), not from the original
+checkout. The old worktree key (`installs/<key>/facts.json` derived from
+`live_tree`) was never installed directly, so its selection facts file is
+likely absent. The generic `selection facts missing` refusal would block the
+migration -- this tree instead binds the root-owned PREVIOUS activation:
+
+```bash
+/usr/bin/python3 -I -B /opt/hermes-maintenance/scripts/maintenance/cutover.py preflight \
+  --candidate-sha <NEW> --parent-sha <OLD> \
+  --candidate-src /opt/candidate/hermes-agent \
+  --live-tree /home/ubuntu/worktrees/worktrees/hermes-upstream-integrate-20261025 \
+  --generation-root /home/ubuntu/.hermes/generations \
+  --journal /var/lib/hermes-cutover/journal-2.jsonl \
+  --baseline-receipt /var/lib/hermes-cutover/activation-<old12>.jsonl
+```
+
+The receipt must be a root-owned (`uid 0`, `0600`, no group/other perms)
+regular file (never a symlink) under `/var/lib/hermes-cutover/` named
+`activation-<hex12>.jsonl`. Preflight validates before any mutation: path
+shape, lstat bind, `stage-ok` extras/generation/venv/home, terminal
+`receipt-success` with `candidate==parent`, live `cmdline[0]` for BOTH units
+inside the prior generation, `gateway_state.json:code_sha==parent` and
+`/api/health commit==parent` (running fleet proof, never the original main
+HEAD). Malformed/stale/wrong-generation receipts refuse fail-closed; receipt
+candidate values are never trusted before the root bind. Extras come from the
+receipt `stage-ok` (no blank facts invented); rollback restores ONLY the
+captured `zzz-candidate.conf` bytes and skips facts/source (drift refuses
+instead of `checkout`, never resetting work). Without `--baseline-receipt`
+the generic facts path is unchanged.

@@ -4,6 +4,16 @@ DESIGN v2: binds BOTH units (MainPID, exe, cmdline, cwd, start_time,
 ActiveEnterTimestamp, NRestarts), the REAL selection facts
 (installs/<key>/facts.json), gateway_state.json bytes, unit texts and
 provenance (parent/candidate SHAs). Any failure is fail-closed.
+
+Second-cutover migration (v2.4): when --baseline-receipt names the root-owned
+PRIOR activation receipt (first cutover success for candidate==parent), the
+selection facts file derived from live_tree may be absent (old worktree key
+was never installed directly; the fleet runs from the prior side generation).
+Preflight then binds the prior generation via the receipt (stage-ok extras +
+generation/venv/home, terminal receipt-success, current proc cmdline match,
+state code_sha + /api/health commit == parent) and leaves facts_bytes empty
+instead of inventing blank facts. Stage derives extras from the receipt and
+rollback restores ONLY the captured dropin bytes.
 """
 
 from __future__ import annotations
@@ -12,6 +22,11 @@ from pathlib import Path
 
 from scripts.maintenance.cutover_git import run_owner_git
 from scripts.maintenance.cutover_journal import append
+from scripts.maintenance.cutover_receipt import (
+    PriorActivation,
+    ReceiptError,
+    load_prior_activation,
+)
 from scripts.maintenance.cutover_types import (
     Baseline,
     CutoverConfig,
@@ -132,6 +147,199 @@ def _capture_unit(
     )
 
 
+def _code_sha_from_state_bytes(raw: bytes) -> str | None:
+    import json as _json
+
+    try:
+        payload = _json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    sha = payload.get("code_sha")
+    if not isinstance(sha, str) or len(sha.strip()) != 40:
+        return None
+    return sha.strip().lower()
+
+
+def _check_receipt_generation(
+    prior: PriorActivation, gw_cmd0: str, dash_cmd0: str
+) -> None:
+    """Both live units must run from the prior side generation (no drift)."""
+    expect = str(prior.venv_python)
+    for label, cmd0 in (("gateway", gw_cmd0), ("dashboard", dash_cmd0)):
+        if not cmd0:
+            raise PreflightError(
+                f"prior receipt generation mismatch: live {label} cmdline empty"
+            )
+        # Exact venv python bind; generation dir containment is implied.
+        if cmd0.strip() != expect:
+            raise PreflightError(
+                f"live {label} {cmd0[:80]!r} != prior generation {expect[:80]!r} "
+                "(wrong generation? refusing)"
+            )
+    # Generation dir itself must be the parent side-generation.
+    if prior.generation.name != f"gen-{prior.candidate_sha[:12]}":
+        raise PreflightError("prior receipt generation is not the parent side-gen")
+
+
+def _check_receipt_parent_running(
+    host: Host, config: CutoverConfig, state_bytes: bytes
+) -> None:
+    """Parent proof comes from the RUNNING fleet, not the original main HEAD.
+
+    gateway_state.json:code_sha and dashboard /api/health commit must both
+    equal parent_sha (the prior candidate 1d9a...). A stale main HEAD (50e82)
+    never satisfies this.
+    """
+    sha = _code_sha_from_state_bytes(state_bytes)
+    if sha is None:
+        raise PreflightError("gateway_state.json code_sha missing/malformed")
+    if sha != config.parent_sha.strip().lower():
+        raise PreflightError(
+            f"running state {sha[:12]} != parent {config.parent_sha[:12]} "
+            "(fleet is not the parent side-gen?)"
+        )
+    url = f"http://127.0.0.1:{config.dashboard_port}/api/health"
+    try:
+        status, body = host.http_get(url, timeout=10)
+    except OSError as exc:
+        raise PreflightError(f"dashboard 9119 unreachable in preflight: {exc}") from exc
+    if int(status) != 200:
+        raise PreflightError(f"dashboard 9119 unhealthy in preflight: HTTP {status}")
+    try:
+        import json as _json
+
+        payload = _json.loads(body)
+        commit = str(payload.get("commit") or "").strip().lower()
+    except ValueError as exc:
+        raise PreflightError("dashboard /api/health body is not JSON") from exc
+    if commit != config.parent_sha.strip().lower():
+        raise PreflightError(
+            f"dashboard commit {commit[:12]} != parent {config.parent_sha[:12]}"
+        )
+
+
+def _load_prior_for_preflight(
+    host: Host, config: CutoverConfig, gw_cmd0: str, dash_cmd0: str
+) -> PriorActivation | None:
+    """Load prior receipt when configured; None on the generic facts path."""
+    receipt_opt = getattr(config, "baseline_receipt", None)
+    want = receipt_opt is not None and str(receipt_opt) not in ("", ".", "None")
+    if not want:
+        return None
+    try:
+        prior = load_prior_activation(host, config)
+    except ReceiptError as exc:
+        raise PreflightError(f"baseline receipt refused: {exc}") from exc
+    _check_receipt_generation(prior, gw_cmd0, dash_cmd0)
+    return prior
+
+
+def _resolve_selection_facts(
+    host: Host, sel_path: Path, prior: PriorActivation | None
+) -> bytes:
+    """Real selection facts; empty (no invention) on receipt migration."""
+    facts_bytes = _read_optional(host, sel_path)
+    if facts_bytes is not None:
+        return facts_bytes
+    if prior is None:
+        raise PreflightError(f"selection facts missing: {sel_path}")
+    # Receipt migration: facts optional, extras come from stage-ok.
+    # Do NOT invent blank facts; leave bytes empty for stage/rollback.
+    return b""
+
+
+def _make_preflight_baseline(
+    *,
+    gateway_text: str,
+    dash_text: str,
+    gateway_dropins: dict[str, bytes],
+    dashboard_dropins: dict[str, bytes],
+    live_head: str,
+    candidate_head: str,
+    gw_pid: int,
+    gw_exe: str,
+    gw_cmd0: str,
+    gw_cwd: str,
+    gw_start: int,
+    gw_enter: str,
+    gw_restarts: str,
+    dash_pid: int,
+    dash_exe: str,
+    dash_cmd0: str,
+    dash_cwd: str,
+    dash_start: int,
+    dash_enter: str,
+    dash_restarts: str,
+    state_bytes: bytes,
+    facts_bytes: bytes,
+    sel_path: Path,
+    state_path: Path,
+    prior: PriorActivation | None,
+) -> Baseline:
+    """Build Baseline with or without a verified prior receipt."""
+    if prior is not None:
+        return Baseline(
+            gateway_unit_text=gateway_text,
+            dashboard_unit_text=dash_text,
+            gateway_dropin_bytes=gateway_dropins,
+            dashboard_dropin_bytes=dashboard_dropins,
+            live_head=live_head,
+            candidate_head=candidate_head,
+            live_main_pid=gw_pid,
+            live_main_exe=gw_exe,
+            live_main_cmdline=(gw_cmd0,),
+            live_main_cwd=gw_cwd,
+            live_main_start_time=gw_start,
+            dashboard_main_pid=dash_pid,
+            dashboard_main_exe=dash_exe,
+            dashboard_main_cmdline=(dash_cmd0,),
+            dashboard_main_cwd=dash_cwd,
+            dashboard_main_start_time=dash_start,
+            gateway_active_enter=gw_enter,
+            dashboard_active_enter=dash_enter,
+            gateway_nrestarts=gw_restarts,
+            dashboard_nrestarts=dash_restarts,
+            gateway_state_bytes=state_bytes,
+            facts_bytes=facts_bytes,
+            selection_facts_path=sel_path,
+            gateway_state_path=state_path,
+            prior_receipt_path=prior.receipt_path,
+            prior_generation=prior.generation,
+            prior_venv_python=prior.venv_python,
+            prior_home=prior.home,
+            prior_extras=tuple(prior.extras),
+            prior_all_extras=bool(prior.all_extras),
+        )
+    return Baseline(
+        gateway_unit_text=gateway_text,
+        dashboard_unit_text=dash_text,
+        gateway_dropin_bytes=gateway_dropins,
+        dashboard_dropin_bytes=dashboard_dropins,
+        live_head=live_head,
+        candidate_head=candidate_head,
+        live_main_pid=gw_pid,
+        live_main_exe=gw_exe,
+        live_main_cmdline=(gw_cmd0,),
+        live_main_cwd=gw_cwd,
+        live_main_start_time=gw_start,
+        dashboard_main_pid=dash_pid,
+        dashboard_main_exe=dash_exe,
+        dashboard_main_cmdline=(dash_cmd0,),
+        dashboard_main_cwd=dash_cwd,
+        dashboard_main_start_time=dash_start,
+        gateway_active_enter=gw_enter,
+        dashboard_active_enter=dash_enter,
+        gateway_nrestarts=gw_restarts,
+        dashboard_nrestarts=dash_restarts,
+        gateway_state_bytes=state_bytes,
+        facts_bytes=facts_bytes,
+        selection_facts_path=sel_path,
+        gateway_state_path=state_path,
+    )
+
+
 def preflight(host: Host, config: CutoverConfig) -> Baseline:
     """Capture reversible baseline. Any failure is fail-closed (raise, no mutation)."""
     if not is_hex_sha(config.candidate_sha):
@@ -208,10 +416,13 @@ def preflight(host: Host, config: CutoverConfig) -> Baseline:
         )
 
     # REAL selection facts (installs/<key>/facts.json), not tools/facts.json.
+    # Second-cutover migration: when --baseline-receipt is configured, the
+    # facts file for the old worktree key may be absent (side generation was
+    # never installed under that key). The receipt then supplies the extras;
+    # facts_bytes stays empty and no blank facts are invented.
     sel_path = selection_facts_path_for(config.live_tree, config.hermes_home)
-    facts_bytes = _read_optional(host, sel_path)
-    if facts_bytes is None:
-        raise PreflightError(f"selection facts missing: {sel_path}")
+    prior = _load_prior_for_preflight(host, config, gw_cmd0, dash_cmd0)
+    facts_bytes = _resolve_selection_facts(host, sel_path, prior)
     # Keep legacy tools facts as a compat read (never restored over selection).
     _read_optional(host, facts_path_for(config.hermes_home))
 
@@ -220,48 +431,61 @@ def preflight(host: Host, config: CutoverConfig) -> Baseline:
     if state_bytes is None:
         raise PreflightError(f"gateway_state.json missing: {state_path}")
 
+    if prior is not None:
+        # Parent proof from the RUNNING fleet (state + /api/health), not the
+        # original main HEAD. Refuses before any mutation.
+        _check_receipt_parent_running(host, config, state_bytes)
+
     gateway_dropins = _list_dropin_bytes(host, config.gateway_dropin_dir)
     dashboard_dropins = _list_dropin_bytes(host, config.dashboard_dropin_dir)
 
-    baseline = Baseline(
-        gateway_unit_text=gateway_text,
-        dashboard_unit_text=dash_text,
-        gateway_dropin_bytes=gateway_dropins,
-        dashboard_dropin_bytes=dashboard_dropins,
+    baseline = _make_preflight_baseline(
+        gateway_text=gateway_text,
+        dash_text=dash_text,
+        gateway_dropins=gateway_dropins,
+        dashboard_dropins=dashboard_dropins,
         live_head=live_head,
         candidate_head=candidate_head,
-        live_main_pid=gw_pid,
-        live_main_exe=gw_exe,
-        live_main_cmdline=(gw_cmd0,),
-        live_main_cwd=gw_cwd,
-        live_main_start_time=gw_start,
-        dashboard_main_pid=dash_pid,
-        dashboard_main_exe=dash_exe,
-        dashboard_main_cmdline=(dash_cmd0,),
-        dashboard_main_cwd=dash_cwd,
-        dashboard_main_start_time=dash_start,
-        gateway_active_enter=gw_enter,
-        dashboard_active_enter=dash_enter,
-        gateway_nrestarts=gw_restarts,
-        dashboard_nrestarts=dash_restarts,
-        gateway_state_bytes=state_bytes,
+        gw_pid=gw_pid,
+        gw_exe=gw_exe,
+        gw_cmd0=gw_cmd0,
+        gw_cwd=gw_cwd,
+        gw_start=gw_start,
+        gw_enter=gw_enter,
+        gw_restarts=gw_restarts,
+        dash_pid=dash_pid,
+        dash_exe=dash_exe,
+        dash_cmd0=dash_cmd0,
+        dash_cwd=dash_cwd,
+        dash_start=dash_start,
+        dash_enter=dash_enter,
+        dash_restarts=dash_restarts,
+        state_bytes=state_bytes,
         facts_bytes=facts_bytes,
-        selection_facts_path=sel_path,
-        gateway_state_path=state_path,
+        sel_path=sel_path,
+        state_path=state_path,
+        prior=prior,
     )
+    detail: dict = {
+        "candidate": config.candidate_sha,
+        "parent": config.parent_sha,
+        "live_pid": gw_pid,
+        "live_exe": gw_exe,
+        "dashboard_pid": dash_pid,
+        "dashboard_exe": dash_exe,
+        "selection_facts": str(sel_path),
+    }
+    if prior is not None:
+        detail["baseline_receipt"] = str(prior.receipt_path)
+        detail["prior_generation"] = str(prior.generation)
+        detail["prior_extras"] = list(prior.extras)
+        detail["prior_all_extras"] = bool(prior.all_extras)
+        detail["facts_bytes_empty"] = not bool(facts_bytes)
     append(
         host,
         config.journal_path,
         "preflight-ok",
         True,
-        {
-            "candidate": config.candidate_sha,
-            "parent": config.parent_sha,
-            "live_pid": gw_pid,
-            "live_exe": gw_exe,
-            "dashboard_pid": dash_pid,
-            "dashboard_exe": dash_exe,
-            "selection_facts": str(sel_path),
-        },
+        detail,
     )
     return baseline

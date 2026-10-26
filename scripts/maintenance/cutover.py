@@ -66,6 +66,7 @@ from scripts.maintenance.cutover_dropin import (
 )
 from scripts.maintenance.cutover_health import check_health, check_rollback_health, wait_for_health
 from scripts.maintenance.cutover_journal import append, has_terminal_receipt, read_all
+from scripts.maintenance.cutover_receipt import ReceiptError, load_prior_activation
 from scripts.maintenance.cutover_git import (
     git_inner_argv,
     owner_git_env,
@@ -95,6 +96,7 @@ from scripts.maintenance.cutover_types import (
     Baseline,
     CutoverConfig,
     CutoverResult,
+    FileStat,
     Host,
     ProductionHost,
     RunResult,
@@ -108,10 +110,12 @@ __all__ = [
     "Baseline",
     "CutoverConfig",
     "CutoverResult",
+    "FileStat",
     "Host",
     "ManifestError",
     "PreflightError",
     "ProductionHost",
+    "ReceiptError",
     "RestoreError",
     "RunResult",
     "SnapshotError",
@@ -126,6 +130,7 @@ __all__ = [
     "is_hex_sha",
     "is_root_installed",
     "load_baseline",
+    "load_prior_activation",
     "orchestrate",
     "owner_git_env",
     "preflight",
@@ -149,6 +154,8 @@ __all__ = [
 
 
 def _build_config(args: argparse.Namespace) -> CutoverConfig:
+    receipt_raw = getattr(args, "baseline_receipt", None)
+    receipt_path = _Path(receipt_raw) if receipt_raw else None
     return CutoverConfig(
         candidate_sha=args.candidate_sha,
         parent_sha=args.parent_sha,
@@ -164,6 +171,7 @@ def _build_config(args: argparse.Namespace) -> CutoverConfig:
         candidate_dropin_name=args.candidate_dropin_name,
         dashboard_port=int(args.dashboard_port),
         controller_path=_here,
+        baseline_receipt=receipt_path,
     )
 
 
@@ -181,6 +189,18 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dashboard-dropin-dir", default="/etc/systemd/system/hermes-dashboard.service.d")
     parser.add_argument("--candidate-dropin-name", default="zzz-candidate.conf")
     parser.add_argument("--dashboard-port", default="9119")
+    parser.add_argument(
+        "--baseline-receipt",
+        default=None,
+        help=(
+            "Optional root-owned prior activation receipt for second-cutover "
+            "migration (e.g. /var/lib/hermes-cutover/activation-<parent12>.jsonl). "
+            "When set, preflight binds owner/mode/non-symlink/type/path, "
+            "receipt candidate==parent, live cmdline generation==prior stage, "
+            "terminal success, and derives extras from stage-ok. Facts stay "
+            "optional; no blank facts are invented."
+        ),
+    )
 
 
 def _cmd_full(host: Host, config: CutoverConfig) -> int:
@@ -198,11 +218,20 @@ def _cmd_resume(host: Host, config: CutoverConfig) -> int:
 def _cmd_preflight(host: Host, config: CutoverConfig) -> int:
     try:
         preflight(host, config)
-    except (PreflightError, OSError) as exc:
+    except (PreflightError, ReceiptError, OSError) as exc:
         print(f"preflight fail-closed: {exc}", file=sys.stderr)
         return 2
     print("preflight ok")
     return 0
+
+
+def _extras_for_verify(baseline: Baseline) -> tuple[list[str], bool]:
+    # Mirrors stage(): facts win, otherwise prior receipt extras.
+    if baseline.facts_bytes:
+        return selected_extras_from_facts(baseline.facts_bytes)
+    if str(getattr(baseline, "prior_generation", "") or "") not in ("", "."):
+        return (sorted(set(str(x) for x in (baseline.prior_extras or ()))), bool(baseline.prior_all_extras))
+    return ([], False)
 
 
 def _cmd_stage(host: Host, config: CutoverConfig) -> int:
@@ -211,10 +240,10 @@ def _cmd_stage(host: Host, config: CutoverConfig) -> int:
         staged = stage(host, config, baseline)
         verify_isolated_launch(host, config, staged, baseline.live_main_exe)
         verify_candidate_web_dist(host, config)
-        extras, use_all = selected_extras_from_facts(baseline.facts_bytes)
+        extras, use_all = _extras_for_verify(baseline)
         verify_staged_extras(host, config, staged, extras, use_all)
         verify_candidate_help(host, config, staged)
-    except (PreflightError, StageError, OSError, RuntimeError) as exc:
+    except (PreflightError, ReceiptError, StageError, OSError, RuntimeError) as exc:
         print(f"stage failed: {exc}", file=sys.stderr)
         return 1
     print(f"staged {staged.generation_dir}")
@@ -225,7 +254,7 @@ def _cmd_health(host: Host, config: CutoverConfig) -> int:
     try:
         baseline = preflight(host, config)
         staged = stage(host, config, baseline)
-    except (PreflightError, StageError, OSError, RuntimeError) as exc:
+    except (PreflightError, ReceiptError, StageError, OSError, RuntimeError) as exc:
         print(f"health setup failed: {exc}", file=sys.stderr)
         return 2
     report = check_health(host, config, staged, baseline)
@@ -239,7 +268,7 @@ def _cmd_rollback(host: Host, config: CutoverConfig) -> int:
     except SnapshotError:
         try:
             baseline = preflight(host, config)
-        except (PreflightError, OSError) as exc:
+        except (PreflightError, ReceiptError, OSError) as exc:
             print(f"rollback preflight fail-closed: {exc}", file=sys.stderr)
             return 2
     errors = rollback(host, config, baseline)

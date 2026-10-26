@@ -166,6 +166,14 @@ def stage(host: Host, config: CutoverConfig, baseline: Baseline | None = None) -
     use_all = False
     if baseline is not None and baseline.facts_bytes:
         extras, use_all = selected_extras_from_facts(baseline.facts_bytes)
+    elif baseline is not None and str(getattr(baseline, "prior_generation", "")) not in ("", "."):
+        # Second-cutover migration: facts_bytes is empty by design (old
+        # worktree key was never installed). Extras come from the verified
+        # prior receipt's stage-ok; never invent blank facts.
+        extras = sorted(set(str(x) for x in (baseline.prior_extras or ())))
+        use_all = bool(baseline.prior_all_extras)
+        if not extras and not use_all:
+            raise StageError("prior receipt carries no extras (refusing core-only migration)")
     argv = stage_argv(config, extras, use_all)
     if _forbidden_staging_argv(argv):
         raise StageError("staging uses a forbidden entrypoint")

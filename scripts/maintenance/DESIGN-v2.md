@@ -377,7 +377,7 @@ health, missing reset):
 External `full f18a8677…` FAILED PRE-MUTATION under systemd root (clean
 env, no `SUDO_UID`; Gateway 15839 / Dashboard 15683 stayed `active`,
 `NRestarts=0`): `git -C … rev-parse HEAD` as root on ubuntu-owned trees
-fails `fatal: detected dubious ownership`, while the sudo-shell preflight
+fails `fatal: detected dubious ownership`, while the sudo shell preflight
 passed. Fix: `cutover_git.py` (stdlib only, in manifest + facade) runs
 EVERY git route as `ubuntu` via absolute
 `/usr/sbin/runuser -u ubuntu -- /usr/bin/env -i HOME=/home/ubuntu
@@ -393,3 +393,45 @@ refusal is now `failed` (fleet untouched, no recovery) instead of
 with a NEW journal path. Regression: simulated systemd-root (`euid==0`)
 asserts exact argv/owner/cwd/env/bounds on all routes plus a real
 clean-env owner `rev-parse` (no safe.directory).
+
+## 12. Second-cutover receipt amendment (v2.4, prior-activation migration)
+
+First cutover leaves the fleet on a side generation (`gen-1d9a…` via
+`zzz-candidate.conf`); the second cutover's parent (`1d9a377fa0…`) is that
+side-gen, not the original main `50e82ad…`. The selection facts path
+derived from `live_tree` (`installs/<key>/facts.json` for the old worktree)
+was never installed, so the generic `selection facts missing` refusal would
+block the migration. v2.4 adds explicit `--baseline-receipt`
+(`/var/lib/hermes-cutover/activation-<parent12>.jsonl`, root-owned `0600`,
+no symlink, regular file, path-bound) verified BEFORE any mutation:
+
+- `cutover_receipt.py` (stdlib, manifest + facade): path shape
+  (`activation-<hex>.jsonl` under the allowed dir), `Host.stat_file` lstat
+  bind (uid 0, owner-readable, no group/other, not symlink, regular file),
+  JSONL parse (malformed line refuses), `stage-ok` (generation/venv/home +
+  `extras`/`all_extras` cleaned like selection facts), terminal
+  `receipt-success` (`ok`, `status success`, `candidate==parent`), generation
+  `gen-<parent12>` + venv-inside-generation binds. Receipt candidate values
+  are never trusted before the root bind.
+- Preflight: still requires `live HEAD==parent` (never falsely `50e82…`)
+  and `candidate HEAD==candidate`; then checks BOTH live `cmdline[0]`
+  equal the prior venv (wrong generation refuses), plus running-fleet
+  parent proof `gateway_state.json:code_sha==parent` and
+  `GET /api/health commit==parent` (state/health, not main HEAD). Facts are
+  optional: when the receipt is verified and the file is absent,
+  `facts_bytes=b""` (no blank invention); `stage()` then uses
+  `prior_extras/prior_all_extras` (empty prior extras refuses core-only).
+  Dropin bytes (`zzz-candidate.conf` effective runtime) are still captured
+  in full for rollback; the snapshot persists `prior_*` and allows empty
+  facts only with a prior receipt; generic path (no receipt) is unchanged.
+- Rollback: provenance allows empty facts with prior; `_restore_source`
+  never checks out (drift `HEAD != parent` refuses instead of resetting
+  work, covering the external staged candidate); `_restore_facts` skips
+  when empty (appends `restore-facts-skipped`, never rewrites unrelated PM
+  facts); `_restore_dropins` restores the full prior override bytes, so the
+  second cutover rolls back to the `gen-parent` fleet only.
+- CLI: `--baseline-receipt` on all subcommands (used by
+  `preflight/stage/health/full`); `resume` uses the snapshot only.
+  Crash-matrix: malformed/stale/wrong-generation/non-root/bad-mode/symlink/
+  wrong-path/terminal-failed/state-mismatch all refuse pre-mutation
+  (`failed`, fleet untouched, no lifecycle writes).

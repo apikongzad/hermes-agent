@@ -66,11 +66,21 @@ def _baseline_to_dict(baseline: Baseline) -> dict:
         "facts_bytes": _b64_encode(baseline.facts_bytes),
         "selection_facts_path": str(baseline.selection_facts_path),
         "gateway_state_path": str(baseline.gateway_state_path),
+        # Second-cutover migration (optional; empty on the generic facts path).
+        "prior_receipt_path": str(baseline.prior_receipt_path) if str(baseline.prior_receipt_path) not in ("", ".") else "",
+        "prior_generation": str(baseline.prior_generation) if str(baseline.prior_generation) not in ("", ".") else "",
+        "prior_venv_python": str(baseline.prior_venv_python) if str(baseline.prior_venv_python) not in ("", ".") else "",
+        "prior_home": str(baseline.prior_home or ""),
+        "prior_extras": list(baseline.prior_extras or ()),
+        "prior_all_extras": bool(baseline.prior_all_extras),
     }
 
 
 def _baseline_from_dict(data: dict) -> Baseline:
     try:
+        prior_receipt_raw = str(data.get("prior_receipt_path") or "")
+        prior_gen_raw = str(data.get("prior_generation") or "")
+        prior_venv_raw = str(data.get("prior_venv_python") or "")
         return Baseline(
             gateway_unit_text=str(data["gateway_unit_text"]),
             dashboard_unit_text=str(data["dashboard_unit_text"]),
@@ -112,6 +122,12 @@ def _baseline_from_dict(data: dict) -> Baseline:
             facts_bytes=_b64_decode(str(data["facts_bytes"])),
             selection_facts_path=Path(str(data["selection_facts_path"])),
             gateway_state_path=Path(str(data["gateway_state_path"])),
+            prior_receipt_path=Path(prior_receipt_raw) if prior_receipt_raw else Path(""),
+            prior_generation=Path(prior_gen_raw) if prior_gen_raw else Path(""),
+            prior_venv_python=Path(prior_venv_raw) if prior_venv_raw else Path(""),
+            prior_home=str(data.get("prior_home") or ""),
+            prior_extras=tuple(str(x) for x in (data.get("prior_extras") or [])),
+            prior_all_extras=bool(data.get("prior_all_extras") or False),
         )
     except (KeyError, ValueError, TypeError) as exc:
         raise SnapshotError(f"snapshot baseline malformed: {exc}") from exc
@@ -174,6 +190,14 @@ def load_baseline(host: Host, config: CutoverConfig) -> Baseline:
         raise SnapshotError("snapshot live HEAD != parent (stale snapshot, refusing)")
     if baseline.candidate_head != config.candidate_sha:
         raise SnapshotError("snapshot candidate HEAD != candidate (stale snapshot, refusing)")
-    if not baseline.facts_bytes:
+    has_prior = str(baseline.prior_generation) not in ("", ".")
+    if not baseline.facts_bytes and not has_prior:
         raise SnapshotError("snapshot has no selection facts bytes (refusing)")
+    # Preserve the full prior dropin override bytes: the second cutover
+    # rolls back to the first cutover's zzz-candidate.conf (gen-parent),
+    # not to an empty state. At least one side must name prior bytes or the
+    # snapshot cannot restore the effective fleet.
+    if has_prior:
+        if baseline.prior_generation.name != f"gen-{config.parent_sha[:12]}":
+            raise SnapshotError("snapshot prior generation != parent (stale, refusing)")
     return baseline
