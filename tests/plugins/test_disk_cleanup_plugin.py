@@ -104,7 +104,7 @@ class TestIsSafePath:
     @pytest.mark.platforms("macos")
     def test_track_accepts_tmp_hermes_path_after_platform_resolution(self, _isolate_env):
         dg = _load_lib()
-        temporary = Path(tempfile.mkdtemp(prefix="hermes-disk-cleanup-", dir="/tmp"))
+        temporary = Path(tempfile.mkdtemp(prefix="hermes-disk-cleanup-"))
         try:
             assert dg.track(str(temporary), "temp", silent=True) is True
         finally:
@@ -124,9 +124,11 @@ class TestIsSafePath:
     def test_rejects_final_and_nested_symlink_escapes(self, _isolate_env):
         # Report-only anchored: lexical is_safe_path True for hermes- temp,
         # but held-fd bind refuses symlink leaf (ELOOP, fail-closed).
+        # TMPDIR-aware: use the allowed temp root (tempfile.gettempdir(),
+        # runner TMPDIR / scratch) — never a hardcoded /tmp literal.
         dg = _load_lib()
-        temporary = Path(tempfile.mkdtemp(prefix="hermes-disk-cleanup-", dir="/tmp"))
-        outside_dir = Path(tempfile.mkdtemp(prefix="disk-cleanup-outside-", dir="/tmp"))
+        temporary = Path(tempfile.mkdtemp(prefix="hermes-disk-cleanup-"))
+        outside_dir = Path(tempfile.mkdtemp(prefix="disk-cleanup-outside-"))
         outside_file = outside_dir / "file.txt"
         outside_file.write_text("outside", encoding="utf-8")
         try:

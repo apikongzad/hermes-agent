@@ -196,6 +196,7 @@ def _managed_runtime_present(cmd: str) -> bool:
 
             return uv_launcher(base) is not None
     except Exception:
+        logger.debug("managed runtime probe failed for %s", cmd, exc_info=True)
         return False
     return False
 

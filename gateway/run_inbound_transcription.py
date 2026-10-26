@@ -28,7 +28,7 @@ class GatewayInboundTranscriptionMixin:
         if not getattr(self.config, "stt_enabled", True):
             notes = []
             for path in audio_paths:
-                abs_path = os.path.abspath(path)
+                abs_path = await asyncio.to_thread(os.path.abspath, path)
                 duration_str = await _probe_audio_duration(abs_path)
                 suffix = f" (duration: {duration_str})" if duration_str else ""
                 notes.append(f"[The user sent a voice message: {abs_path}{suffix}]")
@@ -58,8 +58,8 @@ class GatewayInboundTranscriptionMixin:
                 if transcript is not None:
                     successful_transcripts.append(transcript)
                 enriched_parts.append(note)
-            except Exception as e:
-                logger.error("Transcription error: %s", e)
+            except Exception:
+                logger.error("Transcription error", exc_info=True)
                 enriched_parts.append(self._untranscribed_audio_note(path))
 
         if enriched_parts:
@@ -139,8 +139,8 @@ class GatewayInboundTranscriptionMixin:
                 event, adapter, source, transcripts, metadata=metadata, log_context=log_context
             )
             return enriched_text or text, transcripts
-        except Exception as trans_exc:
-            logger.warning("%s transcription failed: %s", log_context, trans_exc)
+        except Exception:
+            logger.warning("%s transcription failed", log_context, exc_info=True)
             return text, []
 
     _EMPTY_TEXT_PLACEHOLDER = "(The user sent a message with no text content)"

@@ -49,10 +49,8 @@ def owner_git_env() -> dict[str, str]:
 
 
 def _is_root() -> bool:
-    try:
-        return os.geteuid() == 0
-    except AttributeError:
-        return False
+    # hasattr(os, "geteuid") guard — Windows has no geteuid and returns False here.
+    return hasattr(os, "geteuid") and os.geteuid() == 0
 
 
 def git_inner_argv(repo: Path | str, *git_args: str) -> list[str]:

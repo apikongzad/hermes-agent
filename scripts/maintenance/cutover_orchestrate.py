@@ -10,7 +10,10 @@ Stdlib only.
 
 from __future__ import annotations
 
+import logging
 import subprocess
+
+logger = logging.getLogger(__name__)
 
 from scripts.maintenance.cutover_dropin import write_candidate_dropins
 from scripts.maintenance.cutover_health import wait_for_health
@@ -190,6 +193,7 @@ def orchestrate(host: Host, config: CutoverConfig) -> CutoverResult:
         if not report.ok:
             return _fail_with_rollback(host, config, baseline, "health", report.detail)
     except Exception as exc:  # outer lifecycle guarantee after mutation
+        logger.error("cutover orchestrate failed", exc_info=True)
         if live_mutated:
             return _fail_with_rollback(
                 host, config, baseline, "unexpected", f"{type(exc).__name__}: {exc}"[-300:]

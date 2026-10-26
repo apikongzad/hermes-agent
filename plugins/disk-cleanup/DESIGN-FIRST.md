@@ -85,7 +85,7 @@ items without separate sign-off.
   and hook/slash auto-wire live. Closed by §§2,4.
 - **R3 — anchor origin unspecified.** Rev2 said "`openat2` or held walking"
   without saying where the anchor fd comes from, allowing multi-component
-  `open()`, `Path.resolve()`, and the `/tmp→/private/tmp` alias relaxation.
+  `open()`, `Path.resolve()`, and the system-temp alias relaxation.
   Closed by §3.
 - **R4 — metadata as authority + JSON names unvalidated.** Rev2 left mode/stat
   and schema-valid as implicit authority and left `tracked.json` path strings
@@ -184,9 +184,9 @@ for the whole operation. The ONLY entries the bootstrap may register are:
   is the locator input, never a JSON string);
 - ONE entry PER approved hermes temp-dir instance:
   `symbolic_root_id="hermes_tmp:<basename>"` for EACH existing
-  `/tmp/hermes-*` instance approved at bootstrap (first path component under
-  the resolved `/tmp` root starts with `hermes-`; the `/tmp→/private/tmp`
-  alias is resolved once at bootstrap by comparing resolved roots, never
+  scratch `hermes-*` instance approved at bootstrap (first path component under
+  the resolved scratch root starts with `hermes-`; the system-temp alias
+  is resolved once at bootstrap by comparing resolved roots, never
   per-open). Temp-glob discovery is NOT authority: each discovered basename
   and each directory component on its bootstrap walk is validated with
   `O_NOFOLLOW` per A-ROOTS-2 before registration; an unvalidatable instance
@@ -194,7 +194,7 @@ for the whole operation. The ONLY entries the bootstrap may register are:
 
 Everything else is refused EVEN WHEN LEXICALLY VALID (no absolute, no `..`,
 no empty, no NUL is not enough): project trees (`projects/`, `workspace/`,
-`plans/`, `home/`), `/mnt/*`, `/tmp` non-`hermes-*`, outside-registry
+`plans/`, `home/`), `/mnt/*`, scratch non-`hermes-*`, outside-registry
 temp (unregistered `hermes_tmp:<basename>`), and any absolute path outside the selected registry entry. There is no third
 root kind and no per-call root invention beyond the registered per-instance entries.
 
@@ -245,7 +245,7 @@ fixtures asserting absence).** `Path.resolve()` / `os.path.realpath()` /
 `Path.exists()/is_symlink()-then-open()` splits (current `disk_cleanup.py:
 39,53,72,107,194,197,203,207,308,325,343,369,371,383,570,580`); multi-component
 `os.open(str(p))` / `open()` (current `88,109,136` pattern + `65,201,209`);
-`Path("/tmp").resolve()` alias relaxation + `relative_to(hermes_home)` +
+`Path(tempfile.gettempdir()).resolve()` alias relaxation + `relative_to(hermes_home)` +
 `parts[0].startswith("hermes-")` as a per-open check (current `32-56`
 `is_safe_path` — replaced by A-ROOTS-1/2 registry bootstrap +
 symbolic_root_id; `(st_dev,st_ino)` NEVER as ID; temp-glob NEVER as
@@ -273,7 +273,7 @@ A-BIND-1 (reject absolute, reject `..`, reject empty, reject NUL), then
 bound via (a) exact held-component path or (b) `openat2` from the selected
 entry's `held_dirfd` with `RESOLVE_BENEATH|NO_SYMLINKS`. NEVER `(dev,ino)`
 as the ID. A candidate that does
-not name `hermes_home`/`hermes_tmp:<basename>` (project, `/mnt/*`, `/tmp`
+not name `hermes_home`/`hermes_tmp:<basename>` (project, `/mnt/*`, scratch
 non-`hermes-*`, outside temp, unknown symbolic ID) is refused even when lexically valid. No
 candidate string is ever `open()`ed/`stat()`ed/`unlink()`ed by name. Schema
 validation is classification input only (§4). Report-only grants no
@@ -646,7 +646,7 @@ satisfies nothing):**
   skips. The profile explicitly asserts **zero git spawns including no
   `.git/index` writes** (A-NOIMPLICIT-2).
 - **A-ESCAPE-1 — protected-root escapes refused.** Symlinked state dir,
-  `/mnt/*`, `/tmp` non-`hermes-*`, project-tree (`projects/`, `workspace/`,
+  `/mnt/*`, scratch non-`hermes-*`, project-tree (`projects/`, `workspace/`,
   `plans/`, `home/`), unknown `symbolic_root_id`, and absolute/`..`/empty/NUL JSON-name candidates are
   all refused + reported, none written, even when JSON validates. Each case
   asserted under BOTH bind paths (a) component-walk and (b) `openat2` from

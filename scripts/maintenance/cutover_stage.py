@@ -141,10 +141,8 @@ def _wrap_for_user(argv: list[str], env: dict[str, str]) -> list[str]:
     PATH=/usr/bin:/bin (no /usr/sbin), so bare `runuser` would raise
     FileNotFoundError before any live effect.
     """
-    try:
-        is_root = os.geteuid() == 0
-    except AttributeError:
-        is_root = False
+    # hasattr(os, "geteuid") guard — Windows has no geteuid and runs unprivileged here.
+    is_root = hasattr(os, "geteuid") and os.geteuid() == 0
     env_args = [_ENV, "-i"] + [f"{k}={v}" for k, v in sorted(env.items())]
     if is_root:
         return [_RUNUSER, "-u", "ubuntu", "--", *env_args, *argv]
@@ -572,10 +570,10 @@ def verify_isolated_launch(
         raise StageError("staged python is not inside the generation dir")
     if live_exe and live_exe.strip() == str(staged.venv_python).strip():
         raise StageError("staged probe re-executes the live old generation interpreter")
-    try:
-        euid = os.geteuid()
+    if hasattr(os, "geteuid"):
+        euid = os.geteuid()  # hasattr(os, "geteuid") guard — Windows falls to unknown below
         user = "root" if euid == 0 else "ubuntu"
-    except AttributeError:
+    else:
         user = "unknown"
     append(
         host,

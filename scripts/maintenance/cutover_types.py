@@ -158,7 +158,7 @@ class ProductionHost(Host):
 
     def proc_start_time(self, pid: int) -> int | None:
         try:
-            parts = (_proc_base(pid) / "stat").read_text(encoding="utf-8").split()
+            parts = (_proc_base(pid) / "stat").read_text(encoding="utf-8-sig").split()
             return int(parts[21])
         except (OSError, ValueError, IndexError):
             return None

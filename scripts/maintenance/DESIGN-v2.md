@@ -31,7 +31,7 @@ receipts live in §8.
    `exe=/home/ubuntu/.hermes/tools/python-3.14.9+…/bin/python3.14`
    (shared store interpreter), while `cmdline[0]=<venv>/bin/python`
    and `cwd=WorkingDirectory`. venv proof: `python3 -m venv` in
-   `/tmp/opencode/probe` shows `bin/python3 -> /home/ubuntu/.local/bin/python3`
+   `$TMPDIR/probe` shows `bin/python3 -> Hermes store python3.14`
    → store `python3.14`; `sys.executable` names the venv, `/proc exe`
    names the store. v2 health asserts EXACT equality:
    `readlink(/proc/PID/exe) == canonical(store_python)` where
@@ -76,7 +76,7 @@ receipts live in §8.
    …/environments/<uuid>/venv`), NOT `tools/facts.json` (which holds
    `python,uv,node…` only — verified live).
 7. `CLI python -I ignores PYTHONPATH so documented command imports fail`.
-   → Verified: `PYTHONPATH=/tmp/opencode python3 -I -c …` drops
+   → Verified: `PYTHONPATH=$TMPDIR python3 -I -c …` drops
    `PYTHONPATH` from `sys.path` (env still shows it). v2 install/run docs
    NEVER rely on `PYTHONPATH` under `-I`. Root-owned layout
    `/opt/hermes-maintenance/scripts/maintenance/cutover.py` is invoked as
@@ -238,9 +238,9 @@ receipts live in §8.
 
 - `python3 -m pm.build_env --help` → `--source/--out/--python/--cache…`
   (`pm/build_env.py`); `pm.client.build_environment(source,out,…)`.
-- `PYTHONPATH=/tmp/opencode python3 -I -c …` → `sys.path` WITHOUT
-  `/tmp/opencode` (proves I7 doc fix).
-- `python3 -m venv /tmp/opencode/probe/venv1` → `bin/python3` symlink chain
+- `PYTHONPATH=$TMPDIR python3 -I -c …` → `sys.path` WITHOUT
+  `$TMPDIR` (proves I7 doc fix).
+- `python3 -m venv $TMPDIR/probe/venv1` → `bin/python3` symlink chain
   → store `python3.14`; child `sleep` → `/proc exe`=store, `cmdline[0]`=venv,
   `cwd`=launch dir (proves §1.2).
 - `systemctl show hermes-gateway/-dashboard -p MainPID,ActiveEnterTimestamp,

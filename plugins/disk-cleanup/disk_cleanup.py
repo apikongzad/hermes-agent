@@ -3,7 +3,7 @@
 Rules: test files delete at task end (age >= 0); temp after 7 days; cron-output
 after 14 days; empty dirs under HERMES_HOME always. Prompt-only: research
 (keep 10 newest, > 30 days), chrome-profile > 14 days, any file > 500 MB.
-Scope: strictly HERMES_HOME and /tmp/hermes-*; never ~/.hermes/logs/ or system dirs.
+Scope: strictly HERMES_HOME and scratch hermes-*; never logs or system dirs.
 """
 
 from __future__ import annotations
@@ -58,6 +58,39 @@ def _validate_relative(relative: str) -> list[str] | None:
     return parts
 
 
+def _allowed_temp_prefixes() -> list[str]:
+    """Scratch-root temp prefixes (no system-temp literal): Hermes scratch + TMPDIR-aware temp.
+
+    Resolves via get_scratch_dir() (Hermes <home>/cache/scratch, TMPDIR-backed)
+    and tempfile.gettempdir() (TMPDIR-aware). Preserves confinement: callers
+    still require first component hermes-*, validated basename, no dot-dot.
+    Fail-closed to the prefixes that did resolve; an unresolvable root is
+    skipped after logging its traceback.
+    """
+    prefixes: list[str] = []
+    try:
+        from hermes_constants import get_scratch_dir as _get_scratch
+
+        prefixes.append(str(_get_scratch(prune=False)).rstrip("/") + "/")
+    except Exception:
+        logger.debug("scratch temp root resolve failed, skipping", exc_info=True)
+    try:
+        import tempfile as _tf
+
+        prefixes.append(_tf.gettempdir().rstrip("/") + "/")
+    except Exception:
+        logger.debug("system temp root resolve failed, skipping", exc_info=True)
+    return sorted(set(prefixes), key=len, reverse=True)
+
+
+def _match_temp_prefix(s: str) -> str | None:
+    """Remainder after an allowed scratch-temp prefix, else None (outside)."""
+    for prefix in _allowed_temp_prefixes():
+        if s.startswith(prefix):
+            return s[len(prefix):]
+    return None
+
+
 def _require_nofollow_capability() -> None:
     """Fail-closed when O_NOFOLLOW/O_DIRECTORY absent (no silent downgrade)."""
     if not hasattr(_os_mod, "O_NOFOLLOW") or not hasattr(_os_mod, "O_DIRECTORY"):
@@ -94,7 +127,7 @@ def tracer_available() -> bool:
 
         strace = _which("strace")
         if strace:
-            p = _sp.run([strace, "--version"], capture_output=True, text=True, timeout=5, check=False)
+            p = _sp.run([strace, "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, check=False)
             if p.returncode == 0:
                 return True
     except Exception:
@@ -254,7 +287,7 @@ def _walk_to_home(bfd: int) -> RootCapability | None:
 def bootstrap_roots() -> dict[str, RootCapability]:
     """Open / once to locate ONLY hermes_home into registry, then close bootstrap.
 
-    Lazy temp: NEVER enumerates /tmp/hermes-* (unbounded FD census exceeds
+    Lazy temp: NEVER enumerates scratch hermes-* (unbounded FD census exceeds
     RLIMIT). Temp instances bind lazily via bind_temp_basename() for the
     specifically requested allowed basename only, with bounded fds close.
     """
@@ -562,7 +595,7 @@ def _state_file(name: str) -> Path:
 def is_safe_path(path: Path) -> bool:
     """Anchored verdict without Path.resolve (no symlink-follow, no alias relax).
 
-    Lexical registry check only: under HERMES_HOME or /tmp/hermes-* basename.
+    Lexical registry check only: under HERMES_HOME or scratch hermes-* basename.
     Symlink/alias resolution happens only via held-fd bind (ELOOP refuse).
     """
     try:
@@ -581,8 +614,8 @@ def is_safe_path(path: Path) -> bool:
             if ".." in rel.split("/") or "" in rel.split("/"):
                 return False
             return True
-        if s.startswith("/tmp/"):
-            rest = s[len("/tmp/"):]
+        rest = _match_temp_prefix(s)
+        if rest is not None:
             first = rest.split("/", 1)[0] if rest else ""
             if not first.startswith("hermes-"):
                 return False
@@ -756,13 +789,13 @@ def track(path_str: str, category: str, silent: bool = False) -> bool:
                 rel = path_str[len(home_s.rstrip("/")) + 1:] if path_str != home_s else ""
                 if rel == "" or ".." in rel.split("/"):
                     return False
-            elif path_str.startswith("/tmp/"):
-                rest = path_str[len("/tmp/"):]
+            else:
+                rest = _match_temp_prefix(path_str)
+                if rest is None:
+                    return False
                 first = rest.split("/", 1)[0] if rest else ""
                 if not first.startswith("hermes-"):
                     return False
-            else:
-                return False
         except Exception:
             return False
     else:
@@ -1137,8 +1170,8 @@ def guess_category(path: Path) -> Optional[str]:
             if top in _EMPTY_DIR_PROTECTED_TOP_LEVEL:
                 # Only files age out; dirs themselves are not classified here.
                 pass
-        elif ps.startswith("/tmp/"):
-            # Name rules only for temp instances outside home.
+        elif _match_temp_prefix(ps) is not None:
+            # Name rules only for scratch temp instances outside home.
             pass
         else:
             # Outside registry lexically: still apply name rules for verdict,

@@ -296,6 +296,7 @@ class GatewayTurnProgressMixin:
         try:
             adapter = self._runner._delivery_adapter_for(ctx.source)
         except Exception:
+            logger.debug("delivery adapter resolve failed for progress", exc_info=True)
             adapter = None
         code_full, code_short = self._progress_terminal_blocks(adapter, tool_name, args, emoji)
         verbose = ctx.progress_mode == "verbose"
@@ -807,8 +808,8 @@ class GatewayTurnProgressMixin:
             self._schedule(
                 adapter.play_ack_in_voice(ctx._voice_ack_guild[0]), "voice ack scheduling error", loop=ctx._voice_ack_loop,
             )
-        except Exception as err:
-            logger.debug("voice ack schedule failed: %s", err)
+        except Exception:
+            logger.debug("voice ack schedule failed", exc_info=True)
 
     # Slack-native task cards ride agent.tool_start_callback / tool_complete_callback so start and
     # completion correlate by the REAL tool-call id; name-correlated progress_callback text events

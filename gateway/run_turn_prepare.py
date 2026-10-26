@@ -250,6 +250,7 @@ class GatewayTurnPrepareMixin:
                 route["model"], provider=runtime["provider"], base_url=runtime["base_url"], tier=tier,
             )
         except Exception:
+            logger.debug("fast-mode overrides resolve failed, using base", exc_info=True)
             overrides = None
         # Fast-mode keys (service_tier / speed) are top-level and don't collide with extra_body.
         route["request_overrides"] = _deep_merge_request_overrides(base_request_overrides, overrides or {})
