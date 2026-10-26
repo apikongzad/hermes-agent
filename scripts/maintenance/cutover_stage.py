@@ -241,6 +241,12 @@ def stage(host: Host, config: CutoverConfig, baseline: Baseline | None = None) -
 #                            # [computer-use]'s anchor (already "mcp").
 #   sms -> ("aiohttp",)       # pyproject [sms] is exactly ["aiohttp==..."].
 #   uvloop -> ("uvloop",)     # pyproject [uvloop] names uvloop>=... .
+# Sourced from the same schema:
+#   keychain -> ("keyring",)  # pyproject [keychain] == ["keyring==..."];
+#                            # pm/extras.py ANCHORS names "keyring", and
+#                            # agent/vault_keychain.py imports keyring (opt-in
+#                            # OS credential store; KeychainUnavailable when
+#                            # the extra or an OS keychain is absent).
 # Empty extras (cron/pty/nemo-relay == []) and meta bundles
 # (all/termux/termux-all == hermes-agent[...] self-refs) carry NO anchor:
 # they must never invent an import (no `sms`, no `cron`, no `pty`).
@@ -271,6 +277,7 @@ _EXTRA_ANCHORS: dict[str, tuple[str, ...]] = {
     ),
     "google-chat": ("google.cloud.pubsub_v1",),
     "google-meet": ("playwright.sync_api", "websockets"),
+    "keychain": ("keyring",),
     "kittentts": ("kittentts", "soundfile"),
     "matrix": ("mautrix", "asyncpg", "aiosqlite", "markdown", "aiohttp_socks"),
     "mcp": ("mcp",),

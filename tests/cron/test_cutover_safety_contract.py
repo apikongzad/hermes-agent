@@ -1361,7 +1361,10 @@ def test_verify_staged_extras_uses_real_pm_anchors_not_invented(tmp_path: Path) 
     Real mapping (pm/extras.py ANCHORS + sourced mcp/sms/uvloop):
     bedrock->boto3, stt-whisper->faster_whisper, vertex->google.auth,
     vision->PIL, wecom->defusedxml, audio-io->sounddevice+numpy,
-    doc-extract->anydoc, computer-use->mcp, trace-upload->huggingface_hub.
+    doc-extract->anydoc, computer-use->mcp, trace-upload->huggingface_hub,
+    keychain->keyring (pyproject [keychain]==["keyring==..."], pm ANCHORS,
+    agent/vault_keychain.py imports keyring; opt-in credential store,
+    KeychainUnavailable when the extra or an OS keychain is absent).
     Empty/meta extras (cron/pty/nemo-relay/all/termux*) carry no anchor.
     """
     import json as _json
@@ -1397,6 +1400,8 @@ def test_verify_staged_extras_uses_real_pm_anchors_not_invented(tmp_path: Path) 
     assert extras_anchors_for(["sms"]) == ["aiohttp"]
     assert extras_anchors_for(["mcp"]) == ["mcp"]
     assert extras_anchors_for(["uvloop"]) == ["uvloop"]
+    # Credential-store extra: keychain proves via keyring (opt-in, never invented).
+    assert extras_anchors_for(["keychain"]) == ["keyring"]
     # Unknown extras fail closed instead of inventing an import.
     try:
         extras_anchors_for(["not-a-real-extra-xyz"])
@@ -1419,6 +1424,21 @@ def test_verify_staged_extras_uses_real_pm_anchors_not_invented(tmp_path: Path) 
     assert {"mcp", "sms", "uvloop"} <= set(_EXTRA_ANCHORS)
     assert {"cron", "pty", "nemo-relay", "all", "termux", "termux-all"} <= set(
         _NO_ANCHOR_EXTRAS
+    )
+    # Every pyproject extra must be covered: otherwise the validator would
+    # block a legitimate latest env (e.g. CI's keychain extra) fail-closed.
+    import tomllib as _tomllib
+
+    _declared = set(
+        _tomllib.loads(
+            (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(
+                encoding="utf-8"
+            )
+        )["project"]["optional-dependencies"]
+    )
+    _covered = set(_EXTRA_ANCHORS) | set(_NO_ANCHOR_EXTRAS)
+    assert _declared <= _covered, (
+        f"validator blocks legitimate extras {_declared - _covered}"
     )
     # End-to-end through the staged probe: the 9 previously-failing extras
     # verify against a probe that reports their REAL anchors present.
@@ -1468,6 +1488,27 @@ def test_verify_staged_extras_uses_real_pm_anchors_not_invented(tmp_path: Path) 
     )
     for bogus in invented:
         assert bogus not in (captured.get("anchors") or [])
+    # Keychain end-to-end: staged venv carrying keyring passes; a core-only
+    # staged venv missing keyring fails (gate is real, no silent pass).
+    verify_staged_extras(host, config, staged, ["keychain"], False)
+
+    def _missing_keyring(argv: list[str]) -> RunResult:
+        if str(venv_python) in argv and "find_spec" in " ".join(argv):
+            return RunResult(0, _json.dumps({"keyring": False}), "")
+        return RunResult(0, "", "")
+
+    host3 = FakeHost()
+    _seed_success_host(host3, config)
+    host3.run_handlers = [
+        h for h in host3.run_handlers if str(venv_python) not in h[0]
+    ]
+    host3.on_run(str(venv_python), _missing_keyring)
+    try:
+        verify_staged_extras(host3, config, staged, ["keychain"], False)
+        _keyring_gate_real = False
+    except Exception:
+        _keyring_gate_real = True
+    assert _keyring_gate_real
 
 
 def test_candidate_web_dist_rejects_fake_and_requires_ignored(tmp_path: Path) -> None:
