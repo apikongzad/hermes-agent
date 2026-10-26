@@ -1294,13 +1294,14 @@ def test_stage_carries_live_selection_extras_not_core_only(tmp_path: Path) -> No
     argv = stage_argv(config, extras, use_all)
     assert "--extra" in argv and "web" in argv and "telegram" in argv
     assert "pm.build_env" in " ".join(argv)
-    # all-meta maps to --all-extras + remaining extras.
+    # all-meta maps to --all-extras ALONE (uv rejects --all-extras + --extra).
     facts_all = _json.dumps(
         {"packages": {"venv": {"stamp": "x", "extras": ["all", "telegram"], "environment": "y"}}}
     ).encode()
     extras2, use_all2 = selected_extras_from_facts(facts_all)
     assert use_all2 and extras2 == ["telegram"]
     assert "--all-extras" in stage_argv(config, extras2, use_all2)
+    assert "--extra" not in stage_argv(config, extras2, use_all2)
     # Anchors cover messaging/telegram platform deps (no live outbound).
     anchors = extras_anchors_for(["telegram", "web"])
     assert "telegram" in anchors and "fastapi" in anchors
@@ -1364,3 +1365,69 @@ def test_candidate_web_dist_rejects_fake_and_requires_ignored(tmp_path: Path) ->
     except Exception:
         receipt_ok = False
     assert not receipt_ok
+
+
+def test_stage_all_extras_alone_passes_pm_build_env_contract(tmp_path: Path, monkeypatch) -> None:
+    """Regression: live `all` + named extras stages as `--all-extras` alone.
+
+    Root stage failed: `uv sync exited 2: --all-extras cannot be used with --extra`.
+    stage_argv passed both; PM forwarded the conflict. `--all-extras` alone is the
+    semantic superset, so individual `--extra` are dropped when `all` is set.
+    Uses the ACTUAL `pm.build_env` parser with a bounded fake for the build only
+    (no venv mutation, no live effects).
+    """
+    import json as _json
+
+    import pm
+    import pm.client as _pm_client
+    from pm import build_env as _build_env
+    from scripts.maintenance.cutover_stage import (
+        selected_extras_from_facts,
+        stage_argv,
+    )
+    from scripts.maintenance.cutover_types import venv_dir_for
+
+    config = _make_config(tmp_path)
+    live_extras = [
+        "acp", "all", "audio-io", "bedrock", "computer-use", "discord",
+        "doc-extract", "edge-tts", "google", "slack", "stt-whisper",
+        "telegram", "trace-upload", "vertex", "vision", "web", "wecom", "youtube",
+    ]
+    facts = _json.dumps(
+        {"packages": {"venv": {"stamp": "x", "extras": live_extras, "environment": "y"}}}
+    ).encode()
+    extras, use_all = selected_extras_from_facts(facts)
+    assert use_all
+    assert "all" not in extras
+    assert sorted(extras) == sorted(e for e in live_extras if e != "all")
+
+    argv = stage_argv(config, extras, use_all)
+    assert "--all-extras" in argv
+    assert "--extra" not in argv
+    assert "pm.build_env" in " ".join(argv)
+
+    # Contract: the ACTUAL pm.build_env parser accepts the staged argv.
+    calls: dict = {}
+
+    def _fake_build(**kwargs):
+        calls.update(kwargs)
+        return tmp_path / "fake-python"
+
+    monkeypatch.setattr(pm, "build_environment", _fake_build)
+    monkeypatch.setattr(_pm_client, "build_environment", _fake_build)
+    cli_args = argv[argv.index("pm.build_env") + 1:]
+    assert _build_env.main(cli_args) == 0
+    assert calls.get("all_extras") is True
+    assert list(calls.get("extras") or []) == []
+    # Bounded fake built nothing: no venv mutation.
+    assert not venv_dir_for(config).exists()
+
+    # Explicit extras path still carries --extra and is accepted.
+    calls.clear()
+    argv2 = stage_argv(config, ["telegram", "web"], False)
+    assert "--all-extras" not in argv2
+    assert argv2.count("--extra") == 2
+    cli_args2 = argv2[argv2.index("pm.build_env") + 1:]
+    assert _build_env.main(cli_args2) == 0
+    assert calls.get("all_extras") is False
+    assert sorted(calls.get("extras") or []) == ["telegram", "web"]

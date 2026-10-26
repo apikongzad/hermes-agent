@@ -112,9 +112,13 @@ def stage_argv(
         str(out.absolute()),
     ]
     if all_extras:
+        # uv sync rejects `--all-extras` with `--extra` (exit 2). `--all-extras`
+        # alone is the semantic superset of the live selection (`all` + named
+        # extras), so drop the individual extras when `all` is set.
         argv.append("--all-extras")
-    for extra in sorted(set(extras or [])):
-        argv += ["--extra", extra]
+    else:
+        for extra in sorted(set(extras or [])):
+            argv += ["--extra", extra]
     return argv
 
 
