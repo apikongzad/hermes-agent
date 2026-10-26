@@ -145,7 +145,7 @@ def _strict_sibling_identity(host, sibling: Path) -> tuple[int, int]:
             raise ManifestError(
                 f"external controller refused: bad identity for {sibling}: {exc}"
             ) from exc
-        if not isinstance(raw_dev, int) or not isinstance(raw_ino, int):
+        if type(raw_dev) is not int or type(raw_ino) is not int:
             raise ManifestError(
                 f"external controller refused: uncertain device/inode for {sibling}"
             )
@@ -157,7 +157,7 @@ def _strict_sibling_identity(host, sibling: Path) -> tuple[int, int]:
             raise ManifestError(
                 f"external controller refused: not a regular file at {sibling}"
             )
-        return int(raw_dev), int(raw_ino)
+        return raw_dev, raw_ino
     except ManifestError:
         raise
     except Exception as exc:
@@ -204,11 +204,11 @@ def _bound_sibling_bytes(host, sibling: Path) -> tuple[bytes, int, int]:
             raise ManifestError(
                 f"external controller refused: {sibling} did not return bytes"
             )
-        if not isinstance(bdev, int) or not isinstance(bino, int):
+        if type(bdev) is not int or type(bino) is not int:
             raise ManifestError(
                 f"external controller refused: bad bound identity for {sibling}"
             )
-        return bytes(data), int(bdev), int(bino)
+        return bytes(data), bdev, bino
     except ManifestError:
         raise
     except Exception as exc:
@@ -246,23 +246,57 @@ def _refuse_candidate_alias(
     candidate_same = Path(candidate_src) / "scripts" / "maintenance" / name
     stat_fn = getattr(host, "stat_file", None)
     if stat_fn is None or not callable(stat_fn):
-        return
+        raise ManifestError(
+            f"external controller refused: uncertain candidate alias identity for {candidate_same}"
+        )
     try:
         cst = stat_fn(candidate_same)
     except FileNotFoundError:
         return
-    except (NotImplementedError, OSError, Exception):
-        return
+    except NotImplementedError as exc:
+        raise ManifestError(
+            f"external controller refused: uncertain candidate alias identity for {candidate_same}: {exc}"
+        ) from exc
+    except OSError as exc:
+        raise ManifestError(
+            f"external controller refused: uncertain candidate alias identity for {candidate_same}: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise ManifestError(
+            f"external controller refused: uncertain candidate alias identity for {candidate_same}: {exc}"
+        ) from exc
     try:
-        cdev = getattr(cst, "dev", None)
-        cino = getattr(cst, "ino", None)
-    except Exception:
-        return
-    if isinstance(cdev, int) and isinstance(cino, int):
-        if int(cdev) == int(dev) and int(cino) == int(ino):
+        from scripts.maintenance.cutover_types import FileStat as _FileStat
+
+        if not isinstance(cst, _FileStat):
+            raise ManifestError(
+                f"external controller refused: uncertain candidate alias identity for {candidate_same}"
+            )
+        try:
+            cdev = cst.dev
+            cino = cst.ino
+        except Exception as exc:
+            raise ManifestError(
+                f"external controller refused: uncertain candidate alias identity for {candidate_same}: {exc}"
+            ) from exc
+        if type(cdev) is not int or type(cino) is not int:
+            raise ManifestError(
+                f"external controller refused: uncertain candidate alias identity for {candidate_same}"
+            )
+        if type(dev) is not int or type(ino) is not int:
+            raise ManifestError(
+                f"external controller refused: uncertain device/inode for {sibling}"
+            )
+        if cdev == dev and cino == ino:
             raise ManifestError(
                 f"external controller refused: same device/inode as candidate {candidate_same}"
             )
+    except ManifestError:
+        raise
+    except Exception as exc:
+        raise ManifestError(
+            f"external controller refused: uncertain candidate alias identity for {candidate_same}: {exc}"
+        ) from exc
 
 
 def external_controller_provenance(
@@ -296,14 +330,14 @@ def external_controller_provenance(
             raise ManifestError(
                 f"external controller missing: {sibling}: {exc}"
             ) from exc
-        if int(bdev) != int(dev) or int(bino) != int(ino):
+        if bdev != dev or bino != ino:
             raise ManifestError(
                 f"external controller refused: identity changed for {sibling}"
             )
         if candidate_src is not None and str(candidate_src) not in ("", "."):
-            _refuse_candidate_alias(host, sibling, name, int(dev), int(ino), Path(candidate_src))
+            _refuse_candidate_alias(host, sibling, name, dev, ino, Path(candidate_src))
         sibling_sha256[name] = hashlib.sha256(raw).hexdigest()
-        sibling_stat[name] = {"dev": int(dev), "ino": int(ino)}
+        sibling_stat[name] = {"dev": dev, "ino": ino}
         contents[name] = raw
     orch = contents.get("cutover_orchestrate.py", b"")
     fac = contents.get("cutover.py", b"")
