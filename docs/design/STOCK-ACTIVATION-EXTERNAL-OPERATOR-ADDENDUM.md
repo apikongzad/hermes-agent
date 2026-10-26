@@ -133,7 +133,7 @@ could not be verified. It is not an instruction to stop a healthy fleet.
 6. `candidate-materialized`. Copy pinned SHA
    `daec3cd4c6d34f5befbc8f25a8af3e3b84b94f06` plus the generation closure
    into a second kernel read-only snapshot with the same backing-parent
-   rules and the same snapshot-copy fsync rule. Then run the I2 checks.
+   rules and the same snapshot-copy fsync rule. Then run the I2 checks in section 2.11.
    Any failure stops before publish.
 7. `stop-fenced`, before any unit publication and before any unit restore.
    Apply the fence rule in 2.5.
@@ -145,7 +145,7 @@ could not be verified. It is not an instruction to stop a healthy fleet.
    A restore at this point is the snapshot rollback unit in 2.7,
    only after the fence is re-verified. It is not a start of
    pre-transaction bytes.
-10. `restarted` by one explicit start, not by `Restart=`. Then I4 readback.
+10. `restarted` by one explicit start, not by `Restart=`. Then the I4 readback in section 2.12.
 11. `health-verified` using only the two probe contracts in 2.8.
 12. `committed` only after `health-verified`.
 
@@ -262,8 +262,7 @@ inactive:
 - After reload, `systemctl show` EnvironmentFiles for the dashboard is
   empty or absent. If it still names `/home/ubuntu/.hermes/.env` or any
   file, do not start and do not open the file.
-  Remain `stop-fenced`, or enter `stopped-unresolved` with journal reason
-  `missing-loader-evidence`.
+   Enter `stopped-unresolved` with journal reason `missing-loader-evidence`.
 - Forbidden loader key names must be absent from `Environment=` lines in
   the unit text being published and from environment key names
   `systemctl show` reports without opening a file.
@@ -280,11 +279,31 @@ A forbidden key after start is I2 failure and enters snapshot rollback
 only through the fence. It does not authorize the start that already
 happened.
 
-### 2.10 What an implementer must not follow
+### 2.10 What an implementer follows
 
-An implementer follows section 2 only.
+Section 2 is the procedure for order, fence, rollback start, snapshot-copy fsync, health probes, and the EnvironmentFile oracle.
 A base sentence named in section 3 is not a procedure.
 The replaced addendum hash is not a procedure.
+Base invariants not named in section 3 remain in force as restated in sections 2.11, 2.12, and 4.
+An implementer does not invent a second procedure for a remaining invariant.
+
+### 2.11 I2 checks, all required
+
+These restate base I2 without a second flag set and without an EnvironmentFile byte read.
+
+- Interpreter argv[0] and its resolved exe are inside the snapshot.
+- pyvenv.cfg is beside that venv, version_info=3.14.9, include-system-site-packages=false, and home resolves inside the snapshot.
+- python -I is argv, proven by the snapshot interpreter printing isolated=1, ignore_environment=1, safe_path=True, no_site=0.
+  If import hermes_cli.main fails under python -I with a clean environment and a cwd outside the tree, activation is blocked.
+- sitecustomize: find_spec("sitecustomize") under that python -I is None, or its origin is inside the snapshot. An outside origin blocks.
+- WorkingDirectory is explicit: gateway /home/ubuntu/.hermes, dashboard /home/ubuntu. These are user-data directories, not code roots. The python -I probe must show cwd absent from sys.path. Post-start /proc/PID/cwd must equal the journaled WorkingDirectory.
+- Loader-key absence uses section 2.9 only. Do not open /home/ubuntu/.hermes/.env.
+
+### 2.12 I4 readback and stop hooks
+
+Every start, including the snapshot rollback start, is followed by readback of boot id, MainPID, starttime, exe, cmdline, and cgroup. Mismatch or unreadable identity is failure. systemctl restart is an operator action, not a binding. Only the readback binds the new process to the intended bytes. Do not issue a second restart while that identity is ambiguous.
+
+Stop hooks: if post-reload systemctl show, while both units are inactive, still names /home/ubuntu/.hermes/hermes-agent/venv, block. Do not leave stop hooks on v0.21.7. If snapshot-bound stop modules cannot be proven inside the snapshot, a successful empty reset with no replacement hook is the required outcome. Dashboard has no stop hooks today. Do not add the v0.21.7 hooks.
 
 ## 3. Exhaustive supersession
 
@@ -292,7 +311,7 @@ Search of the base for restore, restart, authenticated, EnvironmentFile,
 fsync, rolling-back, and units-published added two further contradicting
 procedures beyond the six review ranges: lines 19-21, and the
 `rolling-back` next-state cells at lines 308, 309, and 318.
-No other base sentence is a contradicting procedure.
+No other base sentence is a contradicting procedure. Sentences not named in section 3 remain when section 4 lists them.
 Threat-model observations, updater non-use, and evidence preservation
 stay in section 4.
 
@@ -322,6 +341,15 @@ These are not reopened.
 | Base lines 360-363 and the durability definition at line 318 | remains |
 | Do not `git checkout` the live worktree. Do not restore `state.db`. | remains |
 | `ProductionHost.write_bytes` unfit | remains |
+| Base I1 immutability, including second-mount and hardlink denial | remains |
+| Base I2 as restated in section 2.11; no second flag set; no EnvironmentFile byte read | remains |
+| Base I4 readback as restated in section 2.12 | remains |
+| Base I6: user data is not overwritten; code rollback does not restore state.db; backup is fail-closed before publish | remains |
+| Base I7: unsigned digest outside the snapshot and outside uid-1001 trees; signed=false | remains |
+| Base I9 stop-hook disposition as restated in section 2.12 | remains |
+| Base I10: only in-place replacement of zzz-candidate.conf; other drop-ins untouched | remains |
+| Base I11: do not enable or install plugins in this transaction | remains |
+| Base I12: do not start /opt or cutover_*.py; 1c12738 is not activation authority | remains |
 | A1-A13 and B1-B7 | UNEXECUTED |
 
 Preservation of pre-transaction unit bytes in the journal remains required
