@@ -46,7 +46,20 @@ def test_basetemp_inside_the_native_home_is_relocated_outside_it(tmp_path, monke
     # One shared, prunable root (never a loose dir in the operator's $HOME) and gone when
     # this pytest exits; a run killed before that is swept as soon as the root is idle.
     assert relocated.parent.name == "hermes-pytest" and relocated.parent != Path.home()
+    # Isolate teardown from ambient /proc: controlled empty inventory, never a real scan
+    # that could see (and resolve) an unrelated live HERMES_HOME or signal it.
+    seen: dict = {}
+
+    def _no_processes(roots):
+        seen["roots"] = list(roots)
+        return []
+
+    monkeypatch.setattr(suite_conftest, "_processes_with_hermes_home_under", _no_processes)
+    killed: list = []
+    monkeypatch.setattr(suite_conftest.os, "kill", lambda pid, sig: killed.append((pid, sig)))
     suite_conftest.pytest_unconfigure(config)
+    assert seen["roots"][0] == relocated
+    assert killed == []
     assert not relocated.exists()
     # The sandbox derived from it no longer resolves to the native root.
     monkeypatch.setenv("HERMES_HOME", str(relocated / "t0" / "hermes_test"))
@@ -99,3 +112,125 @@ def test_relocation_root_sweeps_basetemps_of_killed_runs_and_keeps_live_ones(tmp
         os.utime(p, (ancient, ancient))
     assert suite_conftest._pytest_disk_temp_root(native) == root
     assert not dead.exists() and live.exists()
+
+
+def _fake_proc_inventory(monkeypatch, entries):
+    """Controlled /proc inventory: pid -> HERMES_HOME bytes (or None for no var)."""
+    import builtins
+    import io
+    import os
+
+    class _Entry:
+        def __init__(self, name):
+            self.name = name
+
+    def _fake_scandir(path):
+        assert os.fspath(path) == "/proc"
+        return [_Entry(str(pid)) for pid in entries]
+
+    real_open = builtins.open
+
+    def _fake_open(path, *args, **kwargs):
+        path_s = os.fspath(path)
+        if path_s.startswith("/proc/") and path_s.endswith("/environ"):
+            try:
+                pid = int(path_s.split("/")[2])
+            except ValueError:
+                return real_open(path, *args, **kwargs)
+            home = entries.get(pid)
+            data = b"" if home is None else b"HERMES_HOME=" + home + b"\0OTHER=1\0"
+            return io.BytesIO(data)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", _fake_scandir)
+    monkeypatch.setattr(builtins, "open", _fake_open)
+
+
+@pytest.mark.platforms("linux")
+def test_processes_scan_ignores_unrelated_real_home_without_resolving_it(tmp_path, monkeypatch):
+    """Unrelated live HERMES_HOME is never selected and never filesystem-touched.
+
+    Regression for the full-suite worker that listed an ambient
+    ``HERMES_HOME=/home/ubuntu/.hermes/runtime/...`` process: resolving it stats
+    guarded ancestors and trips HomeIOGuard. The lexical prefilter must skip it
+    before ``Path.resolve()`` while the owned tmp fixture still qualifies.
+    """
+    import os
+
+    owned_root = tmp_path / "owned"
+    owned_root.mkdir()
+    owned_home = owned_root / "hermes_test"
+    owned_home.mkdir()
+    try:
+        real_roots = suite_conftest._REAL_HERMES_ROOT_CANDIDATES
+        unrelated = (
+            real_roots[0] / "runtime" / "cutover-generations-next"
+            if real_roots
+            else Path.home() / ".hermes" / "runtime-probe"
+        )
+    except Exception:
+        unrelated = Path.home() / ".hermes" / "runtime-probe"
+    owned_pid, foreign_pid, empty_pid = 424201, 424202, 424203
+    self_pid = os.getpid()
+    _fake_proc_inventory(
+        monkeypatch,
+        {
+            owned_pid: os.fsencode(str(owned_home)),
+            foreign_pid: os.fsencode(str(unrelated)),
+            empty_pid: None,
+            self_pid: os.fsencode(str(owned_home)),
+        },
+    )
+    real_resolve = Path.resolve
+    resolved_seen: list[str] = []
+
+    def _tracking_resolve(self, *args, **kwargs):
+        resolved_seen.append(os.fspath(self))
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", _tracking_resolve)
+    found = suite_conftest._processes_with_hermes_home_under([owned_root])
+    assert found == [owned_pid]
+    assert os.fspath(unrelated) not in resolved_seen
+
+
+@pytest.mark.platforms("linux")
+def test_reap_only_signals_owned_fixture_home(tmp_path, monkeypatch):
+    """Identity never broadens: teardown SIGTERMs the owned pid, never the foreign one."""
+    import os
+    import signal
+
+    owned_root = tmp_path / "session-root"
+    owned_root.mkdir()
+    owned_home = owned_root / "hermes_test"
+    owned_home.mkdir()
+    try:
+        real_roots = suite_conftest._REAL_HERMES_ROOT_CANDIDATES
+        unrelated = (
+            real_roots[0] / "runtime" / "cutover-generations-next"
+            if real_roots
+            else Path.home() / ".hermes" / "runtime-probe"
+        )
+    except Exception:
+        unrelated = Path.home() / ".hermes" / "runtime-probe"
+    owned_pid, foreign_pid = 424211, 424212
+    _fake_proc_inventory(
+        monkeypatch,
+        {
+            owned_pid: os.fsencode(str(owned_home)),
+            foreign_pid: os.fsencode(str(unrelated)),
+        },
+    )
+    assert suite_conftest._processes_with_hermes_home_under([owned_root]) == [owned_pid]
+    killed: list = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    config = SimpleNamespace(
+        _tmp_path_factory=SimpleNamespace(_basetemp=owned_root),
+        _hermes_relocated_basetemp=None,
+        option=SimpleNamespace(basetemp=str(owned_root)),
+    )
+    # Keep the session-sandbox root from widening identity: point it at the owned root.
+    monkeypatch.setenv("HERMES_TEST_SANDBOX_HOME", str(owned_root))
+    reaped = suite_conftest._reap_session_hermes_processes(config)
+    assert reaped == [owned_pid]
+    assert killed == [(owned_pid, signal.SIGTERM)]

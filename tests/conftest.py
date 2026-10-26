@@ -1099,10 +1099,19 @@ def _processes_with_hermes_home_under(roots) -> list[int]:
 
     Linux only (``/proc/<pid>/environ``; unreadable entries are another user's and skipped).
     Elsewhere the scan is empty: a test-spawned daemon there is the per-test guard's problem.
+
+    The candidate ``HERMES_HOME`` is first checked lexically (``abspath`` without touching
+    the FS) against the resolved roots: an unrelated live home (e.g. the operator's
+    ``~/.hermes/...`` visible from another session) is skipped without ``Path.resolve()``,
+    which would stat every ancestor and trip the real-home tripwire. Only a lexically
+    plausible candidate is resolved, so the confirming ``is_relative_to`` still sees
+    through symlinks. Skipping is fail-closed (a symlink alias into a root is missed as
+    a leak, never as a foreign kill), so identity never broadens.
     """
     if not sys.platform.startswith("linux") or not os.path.isdir("/proc"):
         return []
     resolved = [Path(r).resolve() for r in roots if r]
+    resolved_strs = [os.path.normcase(os.fspath(root)) for root in resolved]
     found = []
     for entry in os.scandir("/proc"):
         if not entry.name.isdigit() or int(entry.name) == os.getpid():
@@ -1116,8 +1125,26 @@ def _processes_with_hermes_home_under(roots) -> list[int]:
         if not home:
             continue
         try:
-            path = Path(os.fsdecode(home)).resolve()
+            candidate_raw = os.fsdecode(home)
         except (OSError, ValueError):
+            continue
+        try:
+            lexical_abs = os.path.normcase(os.path.abspath(os.path.expanduser(candidate_raw)))
+        except (OSError, ValueError):
+            continue
+        plausible = False
+        for root_str in resolved_strs:
+            if lexical_abs == root_str or (
+                lexical_abs.startswith(root_str + os.sep) if root_str != os.sep
+                else lexical_abs.startswith(os.sep)
+            ):
+                plausible = True
+                break
+        if not plausible:
+            continue
+        try:
+            path = Path(candidate_raw).resolve()
+        except (OSError, ValueError, RuntimeError):
             continue
         if any(path == root or path.is_relative_to(root) for root in resolved):
             found.append(int(entry.name))
