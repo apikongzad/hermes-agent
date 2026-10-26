@@ -37,6 +37,19 @@ and runs it with `-I` and NO `PYTHONPATH` (the facade inserts the safe prefix
 itself), so `scripts.maintenance.*` resolves to root-owned bytes, never
 mutable user modules.
 
+Controller identity is external, never the candidate tree: stock candidates
+have no `scripts/maintenance`, and a copy planted in `candidate_src` never
+satisfies the preflight gate. Preflight resolves the facade from
+`config.controller_path` (CLI: the executing `cutover.py`) or the running
+maintenance module file, refuses a resolved path inside `candidate_src`,
+and verifies every `EXPECTED_SIBLINGS` file beside the facade via
+`host.read_bytes` only. `ROOT_PREFIX` is `/opt/hermes-maintenance` only;
+`/opt/hermes-maintenance-next` is not a recognized root prefix. No signature
+exists: provenance records self-measured `sibling_sha256`,
+`root_installed`, `signed:false`, and the honest `trust_limit`
+(`user-writable-source-untrusted-no-signature`, or
+`operator-install-snapshot-not-signature` when root-installed).
+
 ## Live baseline (verified this host, encoded as defaults)
 
 - Gateway effective `ExecStart=/home/ubuntu/.local/bin/hermes gateway run`,

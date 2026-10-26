@@ -77,6 +77,7 @@ from scripts.maintenance.cutover_manifest import (
     EXPECTED_SIBLINGS,
     ManifestError,
     assert_no_candidate_import,
+    external_controller_provenance,
     is_root_installed,
 )
 from scripts.maintenance.cutover_orchestrate import orchestrate, resume
@@ -125,6 +126,7 @@ __all__ = [
     "assert_no_candidate_import",
     "check_health",
     "check_rollback_health",
+    "external_controller_provenance",
     "git_inner_argv",
     "has_terminal_receipt",
     "is_hex_sha",

@@ -22,6 +22,10 @@ from pathlib import Path
 
 from scripts.maintenance.cutover_git import run_owner_git
 from scripts.maintenance.cutover_journal import append
+from scripts.maintenance.cutover_manifest import (
+    ManifestError,
+    external_controller_provenance,
+)
 from scripts.maintenance.cutover_receipt import (
     PriorActivation,
     ReceiptError,
@@ -340,6 +344,41 @@ def _make_preflight_baseline(
     )
 
 
+def _resolve_external_facade(config: CutoverConfig) -> Path:
+    """Controller identity comes from the executing external tool, never the candidate."""
+    ctrl = getattr(config, "controller_path", None)
+    if ctrl is not None and str(ctrl) not in ("", "."):
+        return Path(ctrl)
+    # Fallback: the running maintenance module file (imported package), not the candidate.
+    return Path(__file__).resolve().parent / "cutover.py"
+
+
+def _refuse_controller_inside_candidate(facade: Path, candidate_src: Path) -> None:
+    """A copy planted in the candidate must not satisfy the gate."""
+    try:
+        fac_res = Path(facade).resolve()
+    except OSError as exc:
+        raise PreflightError(
+            f"external controller missing: cannot resolve {facade}: {exc}"
+        ) from exc
+    try:
+        cand_res = Path(candidate_src).resolve()
+    except OSError as exc:
+        raise PreflightError(
+            f"external controller missing: cannot resolve candidate {candidate_src}: {exc}"
+        ) from exc
+    try:
+        inside = fac_res == cand_res or fac_res.is_relative_to(cand_res)
+    except (OSError, RuntimeError, ValueError):
+        c_str = str(cand_res)
+        f_str = str(fac_res)
+        inside = f_str == c_str or f_str.startswith(c_str.rstrip("/") + "/")
+    if inside:
+        raise PreflightError(
+            f"external controller refused: resolved path inside candidate_src: {fac_res}"
+        )
+
+
 def preflight(host: Host, config: CutoverConfig) -> Baseline:
     """Capture reversible baseline. Any failure is fail-closed (raise, no mutation)."""
     if not is_hex_sha(config.candidate_sha):
@@ -353,32 +392,16 @@ def preflight(host: Host, config: CutoverConfig) -> Baseline:
     if "HERMES_EXE" in config.candidate_dropin_name:
         raise PreflightError("dropin name must not imply HERMES_EXE selects the interpreter")
 
-    candidate_facade = (
-        Path(config.candidate_src) / "scripts" / "maintenance" / "cutover.py"
-    )
-    candidate_orchestrator = (
-        Path(config.candidate_src) / "scripts" / "maintenance" / "cutover_orchestrate.py"
-    )
+    # External controller gate (never the candidate tree): stock candidates have
+    # no scripts/maintenance. Verify the executing tool's sibling set via
+    # host.read_bytes only. Missing/unreadable/tampered external siblings fail
+    # closed before any mutation. Candidate copies are never consulted.
+    facade = _resolve_external_facade(config)
+    _refuse_controller_inside_candidate(facade, Path(config.candidate_src))
     try:
-        facade_bytes = host.read_bytes(candidate_facade)
-    except FileNotFoundError:
-        raise PreflightError(f"candidate tree has no controller: {candidate_facade}")
-    except OSError as exc:
-        raise PreflightError(f"cannot read candidate controller: {exc}") from exc
-    try:
-        orchestrator_bytes = host.read_bytes(candidate_orchestrator)
-    except FileNotFoundError:
-        raise PreflightError(
-            f"candidate tree has no orchestrator: {candidate_orchestrator}"
-        )
-    except OSError as exc:
-        raise PreflightError(f"cannot read candidate orchestrator: {exc}") from exc
-    # Facade re-exports (import), implementation defines. Checking the facade
-    # for `def orchestrate` always refused real trees (facade only imports).
-    if b"def orchestrate" not in orchestrator_bytes:
-        raise PreflightError("candidate controller is not the cutover orchestrator")
-    if b"orchestrate" not in facade_bytes:
-        raise PreflightError("candidate facade does not re-export the orchestrator")
+        controller_provenance = external_controller_provenance(host, facade)
+    except ManifestError as exc:
+        raise PreflightError(str(exc)) from exc
 
     if not (config.candidate_dropin_name > "zz-runtime-3.14.9.conf"):
         raise PreflightError("candidate dropin must sort AFTER zz-runtime-3.14.9.conf")
@@ -474,6 +497,7 @@ def preflight(host: Host, config: CutoverConfig) -> Baseline:
         "dashboard_pid": dash_pid,
         "dashboard_exe": dash_exe,
         "selection_facts": str(sel_path),
+        "controller_provenance": controller_provenance,
     }
     if prior is not None:
         detail["baseline_receipt"] = str(prior.receipt_path)

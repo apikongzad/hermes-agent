@@ -6,7 +6,7 @@ live effects (no systemctl, no git checkout, no sends).
 
 Bar (each maps to a parent REJECT finding on v1):
 - PARENT == live HEAD, CANDIDATE == candidate HEAD, never stale.
-- No cgroup gate; controller lives inside the candidate tree.
+- No cgroup gate; controller is external, never inside the candidate tree.
 - No outbound sends: success/failure is a local journal receipt only.
 - Dashboard health is 9119 /api/health with commit==candidate, never 3000/8501
   or bare /health 302.
@@ -32,9 +32,11 @@ import sys
 from pathlib import Path
 
 from scripts.maintenance import cutover as facade
+from scripts.maintenance.cutover_manifest import EXPECTED_SIBLINGS
 from scripts.maintenance.cutover_orchestrate import orchestrate
 from scripts.maintenance.cutover_types import (
     CutoverConfig,
+    FileStat,
     Host,
     RunResult,
     selection_facts_path_for,
@@ -51,6 +53,7 @@ class FakeHost(Host):
     def __init__(self) -> None:
         self.timeline: list[tuple[str, str]] = []
         self.files: dict[str, bytes | Exception] = {}
+        self.stats: dict[str, FileStat | Exception] = {}
         self.exes: dict[int, str | Exception] = {}
         self.cmdlines: dict[int, list[str]] = {}
         self.cwds: dict[int, str] = {}
@@ -134,6 +137,17 @@ class FakeHost(Host):
         self.timeline.append(("start", str(pid)))
         return self.start_times.get(pid, 100)
 
+    def stat_file(self, path: Path) -> FileStat:
+        self.timeline.append(("stat", str(path)))
+        key = str(path)
+        if key in self.stats:
+            value = self.stats[key]
+            if isinstance(value, Exception):
+                raise value
+            assert isinstance(value, FileStat)
+            return value
+        raise FileNotFoundError(key)
+
     def http_get(self, url: str, timeout: int = 10) -> tuple[int, str]:
         self.timeline.append(("http", url))
         if url in self.http:
@@ -160,10 +174,28 @@ def _make_config(tmp_path: Path, **overrides: object) -> CutoverConfig:
         "dashboard_dropin_dir": tmp_path / "dash.d",
         "candidate_dropin_name": "zzz-candidate.conf",
         "dashboard_port": 9119,
-        "controller_path": None,
+        "controller_path": tmp_path / "ext-controller" / "cutover.py",
     }
     fields.update(overrides)
     return CutoverConfig(**fields)  # type: ignore[arg-type]
+
+
+def _seed_external_controller(host: FakeHost, controller_facade: Path) -> dict[str, str]:
+    """Seed the EXTERNAL controller outside candidate_src (hermetic, no disk)."""
+    import hashlib as _hashlib
+
+    ctrl_dir = Path(controller_facade).parent
+    digests: dict[str, str] = {}
+    for name in EXPECTED_SIBLINGS:
+        if name == "cutover.py":
+            data = b"from scripts.maintenance.cutover_orchestrate import orchestrate, resume\n"
+        elif name == "cutover_orchestrate.py":
+            data = b"def orchestrate(host, config): pass\ndef resume(host, config): pass\n"
+        else:
+            data = f"# {name} external stub\n".encode()
+        host.files[str(ctrl_dir / name)] = data
+        digests[name] = _hashlib.sha256(data).hexdigest()
+    return digests
 
 
 def _fresh_state(pid: int, sha: str) -> bytes:
@@ -178,13 +210,9 @@ def _seed_success_host(host: FakeHost, config: CutoverConfig) -> Path:
     venv_python = gen / "venv" / "bin" / "python3"
     store_home = Path("/opt/store/python/bin")
     store_exe = store_home / "python3.14"
-    # Real layout: facade re-exports, orchestrator defines.
-    host.files[str(config.candidate_src / "scripts" / "maintenance" / "cutover.py")] = (
-        b"from scripts.maintenance.cutover_orchestrate import orchestrate, resume"
-    )
-    host.files[
-        str(config.candidate_src / "scripts" / "maintenance" / "cutover_orchestrate.py")
-    ] = (b"def orchestrate(host, config): pass\ndef resume(host, config): pass\n")
+    # External controller outside candidate_src; stock candidate has no maintenance.
+    assert config.controller_path is not None
+    _seed_external_controller(host, Path(config.controller_path))
     # Staged pyvenv.cfg binds the expected store interpreter (exact).
     host.files[str(gen / "venv" / "pyvenv.cfg")] = (
         f"home = {store_home}\nexecutable = {store_exe}\nversion_info = 3.14.9\n".encode()
@@ -363,7 +391,7 @@ def test_no_cgroup_gate_controller_ignores_worker_invisible_path(tmp_path: Path)
 
 
 def test_controller_lives_inside_candidate_tree_under_test() -> None:
-    """The shipped controller file is inside the repo (candidate) tree, not /tmp."""
+    """Checkout layout: the shipped controller file sits in the repo tree (external tool, not candidate_src)."""
     repo_root = Path(__file__).resolve().parents[2]
     controller_file = Path(facade.__file__).resolve()
     assert controller_file.is_relative_to(repo_root)
@@ -690,35 +718,40 @@ def test_preflight_accepts_real_controller_files() -> None:
 
 
 def test_preflight_controller_gate_passes_with_real_bytes(tmp_path: Path) -> None:
-    """FakeHost seeded with REAL controller bytes gets past the controller gate."""
+    """FakeHost seeded with REAL external bytes outside candidate passes the gate."""
     from scripts.maintenance.cutover_preflight import PreflightError, preflight
 
     repo_root = Path(__file__).resolve().parents[2]
-    config = _make_config(tmp_path, candidate_src=repo_root)
+    # Stock-like candidate: hermetic temp dir with no scripts/maintenance.
+    config = _make_config(tmp_path)
     host = FakeHost()
     _seed_success_host(host, config)
-    # Overwrite the minimal facsimile with the real file bytes.
-    host.files[str(repo_root / "scripts" / "maintenance" / "cutover.py")] = (
+    # Overwrite the minimal external facsimile with the real file bytes.
+    ctrl_dir = Path(config.controller_path).parent
+    host.files[str(ctrl_dir / "cutover.py")] = (
         repo_root / "scripts" / "maintenance" / "cutover.py"
     ).read_bytes()
     host.files[
-        str(repo_root / "scripts" / "maintenance" / "cutover_orchestrate.py")
+        str(ctrl_dir / "cutover_orchestrate.py")
     ] = (repo_root / "scripts" / "maintenance" / "cutover_orchestrate.py").read_bytes()
     try:
-        preflight(host, config)
+        baseline = preflight(host, config)
     except PreflightError as exc:
-        # Must get past the controller gate: any failure now is HEAD/units,
-        # never "not the cutover orchestrator".
-        assert "cutover orchestrator" not in str(exc)
-        assert "orchestrator" not in str(exc).lower() or "HEAD" in str(exc) or "live" in str(exc)
+        # Must get past the external controller gate: any failure now is
+        # HEAD/units/live reads, never the external controller refusal.
+        msg = str(exc)
+        assert "candidate tree has no controller" not in msg
+        assert "cutover orchestrator" not in msg
+        assert "external controller" not in msg.lower()
         return
-    # If the fake SHAs happened to match (they cannot: CANDIDATE_SHA is fake),
-    # success also proves the gate passed.
-    assert True
+    # Seeded success host carries matching SHAs/units/state, so preflight can
+    # succeed; success itself proves the external gate passed.
+    assert baseline.candidate_head == CANDIDATE_SHA
+    assert baseline.live_head == PARENT_SHA
 
 
 def test_cli_preflight_reaches_beyond_controller_gate(tmp_path: Path) -> None:
-    """Real `cutover.py preflight` CLI on real bytes fails past the controller gate."""
+    """Real `cutover.py preflight` CLI: stock candidate fails past the external gate."""
     repo_root = Path(__file__).resolve().parents[2]
     script = repo_root / "scripts" / "maintenance" / "cutover.py"
     real_head = subprocess.run(
@@ -726,9 +759,14 @@ def test_cli_preflight_reaches_beyond_controller_gate(tmp_path: Path) -> None:
         capture_output=True, text=True, timeout=30, check=True,
     ).stdout.strip()
     assert len(real_head) == 40
+    # Stock-like candidate: temp dir with no scripts/maintenance (never repo_root,
+    # otherwise the executing facade would be inside candidate_src and must refuse).
+    stock = tmp_path / "stock-candidate"
+    stock.mkdir(exist_ok=True)
+    assert not (stock / "scripts" / "maintenance" / "cutover.py").exists()
     journal = tmp_path / "journal.jsonl"
     home = tmp_path / "home"
-    home.mkdir()
+    home.mkdir(exist_ok=True)
     env = {
         "PATH": "/usr/bin:/bin",
         "HOME": str(tmp_path),
@@ -739,7 +777,7 @@ def test_cli_preflight_reaches_beyond_controller_gate(tmp_path: Path) -> None:
             sys.executable, "-I", "-B", str(script), "preflight",
             "--candidate-sha", "a" * 40,
             "--parent-sha", real_head,
-            "--candidate-src", str(repo_root),
+            "--candidate-src", str(stock),
             "--live-tree", str(repo_root),
             "--generation-root", str(tmp_path / "generations"),
             "--journal", str(journal),
@@ -750,11 +788,186 @@ def test_cli_preflight_reaches_beyond_controller_gate(tmp_path: Path) -> None:
         capture_output=True, text=True, timeout=60,
         cwd=str(repo_root), env=env, check=False,
     )
-    # Must fail closed (candidate HEAD != fake SHA, or live units unreadable
+    # Must fail closed (stock has no git HEAD == fake SHA, or live units unreadable
     # as non-root) but NOT on the controller gate.
     assert done.returncode == 2
     err = (done.stderr or "") + (done.stdout or "")
+    assert "candidate tree has no controller" not in err
     assert "cutover orchestrator" not in err
+    assert "external controller" not in err.lower()
+
+
+def test_stock_candidate_without_maintenance_passes_external_gate(tmp_path: Path) -> None:
+    """Stock-like candidate (no scripts/maintenance) + valid external controller succeeds."""
+    from scripts.maintenance.cutover_preflight import preflight
+
+    config = _make_config(tmp_path)
+    host = FakeHost()
+    _seed_success_host(host, config)
+    # Stock proof: no controller bytes were planted in the candidate tree.
+    for key in host.files:
+        assert not (
+            key.startswith(str(config.candidate_src))
+            and "scripts/maintenance/cutover" in key
+        ), f"candidate must stay stock-like, found {key}"
+    baseline = preflight(host, config)
+    assert baseline.candidate_head == CANDIDATE_SHA
+    assert baseline.live_head == PARENT_SHA
+    # Full success path still passes through the real orchestrator.
+    config2 = _make_config(tmp_path, journal_path=tmp_path / "journal-full.jsonl")
+    host2 = FakeHost()
+    _seed_success_host(host2, config2)
+    result = orchestrate(host2, config2)
+    assert result.status == "success"
+    # Gate reads came from the external dir, never the candidate maintenance path.
+    ctrl_dir = str(Path(config2.controller_path).parent)
+    assert any(
+        kind == "read" and ctrl_dir in detail and "cutover_orchestrate.py" in detail
+        for kind, detail in host2.timeline
+    )
+    assert not any(
+        kind == "read"
+        and str(config2.candidate_src) in detail
+        and "scripts/maintenance/cutover" in detail
+        for kind, detail in host2.timeline
+    )
+
+
+def test_candidate_copy_does_not_satisfy_external_gate(tmp_path: Path) -> None:
+    """A valid-looking candidate copy is ignored when the external controller is bad."""
+    from scripts.maintenance.cutover_preflight import PreflightError, preflight
+
+    config = _make_config(tmp_path)
+    host = FakeHost()
+    _seed_success_host(host, config)
+    # Plant a valid-looking copy in the candidate (attacker/stale stock confusion).
+    host.files[str(config.candidate_src / "scripts" / "maintenance" / "cutover.py")] = (
+        b"from scripts.maintenance.cutover_orchestrate import orchestrate"
+    )
+    host.files[
+        str(config.candidate_src / "scripts" / "maintenance" / "cutover_orchestrate.py")
+    ] = b"def orchestrate(host, config): pass\n"
+    ctrl_dir = Path(config.controller_path).parent
+    # Case A: external orchestrator missing entirely.
+    host.files.pop(str(ctrl_dir / "cutover_orchestrate.py"), None)
+    try:
+        preflight(host, config)
+        missing_ok = True
+    except PreflightError as exc:
+        missing_ok = False
+        msg = str(exc)
+        assert "external controller" in msg.lower()
+        assert "candidate tree has no controller" not in msg
+        assert "candidate tree satisfied" not in msg.lower()
+    assert not missing_ok
+    # Case B: external present but tampered (no `def orchestrate`).
+    config2 = _make_config(tmp_path, journal_path=tmp_path / "journal-tampered.jsonl")
+    host2 = FakeHost()
+    _seed_success_host(host2, config2)
+    host2.files[str(config2.candidate_src / "scripts" / "maintenance" / "cutover.py")] = (
+        b"from scripts.maintenance.cutover_orchestrate import orchestrate"
+    )
+    host2.files[
+        str(config2.candidate_src / "scripts" / "maintenance" / "cutover_orchestrate.py")
+    ] = b"def orchestrate(host, config): pass\n"
+    ctrl2 = Path(config2.controller_path).parent
+    host2.files[str(ctrl2 / "cutover_orchestrate.py")] = b"# tampered: no define here\n"
+    try:
+        preflight(host2, config2)
+        tampered_ok = True
+    except PreflightError as exc2:
+        tampered_ok = False
+        msg2 = str(exc2)
+        assert "external controller" in msg2.lower()
+        assert "candidate tree satisfied" not in msg2.lower()
+    assert not tampered_ok
+
+
+def test_resolved_controller_path_inside_candidate_refused(tmp_path: Path) -> None:
+    """A resolved facade inside candidate_src is refused even with valid bytes."""
+    from scripts.maintenance.cutover_preflight import PreflightError, preflight
+
+    candidate = tmp_path / "candidate"
+    inside_facade = candidate / "scripts" / "maintenance" / "cutover.py"
+    config = _make_config(tmp_path, controller_path=inside_facade)
+    host = FakeHost()
+    _seed_success_host(host, config)
+    try:
+        preflight(host, config)
+        inside_ok = True
+    except PreflightError as exc:
+        inside_ok = False
+        msg = str(exc)
+        assert "external controller" in msg.lower()
+        assert "inside candidate" in msg.lower() or "refused" in msg.lower()
+        assert "candidate tree satisfied" not in msg.lower()
+    assert not inside_ok
+    # Orchestrate must also fail closed (preflight failure, fleet untouched).
+    config2 = _make_config(
+        tmp_path,
+        controller_path=inside_facade,
+        journal_path=tmp_path / "journal-inside.jsonl",
+    )
+    host2 = FakeHost()
+    _seed_success_host(host2, config2)
+    result = orchestrate(host2, config2)
+    assert result.status == "failed"
+    assert "fleet untouched" in result.reason
+    assert "preflight" in result.reason
+
+
+def test_journal_preflight_ok_carries_controller_provenance(tmp_path: Path) -> None:
+    """preflight-ok journal detail records honest external provenance (no signature)."""
+    import hashlib as _hashlib
+
+    from scripts.maintenance.cutover_journal import read_all
+    from scripts.maintenance.cutover_manifest import EXPECTED_SIBLINGS as _EXPECTED
+    from scripts.maintenance.cutover_preflight import preflight
+
+    config = _make_config(tmp_path)
+    host = FakeHost()
+    _seed_success_host(host, config)
+    baseline = preflight(host, config)
+    assert baseline.candidate_head == CANDIDATE_SHA
+    rows = read_all(host, config.journal_path)
+    oks = [r for r in rows if r.get("phase") == "preflight-ok"]
+    assert oks, "expected a preflight-ok journal entry"
+    prov = oks[-1].get("detail", {}).get("controller_provenance")
+    assert isinstance(prov, dict)
+    assert prov.get("controller_path") == str(config.controller_path)
+    assert prov.get("signed") is False
+    assert prov.get("root_installed") is False
+    assert prov.get("trust_limit") == "user-writable-source-untrusted-no-signature"
+    assert prov.get("stat_available") is False
+    assert "signer" not in prov
+    assert "signature" not in prov
+    assert "trusted" not in prov
+    digests = prov.get("sibling_sha256")
+    assert isinstance(digests, dict)
+    ctrl_dir = Path(config.controller_path).parent
+    for name in _EXPECTED:
+        data = host.files[str(ctrl_dir / name)]
+        assert isinstance(data, bytes)
+        assert digests.get(name) == _hashlib.sha256(data).hexdigest()
+
+
+def test_symlink_controller_refused(tmp_path: Path) -> None:
+    """A symlinked external facade is refused even though byte content is valid."""
+    from scripts.maintenance.cutover_preflight import PreflightError, preflight
+
+    config = _make_config(tmp_path)
+    host = FakeHost()
+    _seed_success_host(host, config)
+    host.stats[str(config.controller_path)] = FileStat(
+        uid=0, gid=0, mode=0o600, is_symlink=True, is_file=True
+    )
+    try:
+        preflight(host, config)
+        link_ok = True
+    except PreflightError as exc:
+        link_ok = False
+        assert "external controller" in str(exc).lower()
+    assert not link_ok
 
 
 def test_isolated_launch_prep_reports_candidate_sha(tmp_path: Path) -> None:

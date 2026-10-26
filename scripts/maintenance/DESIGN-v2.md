@@ -159,10 +159,26 @@ receipts live in §8.
 ## 5. Invariants (fail-closed)
 
 - I1 `candidate_sha != parent_sha`, both 40-hex; `dashboard_port==9119`.
-- I2 Controller facade lives inside `candidate_src/scripts/maintenance/cutover.py`
-  and re-exports `orchestrate`; the implementation
-  `candidate_src/scripts/maintenance/cutover_orchestrate.py` contains
-  `def orchestrate` (facade-only `def` check always refused real trees).
+- I2 External controller identity (never the candidate tree): stock candidates
+  have no `scripts/maintenance`. The facade resolves from
+  `config.controller_path` when set, else the running maintenance module
+  file (the imported `cutover_preflight.py` package sibling `cutover.py`);
+  CLI sets it to the executing `cutover.py`. A resolved facade path inside
+  `candidate_src` (equality or relative containment) is refused. Every
+  `EXPECTED_SIBLINGS` name must be readable beside the facade via
+  `host.read_bytes` only; `cutover_orchestrate.py` must contain
+  `def orchestrate` and `cutover.py` must contain `orchestrate` (candidate
+  copies are never consulted). Missing/unreadable/tampered external
+  siblings fail closed before any mutation. Provenance
+  (`controller_provenance` in the `preflight-ok` journal detail) records
+  only `controller_path`, self-measured `sibling_sha256`,
+  `root_installed` (`/opt/hermes-maintenance` only; `-next` is not a
+  recognized prefix), `signed:false` always, `trust_limit`
+  (`user-writable-source-untrusted-no-signature` when not root-installed,
+  `operator-install-snapshot-not-signature` when root-installed),
+  `stat_available` (true only when `host.stat_file` succeeds; symlink or
+  non-file refuses; `NotImplementedError`/`OSError` yields false without
+  failing the byte gate). No signature, signer, or `trusted:true` exists.
 - I3 `candidate_dropin_name > zz-runtime-3.14.9.conf` (lexicographic win).
 - I4 Staging argv is EXACTLY the documented PM entrypoint
   (`pm.build_env --source <abs candidate> --out <abs side>/venv [--python <abs>]`)
@@ -213,8 +229,12 @@ receipts live in §8.
   (fail-closed, never None);
   `git -C <live> rev-parse HEAD == parent_sha`;
   `git -C <candidate> rev-parse HEAD == candidate_sha`;
-  `candidate/.../cutover_orchestrate.py` contains `def orchestrate` AND
-  `candidate/.../cutover.py` re-exports it;
+  external controller beside the executing facade (never `candidate/...`):
+  every `EXPECTED_SIBLINGS` readable via `host.read_bytes`,
+  `cutover_orchestrate.py` contains `def orchestrate` AND `cutover.py`
+  contains `orchestrate`, resolved facade inside `candidate_src` refused,
+  provenance recorded with `signed:false` and the untrusted/operator-snapshot
+  `trust_limit` (no signature);
   `facts.json` (selection) + `gateway_state.json` readable;
   dropin prior bytes captured.
 - Stage (as ubuntu): `runuser -u ubuntu -- env -i HOME=… HERMES_HOME=…
