@@ -4,8 +4,7 @@ This file is not a procedure. It is a design record in plain prose and
 tables. No sentence in this file may be executed to change the host.
 It authorizes no mount, no umount, no losetup attach, no systemctl
 stop, start, restart, enable, or daemon-reload, no package install, no
-provisioning, no closure copy, and no activation. There is no execution
-root named in this file. Every acceptance row in this file stays
+provisioning, no closure copy, and no activation. This authoring does not create or mount an execution root; later sections name the future mount paths, and naming them is not authorization to mount or start. Every acceptance row in this file stays
 UNEXECUTED.
 
 This file does not embed its own sha256. A later GO on this file's own
@@ -490,13 +489,51 @@ editable finder are rewritten with /usr/bin/python3.12 -I, writing
 through a temp name with file fsync, rename, and directory fsync. Then
 the directory fsync walker is run. The recorded walker vector is:
 
-`/usr/bin/python3.12 -I -c '<program>' <root>`
+`/usr/bin/python3.12 -I -c 'import os, sys
+root = sys.argv[1]
+for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+    for name in filenames:
+        path = os.path.join(dirpath, name)
+        if os.path.islink(path):
+            continue
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    dirfd = os.open(dirpath, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(dirfd)
+    finally:
+        os.close(dirfd)' <root>`
 
 The program walks with followlinks disabled, opens each regular file
 with O_RDONLY and O_NOFOLLOW, fsyncs and closes it, opens each real
 directory with O_RDONLY, O_DIRECTORY, and O_NOFOLLOW, fsyncs and closes
 it, and raises on any OSError or symlink directory. An exception is
 durable-state-unknown.
+
+The angle-bracket slots are observed or generated values, not missing design fields:
+
+| Slot | Value |
+|---|---|
+| `<staged-tree>` | the private staging directory after rewrites, under backing/staging/<nonce> |
+| `<staging>` | same as `<staged-tree>` |
+| `<image-temp>` | a nonexistent temp name in the backing directory, not inside the staged tree |
+| `<final-image>` | one of the two image paths in section 5.1 |
+| `<image>` | same as `<final-image>` |
+| `<loopdev>` | the single device path printed by losetup --find --show for that image |
+| `<mountpoint>` | one of the two /run paths in section 5.1 |
+| `<repo>` | the archive source named for that image in section 4 |
+| `<sha>` | the commit named for that image in section 4 |
+| `<nonce>` | 32 hex characters from 16 bytes of /dev/urandom |
+| `<16-byte-urandom-hex>` | same as `<nonce>` |
+| `<src>` | a venv or INTERPRETER_PREFIX |
+| `<dst>` | its destination inside the staged tree |
+| `<private-verify-dir>` | a second private directory under the same nonce, not a mountpoint and not an execution root |
+| `<root>` | the directory passed to the fsync walker |
+| `<name>` | known-good or candidate, matching the image being built |
+| `<MainPID>` | the observed MainPID from systemctl show |
 
 ### 7.5 Verify extract
 
