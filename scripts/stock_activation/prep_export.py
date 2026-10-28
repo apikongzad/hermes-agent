@@ -684,7 +684,7 @@ def _verify_web_dist_with_node(source_dir, dist_dir, runner=None):
         "function skipOut(name){return name===receiptName||name==='.hermes-product';}\n"
         "function contents(name){return !name.split('/').includes('node_modules') && !name.startsWith('native/');}\n"
         "function walkTree(root,inputs,skip,onEntry){function visit(name){if(osMetadata(name)||skip(name))return;const file=join(root,name);if(!existsSync(file))return onEntry(name,'missing');if(!statSync(file).isDirectory())return onEntry(name,'file');onEntry(name,'directory');for(const child of readdirSync(file).sort())visit(name+'/'+child);}for(const input of inputs)visit(input);}\n"
-        "function treeHash(root,inputs,skip,cont){const h=createHash('sha256');walkTree(root,inputs,skip,(name,kind)=>{h.update(name.replaceAll('\\\\','/')).update('\\0');if(kind==='file')h.update(cont(name)?readFileSync(join(root,name)):'file').update('\\0');else h.update(kind+'\\0');});return h.digest('hex');}\n"
+        "function treeHash(root,inputs,skip,cont){const h=createHash('sha256');walkTree(root,inputs,skip,(name,kind)=>{h.update(name.replaceAll('\\\\', '/')).update('\\0');if(kind==='file')h.update(cont(name)?readFileSync(join(root,name)):'file').update('\\0');else h.update(`${kind}\\0`);});return h.digest('hex');}\n"
         "let gotOutput;\n"
         "try{gotOutput=treeHash(out,readdirSync(out).sort(),skipOut,contents);}catch(e){console.error('outputHash fail:'+e);process.exit(2);}\n"
         "if(gotOutput!==expOutput){console.error('outputHash mismatch');process.exit(1);}\n"
@@ -784,6 +784,7 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_CONFIG_SYSTEM": "/dev/null",
         "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
     }
     clean_env = {"PATH": "/usr/bin:/bin"}
 

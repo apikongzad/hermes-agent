@@ -487,6 +487,128 @@ class TestArgvAndImages(unittest.TestCase):
                 self.assertEqual(f.read(), "hi-c040\n")
 
 
+class TestWebDistVerifyRealNode(unittest.TestCase):
+    def test_verify_with_real_node(self):
+        import shutil
+        from scripts.stock_activation.prep_export import _verify_web_dist_with_node
+        node = shutil.which("node")
+        self.assertIsNotNone(node)
+        # _find_node probes /opt/node24/bin etc via os.path.exists; those metadata
+        # checks only pass home_io_guard when their dir is on PATH (guard allows
+        # PATH-entry stats, then realpath would otherwise trip on the hermes
+        # tools symlink). Prepend real node dirs so verification uses real node.
+        _orig_path = os.environ.get("PATH", "")
+        _extra = os.pathsep.join([os.path.dirname(node), "/opt/node24/bin", "/opt/node/bin", "/usr/bin"])
+        os.environ["PATH"] = _extra + os.pathsep + _orig_path
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                src = os.path.join(td, "src")
+                os.makedirs(os.path.join(src, "scripts", "build"))
+                repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+                # Copy worktree freshness (do not edit) + its import dep so sourceHash can import.
+                shutil.copy(
+                    os.path.join(repo_root, "scripts", "build", "freshness.mjs"),
+                    os.path.join(src, "scripts", "build", "freshness.mjs"),
+                )
+                shutil.copy(
+                    os.path.join(repo_root, "scripts", "build", "frontend-common.mjs"),
+                    os.path.join(src, "scripts", "build", "frontend-common.mjs"),
+                )
+                # Minimal web inputs so sourceHash covers real files (missing also deterministic).
+                for p in ("web", "apps/shared"):
+                    d = os.path.join(src, p)
+                    os.makedirs(d, exist_ok=True)
+                    with open(os.path.join(d, "dummy.txt"), "w") as f:
+                        f.write("dummy\n")
+                for rel, content in (
+                    ("package.json", "{}"),
+                    ("package-lock.json", "{}"),
+                    (".npmrc", "x\n"),
+                    ("pm/lock.json", "{}"),
+                    ("scripts/generate-icons.mjs", "x\n"),
+                    ("scripts/generate_icons.py", "x\n"),
+                    ("assets/dummy.txt", "dummy\n"),
+                    ("pyproject.toml", "x\n"),
+                    ("uv.lock", "x\n"),
+                ):
+                    full = os.path.join(src, rel)
+                    os.makedirs(os.path.dirname(full) or src, exist_ok=True)
+                    if not os.path.exists(full):
+                        with open(full, "w") as f:
+                            f.write(content)
+                dist = os.path.join(td, "dist")
+                os.makedirs(dist)
+                with open(os.path.join(dist, "index.html"), "w") as f:
+                    f.write("<html>hi-c040</html>\n")
+                with open(os.path.join(dist, "app.js"), "w") as f:
+                    f.write("console.log(1)\n")
+                # sourceHash via node importing the copied freshness.mjs (same way freshness does).
+                src_js = os.path.join(td, "calc-source.mjs")
+                with open(src_js, "w") as f:
+                    f.write(
+                        "import {join} from 'node:path';\n"
+                        "const src = process.argv[2];\n"
+                        "const mod = await import('file://' + join(src, 'scripts/build/freshness.mjs'));\n"
+                        "console.log(mod.sourceHash(src, 'web'));\n"
+                    )
+                r = subprocess.run([node, src_js, src], capture_output=True, text=True, check=False)
+                self.assertEqual(r.returncode, 0, r.stderr[:2000])
+                source_hash = r.stdout.strip()
+                self.assertTrue(len(source_hash) == 64)
+                # outputHash via node with freshness-identical treeHash (same skip/contents/walk).
+                out_js = os.path.join(td, "calc-output.mjs")
+                with open(out_js, "w") as f:
+                    f.write(
+                        "import {createHash} from 'node:crypto';\n"
+                        "import {existsSync, readFileSync, readdirSync, statSync} from 'node:fs';\n"
+                        "import {join} from 'node:path';\n"
+                        "const out = process.argv[2];\n"
+                        "const receiptName='hermes-build.json';\n"
+                        "const osMetadata = name => {\n"
+                        "  const base = name.split('/').pop()\n"
+                        "  return base === '.DS_Store' || base === '.localized'\n"
+                        "    || base === 'Thumbs.db' || base === 'Desktop.ini' || base.startsWith('._')\n"
+                        "};\n"
+                        "function skipOut(name){ return name===receiptName || name==='.hermes-product'; }\n"
+                        "function contents(name){ return !name.split('/').includes('node_modules') && !name.startsWith('native/'); }\n"
+                        "function walkTree(root, inputs, skip, onEntry) {\n"
+                        "  function visit(name) {\n"
+                        "    if (osMetadata(name) || skip(name)) return\n"
+                        "    const file = join(root, name)\n"
+                        "    if (!existsSync(file)) return onEntry(name, 'missing')\n"
+                        "    if (!statSync(file).isDirectory()) return onEntry(name, 'file')\n"
+                        "    onEntry(name, 'directory')\n"
+                        "    for (const child of readdirSync(file).sort()) visit(`${name}/${child}`)\n"
+                        "  }\n"
+                        "  for (const input of inputs) visit(input)\n"
+                        "}\n"
+                        "function treeHash(root, inputs, skip, contentsFn = () => true) {\n"
+                        "  const hash = createHash('sha256')\n"
+                        "  walkTree(root, inputs, skip, (name, kind) => {\n"
+                        "    hash.update(name.replaceAll('\\\\', '/')).update('\\0')\n"
+                        "    if (kind === 'file') hash.update(contentsFn(name) ? readFileSync(join(root, name)) : 'file').update('\\0')\n"
+                        "    else hash.update(`${kind}\\0`)\n"
+                        "  })\n"
+                        "  return hash.digest('hex')\n"
+                        "}\n"
+                        "console.log(treeHash(out, readdirSync(out).sort(), skipOut, contents));\n"
+                    )
+                r2 = subprocess.run([node, out_js, dist], capture_output=True, text=True, check=False)
+                self.assertEqual(r2.returncode, 0, r2.stderr[:2000])
+                output_hash = r2.stdout.strip()
+                self.assertTrue(len(output_hash) == 64)
+                receipt = {"schema": 1, "product": "web", "inputs": {"sourceHash": source_hash}, "outputHash": output_hash}
+                with open(os.path.join(dist, "hermes-build.json"), "w") as f:
+                    f.write(json.dumps(receipt) + "\n")
+                self.assertTrue(_verify_web_dist_with_node(src, dist))
+                # One-byte dist tamper must fail closed.
+                with open(os.path.join(dist, "app.js"), "ab") as f:
+                    f.write(b"x")
+                self.assertFalse(_verify_web_dist_with_node(src, dist))
+        finally:
+            os.environ["PATH"] = _orig_path
+
+
 class TestContracts(unittest.TestCase):
     def test_export_closure_stub_and_cli(self):
         from scripts.stock_activation.os_adapter import export_closure
