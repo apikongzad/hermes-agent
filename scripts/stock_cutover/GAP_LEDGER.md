@@ -330,3 +330,166 @@ ops by worker. No design bytes edited. No scope expansion.
   external supervisor (`cutover/recover` oneshot + timer) readiness +
   actual gateway endpoint support verification + narrow-exact atomic
   recovery lock design. No stub `True`, no fake protocol.
+
+## 10. Lock-holder death/recovery handoff + external supervisor/live-entry wiring — DESIGN ONLY, NOT ACTIVATED
+
+Base: `6a39702dfdaf266409a9e7a7e37ceb5ab6142094`. No worker sudo/mount/
+service/unit writes. No design files edited. No code changed in this
+section. `lock_acquire` stays preserve-fail-closed (`lock-stale-unverified`,
+no takeover); units in `cutover_recovery.py` stay uninstalled text;
+`cli apply/recover` stay `refused-live-not-authorized-here` (exit 1).
+Implementation of this section requires separate independent review first.
+
+Bindings (immutable inputs, not edited here):
+
+- base `70fc9debac3bdf25b2a52d6413a8bc42e03d00fd38a925faf33b98e7a39c18c9`
+- addendum `ba9791ac89a15b2820f8d9cd8686ef67ef903833bab2eaf62c592da75bbab9fd`
+- gap `246567b90ba0d22bc2d45a122da23813c85a0cbd709aead116aabc04f870e3d7`
+- gap-addendum `ce3e744069360cc00b7f3de93cff9de2ca7518afce82b533db1635e07130ae54`
+- HEAD `6a39702dfdaf266409a9e7a7e37ceb5ab6142094` (9 RealHost methods wired,
+  stale preserved, gateway identify real, no services restarted).
+
+Parent-verified live inputs (non-secret readbacks, not re-probed by worker):
+
+- `root_live_enforced=true`, both mounts read-only, real gateway identify
+  succeeded protocol 1, peer pid 583405 uid 1001, code SHA `1d9a377…`
+- both snapshot python: isolated 1, ignore_environment 1, safe_path true,
+  no_site 0, sitecustomize None, import_ok true, pyvenv 3.14.9
+- NO services restarted by worker. These are inputs to the design below.
+
+Gap (why this section exists, §8-§9 recorded):
+
+- stale lock currently preserves fail-closed forever; a dead holder blocks
+  all future transactions with no safe handoff (unlink-then-create races,
+  no same-UID handoff defined in accepted bytes).
+- external `OnFailure`/timer recovery (`cutover_recovery.py` text,
+  uninstalled) cannot recover a deadlocked coordinator: two contenders or
+  a SIGKILLed holder leave `lock-held`/`lock-stale-unverified` with no
+  kernel-authoritative successor, so recovery can neither serialize nor
+  safely fence-then-continue.
+
+Design (all UNEXECUTED; next slice implements only after review):
+
+1. Single root-owned kernel-flock coordinator. One lock file only:
+   `/var/lib/hermes-stock-activation/journal.lock`, mode 0600 uid 0 gid 0,
+   parent `/var/lib/hermes-stock-activation` 0700 uid 0 (lstat-verified,
+   no symlink), grandparent `/var/lib` 0755 uid 0. No second lock path.
+   Authority is the kernel flock on the retained FD, held for the ENTIRE
+   transaction (acquire before any journal/fence/publication, release by
+   close after receipt is durable). Process death (incl. SIGKILL) releases
+   the flock via FD close — no userspace cleanup required.
+2. Acquire without unlink race, no boolean takeover flag. No
+   `--take-ownership`/`takeownership` user boolean anywhere. Steps:
+   (a) lstat parent (uid/mode/symlink fail-closed); (b) try
+   `O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW,0600` — success means created;
+   on `EEXIST` open existing with `O_RDWR|O_NOFOLLOW` (no `O_TRUNC`,
+   no `O_EXCL`); exact path only (no follow, no `..`, no alternate
+   prefix); (c) `flock(fd,LOCK_EX|LOCK_NB)` — success means authority
+   regardless of file content; `EWOULDBLOCK` means live holder:
+   return `stopped-unresolved:lock-held`, zero mutation. There is NO
+   `unlink` in the acquire path, ever. Stale content is audit, never
+   authority, so a dead holder needs no unlink to vacate.
+3. Owner record is fencing/audit, not authority. After flock success,
+   read journal canonical (`O_RDONLY|O_NOFOLLOW` + full read), then write
+   owner JSON `{boot_id,pid,starttime_field22,monotonic_ns,
+   journal_tail_sha256,target_sha}` via `ftruncate+write+fsync` on the
+   SAME locked FD + parent dir fsync. Owner liveness for diagnostics only:
+   `pidfd` (preferred) or `/proc/<pid>/stat` field 22 + `boot_id` equality;
+   mismatch means previous content stale, but handoff already succeeded
+   via flock — no second acquire, no delete-retry. Never trust content
+   over flock; never trust flock without journal+physical readback below.
+4. Fence-before-anything + monotonic journal fencing. While holding the FD
+   and before any publish/restore/start, the holder MUST: load journal tail
+   + `boot_id` + `show` both units + `file_info` candidate paths +
+   `digest_record`; if tail is terminal (`committed`/`rolled-back`/
+   `stopped-unresolved`/`blocked-unread`) verify read-only and exit —
+   recovery MUST NOT roll back or restart a terminal `committed` healthy
+   fleet; if tail is non-terminal and the next action would publish,
+   restore, or start, re-enter the 5s fence (`stop`, show
+   inactive/MainPID 0, `sleep 5`, show unchanged `NRestarts`) in THIS
+   invocation, then continue per legal-next (§2.3). A journal row saying
+   `stop-fenced` never skips this re-verify. Boot epoch (`boot_id`) change
+   across invocations forces full readback + fence, never resume.
+5. Serialization. `cli apply` and `cli recover` (oneshot + timer, same
+   binary) acquire the SAME lock file first. Concurrent apply/recover are
+   serialized: loser reports `stopped-unresolved:lock-held` with prior
+   journal preserved, no journal append, no fence, no start. On failure the
+   receipt `state`/`reason` MUST reconcile physical state (show/MainPID/
+   unit-byte hashes in receipt detail); no false success, no second start
+   while identity ambiguous, journal never deleted.
+6. Exact rendered units (designed text, NOT installed by worker; root
+   installs only after review + digest verification of exported package).
+   All root-owned: unit files 0644 uid 0 under `/etc/systemd/system/`,
+   program `/var/lib/hermes-stock-activation/recovery/cli.py` 0500 uid 0,
+   dir 0500 uid 0, interpreter fixed `/usr/bin/python3.12 -I`, no `Restart=`
+   (explicit `Restart=no`), `Type=oneshot`, `RemainAfterExit=no`,
+   `NoNewPrivileges=yes`, `PrivateTmp=yes`, `TimeoutStartSec=300`,
+   `TimeoutStopSec=30`. No `systemctl restart` argv; only `stop`/`show`/
+   `sleep 5`/`daemon-reload`/`show`/`start` via the fixed `sudo env -i`
+   launcher (G3). No Gateway restart inside any agent loop: the gateway
+   agent process never spawns systemctl; only these external units do.
+   - `hermes-stock-cutover.service`: `After=` network + both `.mount`
+     units, `Requires=` both `.mount` units,
+     `ConditionPathIsMountPoint=` both snaps,
+     `ConditionPathExists=` both backing images,
+     `OnFailure=hermes-stock-cutover-recover.service`,
+     `ExecStart=/usr/bin/python3.12 -I
+     /var/lib/hermes-stock-activation/recovery/cli.py apply`.
+   - `hermes-stock-cutover-recover.service`: same mount deps/conditions,
+     no `OnFailure` (no loop),
+     `ExecStart=/usr/bin/python3.12 -I
+     /var/lib/hermes-stock-activation/recovery/cli.py recover`.
+   - `hermes-stock-cutover-recover.timer`: `OnBootSec=1min`,
+     `OnUnitInactiveSec=1min`, `Unit=…recover.service`,
+     `Persistent=false`, `AccuracySec=15s`, `WantedBy=timers.target`.
+   - Mount units (2): `What=<backing>/<name>.squashfs`,
+     `Where=/run/hermes-stock-activation/<name>-snap`, `Type=squashfs`,
+     `Options=ro,nosuid,nodev`, `Before=` cutover/recover/gateway/
+     dashboard, `ConditionPathExists=` backing image,
+     `WantedBy=multi-user.target`. `/run` vanishes on boot, so these
+     units recreate + mount read-only BEFORE any service `ExecStart`;
+     if mount/verify fails, cutover/recover conditions fail and the
+     transaction refuses/recovers per §2.3-§2.5 — never a fake
+     future-reboot success claim. Source backing is root-verified first:
+     image 0400 uid 0 sha256 equals pinned `1d3f026c…`/`8e50b775…` +
+     unsquashfs-verify manifest equality (gap-addendum §4.7/§7.5), then
+     mount, then `findmnt` squashfs+ro + EROFS probes; mismatch refuses.
+7. No contradiction with accepted bytes. Order/health/EnvironmentFile/0700
+   journal/terminal states/GO scope unchanged. Gap-addendum §7.1 "no
+   recovery daemon/unit" described provisioned absence (nothing installed),
+   not a ban on designed-but-uninstalled unit text — this section designs
+   the text, installs nothing. `snapshotted` stays illegal; bare
+   `fence-failed` stays illegal; `durable→stop-fenced` only after
+   readback+fence; rollback stays snapshot-`ExecStart` while stop-fenced.
+
+Next implementation acceptance (exact; real fixtures, no mocks-alone):
+
+- process-kill: SIGKILL holder after `stop-fenced`, after publish-before-
+  reload, and after restart-before-health (3 kills); successor acquires via
+  flock, fences, continues per journal; no duplicate start while ambiguous;
+  journal never deleted; prior legal tail preserved.
+- 2-contenders: two real processes, same lock path in a temp 0700/0600
+  root-layout fixture, `LOCK_EX|LOCK_NB` — one holds, one gets `lock-held`;
+  zero double publish/start; journal linearizable (real `flock`, not a
+  boolean stub).
+- hard-fsync: injected `file_fsync`/`dir_fsync` `OSError` at publish and at
+  owner-record write → `durable-state-unknown`, no restart, no success.
+- candidate-health-fail → `rolling-back` → `rolled-back` only if known-good
+  I4 + both probes pass; else `stopped-unresolved`, services left stopped.
+- rollback-health-fail → `stopped-unresolved`, no further start.
+- exported entry: every gate above also passes via real
+  `/usr/bin/python3 -I <EXPORT>/cli.py preflight|apply|recover` subprocess
+  against temp dirs/sockets/files (real `O_NOFOLLOW`/`flock`/AF_UNIX
+  peercred), plus adversarial-sibling-overwrite → preflight refuses and
+  marker absent. In-process `FakeHost` alone is insufficient for GO.
+
+Hash ledger (actual choices): lock `journal.lock` 0600 uid 0, parent 0700
+uid 0; open `O_RDWR|O_CREAT|O_NOFOLLOW` (+`O_EXCL` on create only),
+`flock LOCK_EX|LOCK_NB`, retained FD, never unlink-in-acquire,
+release-by-close; owner JSON fields above; fence 5s; units/timeouts/paths
+as in (6); python `/usr/bin/python3.12 -I`; subcommands `apply`/`recover`;
+timer `OnBootSec=1min OnUnitInactiveSec=1min Persistent=false
+AccuracySec=15s`; mounts `squashfs ro,nosuid,nodev` (flag word 7);
+images `known-good.squashfs`/`candidate.squashfs` 0400 uid 0 with pins
+`1d3f026c…`/`8e50b775…`. Code unchanged: `lock_acquire` fail-closed,
+units uninstalled, `cli` exits 3/4/1. Independent review is the next gate.
