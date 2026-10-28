@@ -167,7 +167,9 @@ def show_full_argv():
         "-p", "Id", "-p", "ActiveState", "-p", "SubState",
         "-p", "MainPID", "-p", "NRestarts",
         "-p", "ExecStart", "-p", "ExecStop", "-p", "ExecStopPost",
-        "-p", "EnvironmentFiles", "-p", "FragmentPath",
+        "-p", "User", "-p", "WorkingDirectory",
+        "-p", "Environment", "-p", "EnvironmentFiles",
+        "-p", "FragmentPath",
         "-p", "DropInPaths",
         "--", GATEWAY_UNIT, DASHBOARD_UNIT,
     ]
@@ -218,7 +220,9 @@ def _show_argv_for(unit, full=False):
             "-p", "Id", "-p", "ActiveState", "-p", "SubState",
             "-p", "MainPID", "-p", "NRestarts",
             "-p", "ExecStart", "-p", "ExecStop", "-p", "ExecStopPost",
-            "-p", "EnvironmentFiles", "-p", "FragmentPath",
+            "-p", "User", "-p", "WorkingDirectory",
+            "-p", "Environment", "-p", "EnvironmentFiles",
+            "-p", "FragmentPath",
             "-p", "DropInPaths",
             "--", unit,
         ]
@@ -568,21 +572,73 @@ class RealCutoverHost(Host):
     def python_probe(self, python_exe):
         # Real I2 probe of a snapshot interpreter. Read-only subprocess:
         # `<exe> -I -c <probe>` with sanitized env, cwd outside tree.
-        # No .env read, no imports from user trees.
+        # No .env read, no imports from user trees. Returns real
+        # import_ok (hermes_cli discovery via snapshot source) and real
+        # pyvenv_version (adjacent venv/pyvenv.cfg), never hardcoded True.
         _refuse_live_env(str(python_exe))
         if not isinstance(python_exe, str) or not python_exe.startswith("/"):
             raise ValueError("python_exe absolute")
         probe = (
-            "import sys,json,importlib.util as u;"
-            "spec=u.find_spec('sitecustomize');"
+            "import sys,json,os,importlib.util as u\n"
+            "spec=u.find_spec('sitecustomize')\n"
+            "sitecustomize_origin=(spec.origin if spec else None)\n"
+            "try:\n"
+            " _cwd=os.getcwd()\n"
+            "except Exception:\n"
+            " _cwd=''\n"
+            "sys_path_has_cwd=('' in sys.path or _cwd in sys.path)\n"
+            "exe=sys.executable\n"
+            "try:\n"
+            " _d1=os.path.dirname(exe)\n"
+            " _d2=os.path.dirname(_d1)\n"
+            " _snap=os.path.dirname(_d2)\n"
+            " _src=os.path.join(_snap,'source')\n"
+            " _added=False\n"
+            " _s1=None\n"
+            " _s2=None\n"
+            " try:\n"
+            "  _sp=list(sys.path)\n"
+            " except Exception:\n"
+            "  _sp=[]\n"
+            " if _src not in _sp:\n"
+            "  sys.path.insert(0,_src)\n"
+            "  _added=True\n"
+            " try:\n"
+            "  _s1=u.find_spec('hermes_cli')\n"
+            " except Exception:\n"
+            "  _s1=None\n"
+            " try:\n"
+            "  _s2=u.find_spec('hermes_cli.main')\n"
+            " except Exception:\n"
+            "  _s2=None\n"
+            " import_ok=bool((_s1 is not None) or (_s2 is not None))\n"
+            "except Exception:\n"
+            " import_ok=False\n"
+            "try:\n"
+            " _vd1=os.path.dirname(exe)\n"
+            " _venv=os.path.dirname(_vd1)\n"
+            " _cfg=os.path.join(_venv,'pyvenv.cfg')\n"
+            " pyvenv_version=None\n"
+            " with open(_cfg,'r',encoding='utf-8',errors='replace') as _f:\n"
+            "  for _line in _f:\n"
+            "   _s=_line.strip()\n"
+            "   if _s.startswith('version'):\n"
+            "    _s2=_s.split('=',1)\n"
+            "    if len(_s2)==2:\n"
+            "     pyvenv_version=_s2[1].strip().split()[0] if _s2[1].strip().split() else None\n"
+            "    break\n"
+            "except Exception:\n"
+            " pyvenv_version=None\n"
             "print(json.dumps({"
             "'isolated':int(sys.flags.isolated),"
             "'ignore_environment':int(sys.flags.ignore_environment),"
             "'safe_path':bool(getattr(sys.flags,'safe_path',False)),"
             "'no_site':int(sys.flags.no_site),"
-            "'sitecustomize_origin':(spec.origin if spec else None),"
-            "'sys_path_has_cwd':('' in sys.path),"
-            "'exe':sys.executable}))"
+            "'sitecustomize_origin':sitecustomize_origin,"
+            "'sys_path_has_cwd':bool(sys_path_has_cwd),"
+            "'exe':exe,"
+            "'import_ok':bool(import_ok),"
+            "'pyvenv_version':pyvenv_version}))"
         )
         env = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C",
                "LC_ALL": "C"}
@@ -695,10 +751,15 @@ class RealCutoverHost(Host):
         Before any journal/fence/publication. Raises OSError('lock-held')
         if a live holder owns it (same boot, holder pid alive with same
         starttime). Stale holder (dead pid, boot mismatch, pid reuse with
-        different starttime) allows takeover after retained-journal check
-        by the caller; this function unlinks the stale file and retries
-        once. Never pretends release after process kill: file remains
-        until explicit takeover; flock alone is not authority.
+        different starttime) is NOT unlinked here: exact stale->new
+        authority transition is underspecified in accepted bytes (no atomic
+        same-UID handoff defined). To avoid inventing a racy
+        unlink-then-create guarantee, this function preserves stale
+        authority and raises OSError('lock-stale-unverified') fail-closed.
+        Retained-journal verification cannot safely run without authority
+        and authority cannot be taken without verification (circular), so
+        the caller maps this to stopped-unresolved and the gap ledger
+        records the design gap. Never pretends release after process kill.
         """
         import fcntl as _fcntl
         import time as _t
@@ -751,15 +812,10 @@ class RealCutoverHost(Host):
                     alive = False
             if alive:
                 raise OSError("lock-held")
-            # Stale: unlink then retry once. If retry races, second writer wins.
-            try:
-                os.unlink(JOURNAL_LOCK_PATH)
-            except OSError:
-                raise OSError("lock-held")
-            try:
-                fd = os.open(JOURNAL_LOCK_PATH, flags, 0o600)
-            except FileExistsError:
-                raise OSError("lock-held")
+            # Stale holder detected, but transition is a design gap (see
+            # docstring + GAP_LEDGER). Preserve stale file, no unlink, no
+            # retry, no race. Fail closed for operator to resolve.
+            raise OSError("lock-stale-unverified")
         # Write content durably, then flock non-blocking as authority.
         try:
             off = 0
@@ -874,7 +930,9 @@ def preflight_readonly(host):
                 "MainPID": u.get("MainPID"),
                 "NRestarts": u.get("NRestarts"),
                 "ExecStart": u.get("ExecStart"),
+                "User": u.get("User"),
                 "WorkingDirectory": u.get("WorkingDirectory"),
+                "Environment": u.get("Environment"),
                 "EnvironmentFiles": u.get("EnvironmentFiles"),
             }
             try:

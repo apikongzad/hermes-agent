@@ -192,3 +192,72 @@ wiring review. Do NOT claim goal complete.
 - Tests: `tests/stock_cutover` 62 green (was 37), `tests/stock_activation`
   147 green. No design bytes edited. RealHost mutations still refused:
   stop/start/reload/sleep/denial/backup/digest/gateway/dropins (see §2).
+
+## 8. Exact-C4 review slice (this commit, NO live operations)
+
+Base: `bfa2f623bdf20e3475000ebbeea2942f53f10c55`. No sudo/envread/mount/
+service ops. No design bytes edited. Parent mounted-runtime proof already
+both passed, service PIDs old unchanged (not touched here).
+
+- C4-reload exact (review NO-GO `_do_reload_checks:718-719`): substring
+  `want_exec in got_s` allowed `--evil-flag` — REMOVED. Now
+  `_parse_show_execstart` normalizes actual `systemctl show` ExecStart
+  (plain argv split or structured `{ path=; argv[]=; }` extraction, single
+  entry only, no `;`/`{`/`}` fragments) and requires equality exact to
+  `_expected_argv_for(unit,snapshot)`; `argv[1]` must be exactly `-I`
+  (`--config=-I-evil` fails). `WORKTREE/GEN` contamination kept as explicit
+  rejection only. Verified by `reload_extra_flag`, `reload_evil_I`,
+  `parse_helpers_exact`, `structured_show_accepted` (all zero-start except
+  structured which commits).
+- C4-reload REQUIRED presence (review `697-702`): `User`/`WD`/`Environment`
+  missing previously passed — now REQUIRED. `User` must be exactly
+  `ubuntu`, `WD` exactly expected gateway/dashboard, `EnvironmentFiles`
+  must be present and empty, `Environment` must be present with exact-key
+  loader contract (no `FORBIDDEN_LOADER_KEYS`, `PYTHONPATH` exact-key, not
+  substring). `show_full_argv` + `_show_argv_for(full)` now request `-p
+  User -p WorkingDirectory -p Environment` (were missing at `165-174`,
+  `212-224`); `preflight_readonly` also records `User`/`Environment`.
+  Verified by `missing_user/wd/environment`, `evil_environment` (all
+  `stopped-unresolved:missing-loader-evidence`, zero `start:`).
+- C4-identity exact (review `_identity_ok:555`): any `-I` substring
+  permitted `--config=-I-evil` — REMOVED. Now `_parse_cmd_argv` + exact
+  `_expected_argv_for` equality, `argv[1]` exactly `-I`, `exe` in exact
+  allowed snapshot interpreters (`.../venv/bin/python3` or `python3.14`);
+  extra `--evil-flag` fails. `cwd` missing previously passed (`is not
+  None` guard) — now REQUIRED: `None`/empty fails closed, else exact
+  `GATEWAY_WD`/`DASHBOARD_WD`. Verified by `identity_cwd_missing`,
+  `identity_evil_I`, `identity_extra_flag` (all `stopped-unresolved`, no
+  commit; post-start so start log exists, never second commit).
+- `_unit_field:361` dead `hasattr(n,n)` loop — REMOVED.
+- Probe real fields (review `575-585` vs `399-417`): `python_probe`
+  lacked `import_ok`/`pyvenv_version` so `_check_python` real success was
+  impossible — FIXED to return real values from isolated runtime: `import_ok`
+  via snapshot-source `hermes_cli`/`hermes_cli.main` `find_spec` (no exec,
+  no hardcode), `pyvenv_version` via adjacent `venv/pyvenv.cfg` `version =`
+  parse (or `None`), `sys_path_has_cwd` via `''` or `getcwd()` in path.
+  System `/usr/bin/python3.12` correctly returns `False`/`None` (not
+  snapshot); temp snapshot with `source/hermes_cli` + `pyvenv.cfg 3.14.9`
+  returns `True`/`3.14.9`. Verified by `python_probe_real_snapshot_exe`
+  (fields present) + `python_probe_real_snapshot_valid`.
+- Lock stale order (review `755-758` before `884-910`): stale `unlink`
+  before retained-journal verify introduced a race and destroyed authority
+  too early — REMOVED. `RealCutoverHost.lock_acquire` now preserves stale
+  file and raises `OSError('lock-stale-unverified')` fail-closed; fake
+  mirrors (no takeover). Orchestrate maps to `stopped-unresolved`, zero
+  start, file byte-preserved. Exact stale->new atomic transition is
+  UNDERSPECIFIED in accepted bytes (no same-UID handoff defined) — this
+  slice does NOT invent one. DESIGN GAP recorded here; stale recovery stays
+  fail-closed until design defines the handoff. Verified by
+  `lock_stale_preserved_no_takeover` (replaces old `reauthorizes` which
+  asserted takeover). Live-holder `lock-held` still blocked with no journal
+  mutation.
+- No regression: C1 (no bare `fence-failed`), C2 (tail-durable recovery),
+  C3 (I2 + prior-bytes evidence + image pins `1d3f026c…`/`8e50b775…`)
+  unchanged and green. 9 mutating RealHost stubs still hard-refused
+  (stop/start/reload/sleep/denial/backup/digest/gateway/dropins);
+  `cli apply/recover` still `refused-live-not-authorized-here` (exit 1);
+  next wiring after review.
+- Tests: `tests/stock_cutover` 75 green (62 + 13 new: 11 orchestrate +
+  2 host/probe+show), `tests/stock_activation` 147 green. C4 NOT claimed
+  `all closed`: reload+identity+probe closed and verified above; lock stale
+  handoff OPEN as design gap by intent.

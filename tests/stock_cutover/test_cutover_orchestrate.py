@@ -54,7 +54,17 @@ class FakeCutoverHost:
         self.nrestarts_bump = False
         self.reload_envfile = False
         self.reload_venv_hook = False
+        self.reload_user_missing = False
+        self.reload_wd_missing = False
+        self.reload_env_missing = False
+        self.reload_env_evil = False
+        self.reload_extra_flag = False
+        self.reload_evil_I = False
+        self.reload_structured = False
         self.proc_mismatch = False
+        self.proc_cwd_missing = False
+        self.proc_evil_I = False
+        self.proc_extra_flag = False
         self.rollback_snapshot_missing = False
         self.rollback_snapshot_writable = False
         self.rollback_snapshot_uid = 0
@@ -132,6 +142,9 @@ class FakeCutoverHost:
                     self._lock_held = True
                     return True
                 # Liveness: dead pid or boot mismatch or pidReuse => stale.
+                # Design gap: stale->new transition underspecified, no
+                # atomic same-UID handoff. Preserve stale file, fail closed
+                # (mirrors RealCutoverHost.lock_acquire, no unlink race).
                 alive = False
                 if isinstance(hp, int) and hp > 0 and isinstance(hb, str) and hb:
                     if hp not in self.dead_pids and hb == my_boot:
@@ -147,14 +160,11 @@ class FakeCutoverHost:
                         except Exception:
                             alive = False
                     else:
-                        # dead_pids or boot mismatch => stale, allow takeover
-                        # only after retained-journal verification by caller.
-                        # Caller (orchestrate) verifies journal+fence before
-                        # publish; here we just allow takeover.
                         alive = False
                 if alive:
                     raise OSError("lock-held")
-                # Stale takeover: overwrite with own identity.
+                # Stale: preserve authority, no unlink, fail closed.
+                raise OSError("lock-stale-unverified")
             else:
                 raise OSError("lock-held")
         content = _j.dumps({
@@ -247,12 +257,33 @@ class FakeCutoverHost:
                 esp = [f"{C.VENV_OLD}/bin/python -m gateway.cgroup_cleanup"]
             py = f"{snap}/venv/bin/python3"
             entry = f"{snap}/source/hermes_cli/main.py"
-            return {"ActiveState": "inactive", "MainPID": 0, "NRestarts": nrestarts,
-                    "ExecStart": f"{py} -I {entry} {'gateway run' if is_gw else 'dashboard --port 9119 --host 127.0.0.1 --no-open --skip-build'}",
-                    "ExecStop": es, "ExecStopPost": esp,
-                    "WorkingDirectory": C.GATEWAY_WD if is_gw else C.DASHBOARD_WD,
-                    "User": "ubuntu", "EnvironmentFiles": envfiles,
-                    "Environment": {"VIRTUAL_ENV": f"{snap}/venv"}}
+            clean_exec = f"{py} -I {entry} {'gateway run' if is_gw else 'dashboard --port 9119 --host 127.0.0.1 --no-open --skip-build'}"
+            exec_val = clean_exec
+            if self.reload_extra_flag:
+                exec_val = clean_exec + " --evil-flag"
+            if self.reload_evil_I:
+                exec_val = clean_exec.replace(" -I ", " --config=-I-evil ", 1)
+            if self.reload_structured:
+                parts = clean_exec.split()
+                exec_val = ("{ path=" + py + " ; "
+                            + " ; ".join("argv[]=" + p for p in parts)
+                            + " ; ignore_errors=no }")
+            out = {"ActiveState": "inactive", "MainPID": 0, "NRestarts": nrestarts,
+                   "ExecStart": exec_val,
+                   "ExecStop": es, "ExecStopPost": esp,
+                   "EnvironmentFiles": envfiles}
+            if not self.reload_user_missing:
+                out["User"] = "ubuntu"
+            if not self.reload_wd_missing:
+                out["WorkingDirectory"] = C.GATEWAY_WD if is_gw else C.DASHBOARD_WD
+            if self.reload_env_missing:
+                pass
+            elif self.reload_env_evil:
+                out["Environment"] = {"VIRTUAL_ENV": f"{snap}/venv",
+                                      "PYTHONPATH": "/tmp/evil"}
+            else:
+                out["Environment"] = {"VIRTUAL_ENV": f"{snap}/venv"}
+            return out
         py = f"{snap}/venv/bin/python3"
         entry = f"{snap}/source/hermes_cli/main.py"
         return {"ActiveState": "active", "MainPID": new_pid, "NRestarts": nrestarts,
@@ -394,17 +425,28 @@ class FakeCutoverHost:
         if self.post_start_forbidden_key and self.published_kind != "rollback":
             return {"boot_id": _boot, "pid": pid, "starttime": 8000001,
                     "exe": f"{snap}/venv/bin/python3.14",
-                    "cmdline": f"{snap}/venv/bin/python3 -I {snap}/source/hermes_cli/main.py gateway run",
-                    "cgroup": "/system.slice/hermes-gateway.service",
+                    "cmdline": (f"{snap}/venv/bin/python3 -I {snap}/source/hermes_cli/main.py "
+                                f"{'gateway run' if is_gw else 'dashboard --port 9119 --host 127.0.0.1 --no-open --skip-build'}"),
+                    "cgroup": ("/system.slice/hermes-gateway.service" if is_gw
+                               else "/system.slice/hermes-dashboard.service"),
                     "cwd": C.GATEWAY_WD if is_gw else C.DASHBOARD_WD,
                     "environ_keys": ["HOME", "PYTHONPATH"]}
-        return {"boot_id": _boot, "pid": pid,
-                "starttime": 8000001 if pid == NEW_GW_PID else 8000002,
-                "exe": f"{snap}/venv/bin/python3.14",
-                "cmdline": f"{snap}/venv/bin/python3 -I {snap}/source/hermes_cli/main.py {'gateway run' if is_gw else 'dashboard run'}",
-                "cgroup": "/system.slice/hermes-gateway.service" if is_gw else "/system.slice/hermes-dashboard.service",
-                "cwd": C.GATEWAY_WD if is_gw else C.DASHBOARD_WD,
-                "environ_keys": ["HOME", "USER", "PATH"]}
+        clean_cmd = (f"{snap}/venv/bin/python3 -I {snap}/source/hermes_cli/main.py "
+                     f"{'gateway run' if is_gw else 'dashboard --port 9119 --host 127.0.0.1 --no-open --skip-build'}")
+        cmd = clean_cmd
+        if self.proc_extra_flag:
+            cmd = clean_cmd + " --evil-flag"
+        if self.proc_evil_I:
+            cmd = clean_cmd.replace(" -I ", " --config=-I-evil ", 1)
+        out = {"boot_id": _boot, "pid": pid,
+               "starttime": 8000001 if pid == NEW_GW_PID else 8000002,
+               "exe": f"{snap}/venv/bin/python3.14",
+               "cmdline": cmd,
+               "cgroup": "/system.slice/hermes-gateway.service" if is_gw else "/system.slice/hermes-dashboard.service",
+               "environ_keys": ["HOME", "USER", "PATH"]}
+        if not self.proc_cwd_missing:
+            out["cwd"] = C.GATEWAY_WD if is_gw else C.DASHBOARD_WD
+        return out
 
     def denial_probe(self, path):
         self.log.append(f"denial:{path}")
@@ -866,6 +908,114 @@ class TestCutoverContractSlice(unittest.TestCase):
         # Instead verify happy journal contains reloaded (proves exact passed while inactive).
         self.assertIn("reloaded", r.journal)
 
+    def test_c4_reload_missing_user_no_start(self):
+        h = make_happy()
+        h.reload_user_missing = True
+        r = C.orchestrate(h, C.Request(target_sha=TARGET))
+        self.assertEqual(r.state, "stopped-unresolved")
+        self.assertEqual(r.reason, "missing-loader-evidence")
+        self.assertEqual([e for e in h.log if e.startswith("start:")], [])
+        self.assertNotIn("committed", r.journal)
+
+    def test_c4_reload_missing_wd_no_start(self):
+        h = make_happy()
+        h.reload_wd_missing = True
+        r = C.orchestrate(h, C.Request(target_sha=TARGET))
+        self.assertEqual(r.state, "stopped-unresolved")
+        self.assertEqual(r.reason, "missing-loader-evidence")
+        self.assertEqual([e for e in h.log if e.startswith("start:")], [])
+        self.assertNotIn("committed", r.journal)
+
+    def test_c4_reload_missing_environment_no_start(self):
+        h = make_happy()
+        h.reload_env_missing = True
+        r = C.orchestrate(h, C.Request(target_sha=TARGET))
+        self.assertEqual(r.state, "stopped-unresolved")
+        self.assertEqual(r.reason, "missing-loader-evidence")
+        self.assertEqual([e for e in h.log if e.startswith("start:")], [])
+        self.assertNotIn("committed", r.journal)
+
+    def test_c4_reload_evil_environment_no_start(self):
+        h = make_happy()
+        h.reload_env_evil = True
+        r = C.orchestrate(h, C.Request(target_sha=TARGET))
+        self.assertEqual(r.state, "stopped-unresolved")
+        self.assertEqual(r.reason, "missing-loader-evidence")
+        self.assertEqual([e for e in h.log if e.startswith("start:")], [])
+        self.assertNotIn("committed", r.journal)
+
+    def test_c4_reload_extra_argv_no_start(self):
+        h = make_happy()
+        h.reload_extra_flag = True
+        r = C.orchestrate(h, C.Request(target_sha=TARGET))
+        self.assertEqual(r.state, "stopped-unresolved")
+        self.assertEqual(r.reason, "missing-loader-evidence")
+        self.assertEqual([e for e in h.log if e.startswith("start:")], [])
+        self.assertNotIn("committed", r.journal)
+
+    def test_c4_reload_evil_I_no_start(self):
+        h = make_happy()
+        h.reload_evil_I = True
+        r = C.orchestrate(h, C.Request(target_sha=TARGET))
+        self.assertEqual(r.state, "stopped-unresolved")
+        self.assertEqual(r.reason, "missing-loader-evidence")
+        self.assertEqual([e for e in h.log if e.startswith("start:")], [])
+        self.assertNotIn("committed", r.journal)
+
+    def test_c4_identity_cwd_missing_no_commit(self):
+        h = make_happy()
+        h.proc_cwd_missing = True
+        r = C.orchestrate(h, C.Request(target_sha=TARGET))
+        # Identity is post-start: reload passed so start(s) occurred, but
+        # missing cwd fails I4 for candidate and rollback -> no commit.
+        self.assertEqual(r.state, "stopped-unresolved")
+        self.assertNotIn("committed", r.journal)
+        self.assertNotIn("health-verified", r.journal)
+
+    def test_c4_identity_evil_I_no_commit(self):
+        h = make_happy()
+        h.proc_evil_I = True
+        r = C.orchestrate(h, C.Request(target_sha=TARGET))
+        self.assertEqual(r.state, "stopped-unresolved")
+        self.assertNotIn("committed", r.journal)
+        self.assertNotIn("health-verified", r.journal)
+
+    def test_c4_identity_extra_flag_no_commit(self):
+        h = make_happy()
+        h.proc_extra_flag = True
+        r = C.orchestrate(h, C.Request(target_sha=TARGET))
+        self.assertEqual(r.state, "stopped-unresolved")
+        self.assertNotIn("committed", r.journal)
+        self.assertNotIn("health-verified", r.journal)
+
+    def test_c4_structured_show_accepted(self):
+        h = make_happy()
+        h.reload_structured = True
+        r = C.orchestrate(h, C.Request(target_sha=TARGET))
+        self.assertEqual(r.state, "committed")
+        self.assertIn("reloaded", r.journal)
+        self.assertEqual(len([e for e in h.log if e.startswith("start:")]), 1)
+
+    def test_c4_parse_helpers_exact(self):
+        # Substring must not pass: extra flag changes argv length.
+        want_gw = C._expected_argv_for(C.GATEWAY_UNIT, C.CANDIDATE_SNAPSHOT)
+        self.assertEqual(want_gw[1], "-I")
+        got = C._parse_show_execstart(" ".join(want_gw) + " --evil-flag")
+        self.assertNotEqual(got, want_gw)
+        # Evil -I fragment is not exact '-I'.
+        evil = list(want_gw)
+        evil[1] = "--config=-I-evil"
+        self.assertNotEqual(evil, want_gw)
+        # Structured valid parses to same argv.
+        struct = ("{ path=" + want_gw[0] + " ; "
+                  + " ; ".join("argv[]=" + p for p in want_gw)
+                  + " ; ignore_errors=no }")
+        self.assertEqual(C._parse_show_execstart(struct), want_gw)
+        # Multi-entry list (stacked) is not accepted.
+        self.assertIsNone(C._parse_show_execstart([struct, struct]))
+        # Cmd argv exact: evil-I fails identity parse equality.
+        self.assertNotEqual(C._parse_cmd_argv(" ".join(evil)), want_gw)
+
     def test_append_oserror_durable_no_start(self):
         h = make_happy()
         h.journal_append_oserror = True
@@ -890,18 +1040,23 @@ class TestCutoverContractSlice(unittest.TestCase):
         self.assertEqual([e for e in h.log if e.startswith("start:")], [])
         self.assertEqual(h.journal, [])
 
-    def test_lock_stale_recovery_reauthorizes(self):
+    def test_lock_stale_preserved_no_takeover(self):
         import json as _j
         h = make_happy()
         dead = 88888
         h.dead_pids.add(dead)
-        h.files[C.JOURNAL_LOCK_PATH] = _j.dumps({
+        stale = _j.dumps({
             "boot_id": h.boot_id(), "pid": dead,
             "starttime": 8000002, "epoch": 1.0,
         }).encode("utf-8")
+        h.files[C.JOURNAL_LOCK_PATH] = stale
         r = C.orchestrate(h, C.Request(target_sha=TARGET))
-        # Stale holder (dead pid) allows takeover + retained journal recovery.
-        self.assertEqual(r.state, "committed")
+        # Stale holder: exact stale->new transition is a design gap (no
+        # atomic same-UID handoff). Preserve stale file, fail closed, no
+        # unlink race, zero start. See GAP_LEDGER §8.
+        self.assertEqual(r.state, "stopped-unresolved")
+        self.assertEqual([e for e in h.log if e.startswith("start:")], [])
+        self.assertEqual(h.files.get(C.JOURNAL_LOCK_PATH), stale)
         self.assertIn("lock-acquire", h.log)
 
     def test_lock_release_owner_only(self):

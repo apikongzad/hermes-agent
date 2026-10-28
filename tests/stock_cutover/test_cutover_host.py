@@ -129,6 +129,62 @@ class TestReadAdapter(unittest.TestCase):
         self.assertEqual(got["isolated"], 1)
         self.assertEqual(got["ignore_environment"], 1)
         self.assertFalse(got["sys_path_has_cwd"])
+        # Real fields (not hardcoded True): system python has no adjacent
+        # hermes_cli/pyvenv.cfg, so False/None proves real discovery.
+        self.assertIn("import_ok", got)
+        self.assertIn("pyvenv_version", got)
+        self.assertEqual(got["import_ok"], False)
+        self.assertTrue(got["pyvenv_version"] is None
+                        or isinstance(got["pyvenv_version"], str))
+        self.assertIn("safe_path", got)
+        self.assertIn("sitecustomize_origin", got)
+        self.assertIn("exe", got)
+
+    def test_python_probe_real_snapshot_valid(self):
+        import os as _os
+        import shutil as _sh
+        import tempfile as _tf
+        h = H.RealCutoverHost(runner=FakeRunner())
+        d = _tf.mkdtemp(prefix="snap-valid-", dir="/tmp")
+        try:
+            snap = _os.path.join(d, "snap")
+            venvbin = _os.path.join(snap, "venv", "bin")
+            srccli = _os.path.join(snap, "source", "hermes_cli")
+            _os.makedirs(venvbin)
+            _os.makedirs(srccli)
+            _os.symlink("/usr/bin/python3.12",
+                        _os.path.join(venvbin, "python3"))
+            with open(_os.path.join(srccli, "__init__.py"), "w") as f:
+                f.write("# pkg\n")
+            with open(_os.path.join(srccli, "main.py"), "w") as f:
+                f.write("x=1\n")
+            with open(_os.path.join(snap, "venv", "pyvenv.cfg"), "w") as f:
+                f.write("home = /usr\nversion = 3.14.9\n")
+            got = h.python_probe(_os.path.join(venvbin, "python3"))
+            self.assertEqual(got["isolated"], 1)
+            self.assertEqual(got["import_ok"], True)
+            self.assertEqual(got["pyvenv_version"], "3.14.9")
+            self.assertFalse(got["sys_path_has_cwd"])
+        finally:
+            _sh.rmtree(d, ignore_errors=True)
+
+    def test_show_full_requests_user_wd_env(self):
+        full = H.show_full_argv()
+        joined = " ".join(full)
+        for prop in ("User", "WorkingDirectory", "Environment",
+                     "EnvironmentFiles", "ExecStart"):
+            self.assertIn(prop, joined)
+        # No restart element.
+        for el in full:
+            self.assertNotEqual(el, "restart")
+        # Per-unit full argv also carries the three REQUIRED properties.
+        for unit in H.BOTH:
+            argv = H._show_argv_for(unit, full=True)
+            js = " ".join(argv)
+            self.assertIn("-p", js)
+            self.assertIn("User", js)
+            self.assertIn("WorkingDirectory", js)
+            self.assertIn("Environment", js)
 
     def test_mutations_hard_refused(self):
         h = H.RealCutoverHost(runner=FakeRunner())

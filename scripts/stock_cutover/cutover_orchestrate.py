@@ -359,9 +359,6 @@ def _unit_field(u, *names):
                 return u[n]
         return None
     for n in names:
-        if hasattr(n, n):
-            pass
-    for n in names:
         if hasattr(u, n):
             return getattr(u, n)
     return None
@@ -481,6 +478,122 @@ def _publish_snapshot(host, snapshot_str):
         host.dir_fsync(parent)
 
 
+def _expected_argv_for(unit, snapshot_str):
+    if unit == GATEWAY_UNIT:
+        return [
+            snapshot_str + "/venv/bin/python3",
+            "-I",
+            snapshot_str + "/source/hermes_cli/main.py",
+            "gateway",
+            "run",
+        ]
+    if unit == DASHBOARD_UNIT:
+        return [
+            snapshot_str + "/venv/bin/python3",
+            "-I",
+            snapshot_str + "/source/hermes_cli/main.py",
+            "dashboard",
+            "--port",
+            "9119",
+            "--host",
+            "127.0.0.1",
+            "--no-open",
+            "--skip-build",
+        ]
+    raise ValueError("unit")
+
+
+def _allowed_interpreters(snapshot_str):
+    return {
+        snapshot_str + "/venv/bin/python3",
+        snapshot_str + "/venv/bin/python3.14",
+    }
+
+
+def _parse_cmd_argv(cmd):
+    """Parse proc cmdline to argv list. None when unparseable/missing."""
+    if cmd is None:
+        return None
+    if isinstance(cmd, (list, tuple)):
+        try:
+            out = [str(x) for x in cmd]
+        except Exception:
+            return None
+        if not out:
+            return None
+        return out
+    if isinstance(cmd, bytes):
+        try:
+            cmd = cmd.decode("utf-8", "replace")
+        except Exception:
+            return None
+    if not isinstance(cmd, str):
+        try:
+            cmd = str(cmd)
+        except Exception:
+            return None
+    if not cmd.strip():
+        return None
+    # Proc cmdline joined with spaces; args contain no spaces. Plain
+    # whitespace split is exact for this closure and avoids new imports.
+    # Quoted forms stay quoted (mismatch -> fail-closed, never bypass).
+    return cmd.strip().split()
+
+
+def _parse_show_execstart(got):
+    """Normalize systemctl show ExecStart to argv list. None on mismatch.
+
+    Accepts plain argv string (whitespace split) or structured
+    `{ path=... ; argv[]=... ; ... }` form by extracting argv[] in order.
+    Any ';'/'{'/'}' without argv[]=, empty, or multi-entry list returns
+    None so the caller fails closed (exact equality, no substrings).
+    """
+    if got is None:
+        return None
+    if isinstance(got, (list, tuple)):
+        # Empty reset has no ExecStart; non-singleton is stacked -> fail.
+        if len(got) == 0:
+            return None
+        if len(got) != 1:
+            return None
+        return _parse_show_execstart(got[0])
+    if isinstance(got, bytes):
+        try:
+            got = got.decode("utf-8", "replace")
+        except Exception:
+            return None
+    if not isinstance(got, str):
+        try:
+            got = str(got)
+        except Exception:
+            return None
+    if not got.strip():
+        return None
+    if "argv[]=" in got:
+        argv = []
+        for part in got.split(";"):
+            p = part.strip()
+            if p.startswith("{"):
+                p = p[1:].strip()
+            if p.endswith("}"):
+                p = p[:-1].strip()
+            if p.startswith("argv[]="):
+                v = p[len("argv[]="):].strip()
+                if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+                    v = v[1:-1].replace('\\"', '"').replace('\\\\', '\\')
+                argv.append(v)
+        if not argv:
+            return None
+        return argv
+    # Plain form must not contain structured fragments.
+    if ";" in got or "{" in got or "}" in got:
+        return None
+    parts = got.strip().split()
+    if not parts:
+        return None
+    return parts
+
+
 def _identity_ok(host, snapshot_str, worktree_path):
     """Full I4 readback: boot/starttime(field22)/cgroup/PID/exe/cmdline.
 
@@ -488,9 +601,12 @@ def _identity_ok(host, snapshot_str, worktree_path):
     - show_unit MainPID must be int>0 and equal proc_identity pid
     - proc boot_id must equal host.boot_id()
     - starttime must be int>0 (field22) and present
-    - exe/cmdline must contain snapshot_str + 'python3 -I', no worktree/gen
+    - parsed argv must equal expected snapshot argv exactly
+      (argv[0] snapshot python, argv[1] exactly '-I', entry + subcommand
+      exact; extra '--evil-flag' or '--config=-I-evil' fails)
+    - exe must be exact snapshot interpreter (python3 or python3.14)
     - cgroup must be present and name the service
-    - cwd (when exposed) must equal journaled WorkingDirectory
+    - cwd is REQUIRED and must equal journaled WorkingDirectory
     Mismatch or unreadable identity is failure (False), OSError raises
     _ProcIdentityUnknown for caller to map to stopped-unresolved.
     """
@@ -518,24 +634,27 @@ def _identity_ok(host, snapshot_str, worktree_path):
             raise _ProcIdentityUnknown
         if isinstance(ident, dict):
             exe = ident.get("exe", "") or ""
-            cmd = ident.get("cmdline", "") or ""
+            cmd_raw = ident.get("cmdline", None)
+            if cmd_raw is None:
+                cmd_raw = ident.get("cmd", None)
             boot = ident.get("boot_id", ident.get("bootId", ""))
             st = ident.get("starttime", ident.get("start_time", 0))
             cg = ident.get("cgroup", "") or ""
             ipid = ident.get("pid", pid_i)
-            cwd = ident.get("cwd", ident.get("Cwd", None))
-            if isinstance(cmd, (list, tuple)):
-                cmd = " ".join(cmd)
+            if "cwd" in ident:
+                cwd = ident.get("cwd")
+            else:
+                cwd = ident.get("Cwd", None)
         else:
             exe = getattr(ident, "exe", "") or ""
-            cmd = getattr(ident, "cmdline", "") or ""
+            cmd_raw = getattr(ident, "cmdline", None)
+            if cmd_raw is None:
+                cmd_raw = getattr(ident, "cmd", None)
             boot = getattr(ident, "boot_id", "") or ""
             st = getattr(ident, "starttime", 0)
             cg = getattr(ident, "cgroup", "") or ""
             ipid = getattr(ident, "pid", pid_i)
             cwd = getattr(ident, "cwd", None)
-            if isinstance(cmd, (list, tuple)):
-                cmd = " ".join(cmd)
         try:
             if int(ipid) != pid_i:
                 return False
@@ -549,11 +668,37 @@ def _identity_ok(host, snapshot_str, worktree_path):
             return False
         if st_i <= 0:
             return False
-        exe_s, cmd_s = str(exe), str(cmd)
-        if snapshot_str not in exe_s or snapshot_str not in cmd_s:
+        # Exact argv: interpreter + '-I' + entry + subcommand, no fragments.
+        want_argv = _expected_argv_for(unit, snapshot_str)
+        got_argv = _parse_cmd_argv(cmd_raw)
+        if got_argv is None:
             return False
-        if "python3 -I" not in cmd_s and "python3.14 -I" not in cmd_s and "-I" not in cmd_s:
+        if got_argv != want_argv:
             return False
+        # argv[1] must be exactly '-I' (exact equality already ensures,
+        # explicit for review traceability; '--config=-I-evil' fails here).
+        if len(got_argv) < 2 or got_argv[1] != "-I":
+            return False
+        exe_s = str(exe)
+        if exe_s not in _allowed_interpreters(snapshot_str):
+            return False
+        # Contamination is already mismatch via exact argv/exe, kept as
+        # explicit rejection (never permissive).
+        if isinstance(cmd_raw, (list, tuple)):
+            try:
+                cmd_s = " ".join(str(x) for x in cmd_raw)
+            except Exception:
+                return False
+        elif isinstance(cmd_raw, bytes):
+            try:
+                cmd_s = cmd_raw.decode("utf-8", "replace")
+            except Exception:
+                return False
+        else:
+            try:
+                cmd_s = str(cmd_raw)
+            except Exception:
+                return False
         if worktree_path and (worktree_path in exe_s or worktree_path in cmd_s):
             return False
         if GEN_KNOWN_GOOD in exe_s or GEN_KNOWN_GOOD in cmd_s:
@@ -564,10 +709,18 @@ def _identity_ok(host, snapshot_str, worktree_path):
         # cgroup must name the service slice (gateway vs dashboard).
         if unit not in cg_s and "hermes" not in cg_s:
             return False
-        if cwd is not None:
-            want_wd = GATEWAY_WD if unit == GATEWAY_UNIT else DASHBOARD_WD
-            if str(cwd) != want_wd:
-                return False
+        # cwd is REQUIRED: missing/empty fails closed.
+        if cwd is None:
+            return False
+        try:
+            cwd_s = str(cwd)
+        except Exception:
+            return False
+        if not cwd_s:
+            return False
+        want_wd = GATEWAY_WD if unit == GATEWAY_UNIT else DASHBOARD_WD
+        if cwd_s != want_wd:
+            return False
     return True
 
 
@@ -673,17 +826,60 @@ def _expected_wd_for(unit):
     raise ValueError("unit")
 
 
+def _parse_env_keys_vals(env):
+    """Split Environment property to (keys, vals) without substrings."""
+    if isinstance(env, dict):
+        try:
+            keys = [str(k) for k in env.keys()]
+        except Exception:
+            keys = []
+        try:
+            vals = " ".join(str(v) for v in env.values())
+        except Exception:
+            vals = ""
+        return keys, vals
+    if isinstance(env, (list, tuple)):
+        keys = []
+        vals_parts = []
+        for x in env:
+            try:
+                s = str(x)
+            except Exception:
+                continue
+            vals_parts.append(s)
+            if "=" in s:
+                keys.append(s.split("=", 1)[0].strip())
+            else:
+                keys.append(s.strip())
+        return keys, " ".join(vals_parts)
+    try:
+        s = str(env)
+    except Exception:
+        return [], ""
+    if not s.strip():
+        return [], ""
+    keys = []
+    for tok in s.strip().split():
+        if "=" in tok:
+            keys.append(tok.split("=", 1)[0].strip())
+        else:
+            keys.append(tok.strip())
+    return keys, s
+
+
 def _do_reload_checks(host, snapshot_str=None):
     """Exact reload checks vs rendered expected (C4).
 
     When snapshot_str is None, uses CANDIDATE_SNAPSHOT (normal publish).
     Callers in rollback pass KNOWN_GOOD_SNAPSHOT. Checks per unit:
-    - User == ubuntu
-    - WorkingDirectory == expected gateway/dashboard WD
-    - ExecStart == rendered expected snapshot argv (exact)
+    - User REQUIRED, exactly ubuntu (missing fails)
+    - WorkingDirectory REQUIRED, exactly expected gateway/dashboard WD
+    - ExecStart normalized structured argv exactly equal expected argv
+      (no substring, no extra '--evil-flag', argv[1] exactly '-I')
     - ExecStop/ExecStopPost empty reset (no v0.21.7 venv hooks)
-    - EnvironmentFiles empty/absent (missing-loader-evidence if present)
-    - No forbidden loader keys in Environment/EnvironmentFiles text
+    - EnvironmentFiles REQUIRED presence, must be empty (any entry is
+      missing-loader-evidence); Environment REQUIRED presence, must not
+      contain forbidden loader keys
     """
     if snapshot_str is None:
         snapshot_str = CANDIDATE_SNAPSHOT
@@ -695,32 +891,82 @@ def _do_reload_checks(host, snapshot_str=None):
         return ("stopped-unresolved", "reload-unreadable")
     for unit, u in ((GATEWAY_UNIT, gu), (DASHBOARD_UNIT, du)):
         user = _unit_field(u, "User", "user")
-        if user is not None and user != EXPECTED_USER:
+        if user is None:
+            return ("stopped-unresolved", "user-mismatch")
+        try:
+            user_s = str(user)
+        except Exception:
+            return ("stopped-unresolved", "user-mismatch")
+        if user_s != EXPECTED_USER:
             return ("stopped-unresolved", "user-mismatch")
         wd = _unit_field(u, "WorkingDirectory", "working_directory", "WorkingDir")
         want_wd = _expected_wd_for(unit)
-        if wd is not None and wd != want_wd:
+        if wd is None:
+            return ("stopped-unresolved", "workingdirectory-mismatch")
+        try:
+            wd_s = str(wd)
+        except Exception:
+            return ("stopped-unresolved", "workingdirectory-mismatch")
+        if wd_s != want_wd:
             return ("stopped-unresolved", "workingdirectory-mismatch")
         ef = _unit_field(u, "EnvironmentFiles", "environment_files", "env_files")
-        if ef:
+        if ef is None:
             return ("stopped-unresolved", "missing-loader-evidence")
-        # Exact ExecStart vs rendered expected.
-        want_exec = _expected_exec_for(unit, snapshot_str)
+        if ef:
+            # Any non-empty EnvironmentFiles is missing loader evidence.
+            # Normalize: non-empty list/tuple/dict or non-blank string.
+            if isinstance(ef, (list, tuple, dict)):
+                if len(ef) != 0:
+                    return ("stopped-unresolved", "missing-loader-evidence")
+            elif isinstance(ef, bytes):
+                try:
+                    es = ef.decode("utf-8", "replace")
+                except Exception:
+                    return ("stopped-unresolved", "missing-loader-evidence")
+                if es.strip() not in ("", "[]", "None"):
+                    return ("stopped-unresolved", "missing-loader-evidence")
+            else:
+                try:
+                    es = str(ef)
+                except Exception:
+                    return ("stopped-unresolved", "missing-loader-evidence")
+                if es.strip() not in ("", "[]", "None"):
+                    return ("stopped-unresolved", "missing-loader-evidence")
+                # Empty string form is present-but-empty: allowed.
+                # Any other non-empty string fails above.
+            # Re-check truthy non-empty that slipped through.
+            if ef:
+                try:
+                    blank = str(ef).strip() in ("", "[]", "None")
+                except Exception:
+                    blank = False
+                if not blank:
+                    return ("stopped-unresolved", "missing-loader-evidence")
+        # Exact ExecStart vs expected argv (no permissive substrings).
+        want_argv = _expected_argv_for(unit, snapshot_str)
         got_exec = _unit_field(u, "ExecStart", "exec_start")
         if got_exec is None:
             return ("stopped-unresolved", "reload-unreadable")
-        if isinstance(got_exec, (list, tuple)):
-            got_s = " ".join(str(x) for x in got_exec)
-        else:
-            got_s = str(got_exec)
-        # show may prefix with '@' or include ';' fragments; require exact
-        # expected argv substring and no worktree/gen contamination.
-        if want_exec not in got_s:
+        got_argv = _parse_show_execstart(got_exec)
+        if got_argv is None:
+            return ("stopped-unresolved", "execstart-mismatch")
+        if got_argv != want_argv:
+            return ("stopped-unresolved", "execstart-mismatch")
+        if len(got_argv) < 2 or got_argv[1] != "-I":
+            return ("stopped-unresolved", "execstart-flags")
+        # Contamination is already mismatch via exact argv; explicit
+        # rejection kept (never permissive).
+        try:
+            if isinstance(got_exec, (list, tuple)):
+                got_s = " ".join(str(x) for x in got_exec)
+            elif isinstance(got_exec, bytes):
+                got_s = got_exec.decode("utf-8", "replace")
+            else:
+                got_s = str(got_exec)
+        except Exception:
             return ("stopped-unresolved", "execstart-mismatch")
         if WORKTREE_PATH in got_s or GEN_KNOWN_GOOD in got_s:
             return ("stopped-unresolved", "execstart-mismatch")
-        if "python3 -I" not in got_s and "-I" not in got_s:
-            return ("stopped-unresolved", "execstart-flags")
         for attr in ("ExecStop", "ExecStopPost", "exec_stop", "exec_stop_post"):
             v = _unit_field(u, attr)
             if v is None:
@@ -739,22 +985,31 @@ def _do_reload_checks(host, snapshot_str=None):
             # empty reset with no replacement is the required outcome.
             if s.strip():
                 return ("stopped-unresolved", "stop-hook-present")
-        # Forbidden loader keys in Environment text when exposed.
+        # Loader Environment contract: REQUIRED presence, no forbidden keys.
         env = _unit_field(u, "Environment", "environment")
-        if env:
-            if isinstance(env, dict):
-                keys = list(env.keys())
-                vals = " ".join(str(v) for v in env.values())
-            elif isinstance(env, (list, tuple)):
-                keys = [str(x).split("=")[0] for x in env]
-                vals = " ".join(str(x) for x in env)
-            else:
-                keys = []
-                vals = str(env)
-            for k in keys:
-                if k in FORBIDDEN_LOADER_KEYS:
-                    return ("stopped-unresolved", "missing-loader-evidence")
-            if "PYTHONPATH" in vals:
+        if env is None:
+            return ("stopped-unresolved", "missing-loader-evidence")
+        keys, vals = _parse_env_keys_vals(env)
+        for k in keys:
+            try:
+                ks = str(k)
+            except Exception:
+                continue
+            if ks in FORBIDDEN_LOADER_KEYS:
+                return ("stopped-unresolved", "missing-loader-evidence")
+        # Exact key match for PYTHONPATH (substring would false-positive
+        # MYPYTHONPATH; exact key check above already covers, kept here
+        # as explicit loader contract on values text).
+        if "PYTHONPATH" in keys:
+            return ("stopped-unresolved", "missing-loader-evidence")
+        # Values text must not smuggle forbidden loader assignment.
+        # Parse tokens exactly; substring on whole blob is not used.
+        try:
+            vals_s = str(vals)
+        except Exception:
+            vals_s = ""
+        for tok in vals_s.split():
+            if tok.split("=", 1)[0].strip() in FORBIDDEN_LOADER_KEYS:
                 return ("stopped-unresolved", "missing-loader-evidence")
     return ("ok", "")
 
