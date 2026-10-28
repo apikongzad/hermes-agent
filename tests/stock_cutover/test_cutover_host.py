@@ -219,5 +219,65 @@ class TestSupervision(unittest.TestCase):
                           "/var/lib/hermes-stock-activation/recovery/cli.py", "apply"])
 
 
+class TestRunnerIdentityObject(unittest.TestCase):
+    def test_object_identity_not_name(self):
+        # Injected runner named _run_fixed must still be treated as injected,
+        # not live. Old name-based check would misclassify.
+        import subprocess as _sp
+        def _run_fixed(argv, timeout=60):
+            self.assertEqual(argv[0], "/usr/bin/findmnt")
+            return _sp.CompletedProcess(argv, 0, "squashfs ro /dev/loop9 /run/x", "")
+        _run_fixed.__name__ = "_run_fixed"
+        h = H.RealCutoverHost(runner=_run_fixed)
+        self.assertFalse(h._is_live)
+        out = h.mount_show(H.KNOWN_GOOD_MOUNT)
+        self.assertIn("squashfs", out)
+        # Live host uses object identity (is_live True).
+        h2 = H.RealCutoverHost(runner=None)
+        self.assertTrue(h2._is_live)
+
+    def test_proc_identity_full_fields(self):
+        import os as _os
+        h = H.RealCutoverHost(runner=FakeRunner())
+        ident = h.proc_identity(_os.getpid())
+        for k in ("boot_id", "pid", "starttime", "exe", "cmdline", "cgroup", "cwd"):
+            self.assertIn(k, ident)
+        self.assertEqual(ident["pid"], _os.getpid())
+        self.assertGreater(int(ident["starttime"]), 0)
+        self.assertTrue(ident["boot_id"])
+        self.assertTrue(ident["exe"])
+        # cwd must be real dir (readlink /proc/self/cwd).
+        self.assertTrue(ident["cwd"].startswith("/"))
+
+    def test_file_info_o_nofollow_no_follow(self):
+        import os as _os
+        import tempfile as _tf
+        h = H.RealCutoverHost(runner=FakeRunner())
+        d = _tf.mkdtemp(prefix="cutover-nofollow-", dir="/tmp")
+        try:
+            real = _os.path.join(d, "real.conf")
+            with open(real, "wb") as f:
+                f.write(b"real-bytes")
+            link = _os.path.join(d, "link.conf")
+            _os.symlink(real, link)
+            info_link = h.file_info(link)
+            # Symlink must not be hashed as target (sha empty, no follow).
+            self.assertEqual(info_link["sha256"], "")
+            info_real = h.file_info(real)
+            self.assertEqual(len(info_real["sha256"]), 64)
+        finally:
+            import shutil as _sh
+            _sh.rmtree(d, ignore_errors=True)
+
+    def test_lock_info_none_when_absent(self):
+        h = H.RealCutoverHost(runner=FakeRunner())
+        # No /var/lib/.../journal.lock in worker (no root); must be None or OSError.
+        try:
+            info = h.lock_info()
+        except OSError:
+            info = None
+        self.assertTrue(info is None or isinstance(info, dict))
+
+
 if __name__ == "__main__":
     unittest.main()

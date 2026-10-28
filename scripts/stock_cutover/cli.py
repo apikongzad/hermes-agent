@@ -58,28 +58,98 @@ def _entry_dir():
 
 
 def _sha256_file(path):
+    # O_NOFOLLOW hardening: lstat first, then open via O_NOFOLLOW fd.
+    # Never follows symlink between check and hash (TOCTOU).
+    try:
+        lst = os.lstat(path)
+    except OSError:
+        raise
+    if stat.S_ISLNK(lst.st_mode):
+        raise OSError("symlink refused")
+    if not stat.S_ISREG(lst.st_mode):
+        raise OSError("not regular file")
     h = hashlib.sha256()
-    with open(path, "rb") as f:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
         while True:
-            b = f.read(65536)
+            b = os.read(fd, 65536)
             if not b:
                 break
             h.update(b)
+    finally:
+        os.close(fd)
     return h.hexdigest()
+
+
+def _is_root_live_dir(entry_dir):
+    try:
+        euid = os.geteuid()
+    except AttributeError:
+        return False
+    if euid != 0:
+        return False
+    try:
+        norm = os.path.normpath(entry_dir)
+    except Exception:
+        return False
+    if norm == INSTALL_PREFIX or norm.startswith(INSTALL_PREFIX + "/"):
+        return True
+    return False
+
+
+def _enforce_root_live_layout(entry_dir, rel, lst):
+    """Enforce uid/mode/path when root live is allowed.
+
+    Only called when _is_root_live_dir(entry_dir) is True. Requires
+    uid 0, mode 0500 for .py siblings, 0400 for MANIFEST.json, entry
+    under INSTALL_PREFIX, no symlink. Returns (ok, reason).
+    """
+    if lst.st_uid != 0:
+        return False, f"root live uid: {rel}"
+    mode = stat.S_IMODE(lst.st_mode)
+    if rel == MANIFEST_REL:
+        if mode != 0o400:
+            return False, f"root live mode manifest: {rel} {oct(mode)}"
+    elif rel.endswith(".py"):
+        if mode != 0o500:
+            return False, f"root live mode: {rel} {oct(mode)}"
+    else:
+        return False, f"root live rel: {rel}"
+    return True, ""
 
 
 def _verify_export_dir(entry_dir):
     """Verify every MANIFEST file hash BEFORE importing siblings.
 
     Returns (ok, reason, entry_shas). Performs no import, opens no .env,
-    follows no symlink for hash targets (lstat + open O_NOFOLLOW via
-    refusal of symlinked siblings). Adversarial post-export overwrite
-    yields ok=False and the caller must NOT import siblings.
+    follows no symlink for hash targets (lstat + O_NOFOLLOW fd hash).
+    Adversarial post-export overwrite yields ok=False and the caller must
+    NOT import siblings. MANIFEST self-consistency is NOT trust: parent
+    must verify REVIEWED digests after root-owned install. When running
+    as root from INSTALL_PREFIX, additionally enforces uid/mode/path.
     """
     if not isinstance(entry_dir, str) or not entry_dir:
         return False, "entry dir type", {}
     if not os.path.isabs(entry_dir):
         return False, "entry dir relative", {}
+    # Entry dir itself must not be symlink; root-live enforces ownership.
+    try:
+        dstat = os.lstat(entry_dir)
+    except OSError as e:
+        return False, f"entry dir missing: {e}", {}
+    if stat.S_ISLNK(dstat.st_mode):
+        return False, "entry dir symlink", {}
+    if not stat.S_ISDIR(dstat.st_mode):
+        return False, "entry dir not dir", {}
+    root_live = _is_root_live_dir(entry_dir)
+    if root_live:
+        if dstat.st_uid != 0:
+            return False, "root live entry uid", {}
+        if stat.S_IMODE(dstat.st_mode) != 0o500:
+            return False, "root live entry mode", {}
+        norm = os.path.normpath(entry_dir)
+        if norm != INSTALL_PREFIX and not norm.startswith(INSTALL_PREFIX + "/"):
+            return False, "root live path", {}
     man = os.path.join(entry_dir, MANIFEST_REL)
     try:
         st = os.lstat(man)
@@ -87,9 +157,26 @@ def _verify_export_dir(entry_dir):
         return False, f"manifest missing: {e}", {}
     if stat.S_ISLNK(st.st_mode):
         return False, "manifest symlink", {}
+    if root_live:
+        ok, why = _enforce_root_live_layout(entry_dir, MANIFEST_REL, st)
+        if not ok:
+            return False, why, {}
     try:
-        with open(man, "rb") as f:
-            payload = json.loads(f.read().decode("utf-8"))
+        # O_NOFOLLOW read of MANIFEST.
+        mfd = os.open(man, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            chunks = []
+            while True:
+                b = os.read(mfd, 65536)
+                if not b:
+                    break
+                chunks.append(b)
+            raw = b"".join(chunks)
+        finally:
+            os.close(mfd)
+        payload = json.loads(raw.decode("utf-8"))
+    except OSError as e:
+        return False, f"manifest unreadable: {e}", {}
     except Exception as e:
         return False, f"manifest parse: {e}", {}
     files = payload.get("files")
@@ -116,6 +203,10 @@ def _verify_export_dir(entry_dir):
             return False, f"sibling symlink: {rel}", {}
         if not stat.S_ISREG(lst.st_mode):
             return False, f"sibling not file: {rel}", {}
+        if root_live:
+            ok, why = _enforce_root_live_layout(entry_dir, rel, lst)
+            if not ok:
+                return False, why, {}
         try:
             got = _sha256_file(p)
         except OSError as e:
@@ -214,6 +305,15 @@ def main(argv=None):
                                "service_cutover": "NOT-AUTHORIZED"},
                              sort_keys=True, indent=2))
             return 4
+        # MANIFEST self-consistency is NOT trust. Parent must verify
+        # REVIEWED digests after root-owned install. Root-live additionally
+        # enforces uid/mode/path via _verify_export_dir.
+        if isinstance(res, dict):
+            res["manifest_trust"] = "self-consistent-only-not-trusted"
+            try:
+                res["root_live_enforced"] = bool(_is_root_live_dir(entry_dir))
+            except Exception:
+                res["root_live_enforced"] = False
         print(json.dumps(res, sort_keys=True, indent=2))
         return 0
     if cmd in ("apply", "recover"):

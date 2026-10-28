@@ -158,3 +158,37 @@ wiring review. Do NOT claim goal complete.
   `preflight` refuses, marker file absent.
 - No sudo/mount/service mutation in worker; no `/var/lib` or `/run`
   writes; no `.env` opens; no design files edited.
+
+## 7. Next slice (state/durability/evidence/lock, this commit)
+
+- C1: no bare `fence-failed`; `_rollback` + publish/reload paths return
+  `stopped-unresolved:fence-failed`, preserving prior legal journal or
+  canonical terminal per §2.3/§2.5.
+- C2: tail `durable-state-unknown` recovers via `_recover_durable`:
+  journal+physical readback + this-invocation 5s fence re-verify, then
+  `stop-fenced`; otherwise `stopped-unresolved`. No early-return-forever.
+- C3: `known-good-frozen` is I2 (denial+python+digest with exact image
+  pins) + snapshot-copy fsync + durable prior-bytes evidence
+  (base64+sha256 via `_preserve_prior_bytes` in journal detail) before
+  first stop. Marker-only removed.
+- C4: `_do_reload_checks(snapshot)` exact User/WD/ExecStart vs rendered
+  expected, empty stop-hook reset, no v0.21.7 hooks; `_identity_ok` full
+  boot_id/starttime(field22)/cgroup/PID/exe/cmdline/cwd vs pinned
+  generation + expected runtime.
+- `_append` OSError -> `_DurableUnknown` -> `durable-state-unknown`, no
+  false success, no further start. All append sites fail-closed.
+- Image pins: `KNOWN_GOOD_IMAGE_SHA=1d3f026c…381a04`,
+  `CANDIDATE_IMAGE_SHA=8e50b775…61a176`; `_check_digest` requires exact
+  match, not just signed=false/outside.
+- Lock: `JOURNAL_LOCK_PATH` O_EXCL+flock authority via
+  `lock_acquire/lock_release/lock_info` with epoch/boot/pid/starttime;
+  acquired before any journal/fence/publication; stale takeover only
+  after retained-journal verification; no pretend release after kill.
+- Preflight: O_NOFOLLOW fd hashes, `_is_root_live_dir` uid/mode/path
+  enforcement when root live; `manifest_trust=self-consistent-only-
+  not-trusted`; runner identity via object (`_is_live`), not `__name__`.
+- CLI apply/recover stay `refused-live-not-authorized-here` (exit 1)
+  until full review; no handoff break.
+- Tests: `tests/stock_cutover` 62 green (was 37), `tests/stock_activation`
+  147 green. No design bytes edited. RealHost mutations still refused:
+  stop/start/reload/sleep/denial/backup/digest/gateway/dropins (see §2).

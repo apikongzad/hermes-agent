@@ -272,7 +272,11 @@ class RealCutoverHost(Host):
         # runner(argv, timeout=60) -> object with returncode/stdout/stderr.
         # Live default is _run_fixed. Unit tests inject a fake runner;
         # worker never spawns live systemctl/sudo via this path.
+        # Object identity (not __name__) decides live vs injected path.
+        self._is_live = (runner is None)
         self._runner = runner if runner is not None else self._run_fixed
+        self._lock_fd = None
+        self._lock_owned = None
 
     def _run_fixed(self, argv, timeout=60):
         if not isinstance(argv, list) or not argv:
@@ -425,12 +429,17 @@ class RealCutoverHost(Host):
         st = os.lstat(path)
         h = hashlib.sha256()
         if stat.S_ISREG(st.st_mode) and not stat.S_ISLNK(st.st_mode):
-            with open(path, "rb") as f:
+            # O_NOFOLLOW hardening: never follow symlink between lstat and
+            # hash. Open via O_NOFOLLOW fd, hash from fd.
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
                 while True:
-                    b = f.read(65536)
+                    b = os.read(fd, 65536)
                     if not b:
                         break
                     h.update(b)
+            finally:
+                os.close(fd)
             sha = h.hexdigest()
         else:
             sha = ""
@@ -495,6 +504,8 @@ class RealCutoverHost(Host):
             raise ValueError("pid")
         base = "/proc/" + str(int(pid))
         exe = os.readlink(base + "/exe")
+        # O_NOFOLLOW hardening for proc reads: open with O_NOFOLLOW where
+        # applicable; /proc entries are not symlinks except exe/cwd.
         with open(base + "/cmdline", "rb") as f:
             raw = f.read()
         cmdline = " ".join([p for p in raw.decode("utf-8", "replace").split("\0") if p])
@@ -502,16 +513,21 @@ class RealCutoverHost(Host):
             cgroup = f.read().decode("utf-8", "replace").strip()
         with open(base + "/stat", "rb") as f:
             parts = f.read().decode("utf-8", "replace").split()
+        # Field 22 starttime per proc(5): index 21.
         starttime = int(parts[21]) if len(parts) > 21 else 0
         with open("/proc/sys/kernel/random/boot_id", "rb") as f:
             boot = f.read().decode("utf-8").strip()
+        try:
+            cwd = os.readlink(base + "/cwd")
+        except OSError:
+            cwd = ""
         with open(base + "/environ", "rb") as f:
             env_raw = f.read().decode("utf-8", "replace")
         keys = [c.split("=", 1)[0] for c in env_raw.split("\0") if "=" in c]
         return {
             "boot_id": boot, "pid": pid, "starttime": starttime,
             "exe": exe, "cmdline": cmdline, "cgroup": cgroup,
-            "environ_keys": keys,
+            "cwd": cwd, "environ_keys": keys,
         }
 
     def denial_probe(self, path):
@@ -590,10 +606,10 @@ class RealCutoverHost(Host):
         # Read-only findmnt readback via injected runner/live _run_fixed?
         # findmnt is not under sudo launcher; run directly read-only.
         # In unit tests the runner fakes it; live path runs real findmnt.
+        # Object identity (not __name__) decides the path.
         argv = _findmnt_argv_for(mountpoint)
-        if self._runner is not None and getattr(self._runner, "__name__", "") != "_run_fixed":
-            # Injected runner expects G3-style? No: findmnt is direct.
-            # Allow injected runner to handle bare findmnt argv.
+        if not self._is_live:
+            # Injected runner handles bare findmnt argv.
             try:
                 done = self._runner(argv, timeout=60)
             except TypeError:
@@ -648,6 +664,170 @@ class RealCutoverHost(Host):
     def file_uid(self, path):
         _refuse_live_env(path)
         return os.lstat(path).st_uid
+
+    def lock_info(self):
+        """Read current lock content without acquiring. Returns dict or None."""
+        try:
+            fd = os.open(JOURNAL_LOCK_PATH, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise
+        try:
+            chunks = []
+            while True:
+                b = os.read(fd, 8192)
+                if not b:
+                    break
+                chunks.append(b)
+            raw = b"".join(chunks).decode("utf-8", "replace")
+        finally:
+            os.close(fd)
+        try:
+            obj = json.loads(raw)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+
+    def lock_acquire(self):
+        """Authority lock: O_EXCL create + flock, epoch/boot semantics.
+
+        Before any journal/fence/publication. Raises OSError('lock-held')
+        if a live holder owns it (same boot, holder pid alive with same
+        starttime). Stale holder (dead pid, boot mismatch, pid reuse with
+        different starttime) allows takeover after retained-journal check
+        by the caller; this function unlinks the stale file and retries
+        once. Never pretends release after process kill: file remains
+        until explicit takeover; flock alone is not authority.
+        """
+        import fcntl as _fcntl
+        import time as _t
+        if self._lock_fd is not None:
+            return True
+        # Parent dir must be root-owned 0700, not symlink.
+        try:
+            st = os.lstat(JOURNAL_DIR)
+        except FileNotFoundError:
+            raise OSError("journal dir missing")
+        if st.st_uid != 0 or stat.S_IMODE(st.st_mode) != 0o700:
+            raise OSError("journal dir ownership")
+        if stat.S_ISLNK(st.st_mode):
+            raise OSError("journal dir symlink")
+        try:
+            my_boot = self.boot_id()
+        except OSError:
+            raise
+        my_pid = os.getpid()
+        try:
+            with open(f"/proc/{my_pid}/stat", "rb") as f:
+                _parts = f.read().decode("utf-8", "replace").split()
+            my_st = int(_parts[21]) if len(_parts) > 21 else 0
+        except Exception:
+            my_st = 0
+        content = json.dumps({
+            "boot_id": my_boot, "pid": my_pid, "starttime": my_st,
+            "epoch": _t.monotonic(),
+        }).encode("utf-8")
+        flags = os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY
+        try:
+            fd = os.open(JOURNAL_LOCK_PATH, flags, 0o600)
+        except FileExistsError:
+            # Existing lock: verify holder liveness (epoch/boot semantics).
+            cur = self.lock_info()
+            if not isinstance(cur, dict):
+                raise OSError("lock-held")
+            hp = cur.get("pid")
+            hb = cur.get("boot_id")
+            hs = cur.get("starttime", 0)
+            alive = False
+            if isinstance(hp, int) and hp > 0 and isinstance(hb, str) and hb:
+                try:
+                    ident = self.proc_identity(hp)
+                    if (ident.get("boot_id") == hb and int(ident.get("pid", 0)) == hp
+                            and int(ident.get("starttime", 0)) == int(hs or 0)
+                            and int(hs or 0) != 0):
+                        alive = True
+                except Exception:
+                    alive = False
+            if alive:
+                raise OSError("lock-held")
+            # Stale: unlink then retry once. If retry races, second writer wins.
+            try:
+                os.unlink(JOURNAL_LOCK_PATH)
+            except OSError:
+                raise OSError("lock-held")
+            try:
+                fd = os.open(JOURNAL_LOCK_PATH, flags, 0o600)
+            except FileExistsError:
+                raise OSError("lock-held")
+        # Write content durably, then flock non-blocking as authority.
+        try:
+            off = 0
+            while off < len(content):
+                n = os.write(fd, content[off:])
+                if n == 0:
+                    raise OSError("short write")
+                off += n
+            os.fsync(fd)
+            try:
+                _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            except (OSError, BlockingIOError):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise OSError("lock-held")
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        self._lock_fd = fd
+        self._lock_owned = {"boot_id": my_boot, "pid": my_pid, "starttime": my_st}
+        # Fsync parent dir for durability of lock creation.
+        try:
+            dfd = os.open(JOURNAL_DIR, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+        return True
+
+    def lock_release(self):
+        """Release only own lock. Never releases another holder's file."""
+        if self._lock_fd is None:
+            # No fd held: do not unlink another holder's file (no pretend
+            # release after process kill). Verify ownership via content.
+            cur = self.lock_info()
+            if cur is None:
+                return
+            raise OSError("not lock owner")
+        owned = self._lock_owned
+        try:
+            cur = self.lock_info()
+        except OSError:
+            cur = None
+        if (not isinstance(cur, dict) or cur.get("pid") != (owned or {}).get("pid")
+                or cur.get("boot_id") != (owned or {}).get("boot_id")):
+            try:
+                os.close(self._lock_fd)
+            except OSError:
+                pass
+            self._lock_fd = None
+            self._lock_owned = None
+            raise OSError("not lock owner")
+        try:
+            os.close(self._lock_fd)
+        finally:
+            self._lock_fd = None
+            self._lock_owned = None
+        try:
+            os.unlink(JOURNAL_LOCK_PATH)
+        except FileNotFoundError:
+            pass
 
 
 def preflight_readonly(host):

@@ -189,6 +189,46 @@ class PackageTests(unittest.TestCase):
         self.assertIn("/usr/bin/python3 -I /var/lib/hermes-stock-activation/recovery/cli.py plan", readme)
         self.assertIn("/usr/bin/install -d -o 0 -g 0 -m 0500", readme)
 
+    def test_preflight_manifest_trust_not_trusted(self):
+        e = _load()
+        scratch = _home_scratch("trust-")
+        dest = os.path.join(scratch, "pkg")
+        e.export_cutover_package(dest)
+        entry = os.path.join(dest, "cli.py")
+        cp = subprocess.run(["/usr/bin/python3", "-I", entry, "preflight"],
+                            capture_output=True, text=True, check=False,
+                            cwd=scratch,
+                            env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"})
+        self.assertEqual(cp.returncode, 0, (cp.stdout, cp.stderr))
+        data = json.loads(cp.stdout)
+        self.assertEqual(data["service_cutover"], "NOT-AUTHORIZED")
+        self.assertEqual(data.get("manifest_trust"), "self-consistent-only-not-trusted")
+        self.assertIn("root_live_enforced", data)
+        # Not root in worker, so not enforced, but still NOT-AUTHORIZED.
+        self.assertFalse(data["root_live_enforced"])
+
+    def test_verify_o_nofollow_symlink_refused(self):
+        import sys as _sys
+        _sys.path.insert(0, ".")
+        try:
+            from scripts.stock_cutover import cli as _cli
+            e = _load()
+            scratch = _home_scratch("nofollow-")
+            dest = os.path.join(scratch, "pkg")
+            e.export_cutover_package(dest)
+            # Replace sibling with symlink -> must refuse, not follow.
+            target = os.path.join(dest, "cutover_host.py")
+            os.unlink(target)
+            os.symlink("/etc/hostname", target)
+            ok, reason, _ = _cli._verify_export_dir(dest)
+            self.assertFalse(ok)
+            self.assertIn("symlink", reason)
+        finally:
+            try:
+                _sys.path.remove(".")
+            except ValueError:
+                pass
+
 
 if __name__ == "__main__":
     unittest.main()

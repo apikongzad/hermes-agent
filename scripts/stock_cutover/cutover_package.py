@@ -35,6 +35,7 @@ PACKAGE_FILES = (
 _ALLOWED_TOP = frozenset({
     "hashlib", "json", "os", "stat", "subprocess", "sys",
     "socket", "time", "re", "urllib", "http", "importlib",
+    "fcntl", "base64",
 })
 _ALLOWED_FROM_ROOT = frozenset({"urllib", "http"})
 

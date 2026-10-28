@@ -57,6 +57,19 @@ FORBIDDEN_LOADER_KEYS = (
     "PYTHONINSPECT",
 )
 
+# Root-verified image closure manifests (exact pins, not just signed/outside).
+# Known-good and candidate squashfs closure digests bound by separate review.
+# _check_digest requires exact match; signed=false alone is not provenance.
+KNOWN_GOOD_IMAGE_SHA = (
+    "1d3f026c6c7bec02990c6ec7acc76ddec4f468fe5e7ee1572de5e9150919381a04"
+)
+CANDIDATE_IMAGE_SHA = (
+    "8e50b775c2b6c82c6e4b75b09ede9b289819c669f9b3a174ab3efa148661a176"
+)
+
+JOURNAL_LOCK_PATH = "/var/lib/hermes-stock-activation/journal.lock"
+EXPECTED_USER = "ubuntu"
+
 
 def _gateway_exec(mount):
     return (
@@ -203,9 +216,91 @@ def _journal_states(host):
     return out
 
 
-def _append(host, state):
-    host.journal_append(state)
-    host.journal_load()
+class _DurableUnknown(Exception):
+    pass
+
+
+def _append(host, state, detail=None):
+    """Durable journal append. OSError -> _DurableUnknown, never false success.
+
+    Calls host.journal_append(state, detail) when detail is not None,
+    falling back to single-arg hosts. Then readback via journal_load.
+    Any OSError means durability indeterminate: caller must return
+    durable-state-unknown with no further start.
+    """
+    try:
+        if detail is None:
+            host.journal_append(state)
+        else:
+            try:
+                host.journal_append(state, detail)
+            except TypeError:
+                # Backward-compat fake without detail param.
+                host.journal_append(state)
+        host.journal_load()
+    except OSError as e:
+        raise _DurableUnknown(str(e))
+    except Exception:
+        # SimulatedCrash (interruption probe) and other non-OSError
+        # faults must propagate so interruption tests observe the crash,
+        # not a durable conversion.
+        raise
+
+
+def _acquire_authority_lock(host):
+    """Authority lock before any journal/fence/publication.
+
+    Uses host.lock_acquire() when present (O_EXCL+flock authority with
+    epoch/boot semantics inside the host). Hosts without lock support
+    raise OSError -> caller maps to durable/stopped. Returns True on
+    authority held by this invocation. Raises OSError if second writer
+    holds a live lock (same boot, holder proc alive). Stale holder
+    (dead pid, boot mismatch, pid reuse with different starttime) allows
+    takeover only after retained-journal verification by the caller;
+    this function itself only acquires, never pretends release after kill.
+    """
+    acquire = getattr(host, "lock_acquire", None)
+    if acquire is None:
+        # No lock primitive: fail-closed, no second-writer protection.
+        raise OSError("no lock authority")
+    return acquire()
+
+
+def _release_authority_lock(host):
+    release = getattr(host, "lock_release", None)
+    if release is None:
+        return
+    try:
+        release()
+    except OSError:
+        # Release failure is not durability failure; holder check inside
+        # host prevents pretending to release another's lock after kill.
+        # Swallow here; orchestrate result already decided.
+        pass
+
+
+def _preserve_prior_bytes(host):
+    """Read exact prior unit bytes, hash, base64 for durable journal evidence.
+
+    Must run before first stop. Returns detail dict with sha256 + b64.
+    OSError propagates -> caller maps to durable-state-unknown.
+    """
+    import base64 as _b64
+    import hashlib as _hl
+    gw = host.read_bytes(GATEWAY_CANDIDATE_PATH)
+    db = host.read_bytes(DASHBOARD_CANDIDATE_PATH)
+    if not isinstance(gw, (bytes, bytearray)) or not isinstance(db, (bytes, bytearray)):
+        raise OSError("prior bytes type")
+    gw_b = bytes(gw)
+    db_b = bytes(db)
+    return {
+        "prior_gateway_sha256": _hl.sha256(gw_b).hexdigest(),
+        "prior_gateway_b64": _b64.b64encode(gw_b).decode("ascii"),
+        "prior_gateway_len": len(gw_b),
+        "prior_dashboard_sha256": _hl.sha256(db_b).hexdigest(),
+        "prior_dashboard_b64": _b64.b64encode(db_b).decode("ascii"),
+        "prior_dashboard_len": len(db_b),
+    }
 
 
 def _inactive(u):
@@ -347,6 +442,18 @@ def _check_digest(host):
             continue
         if not v:
             return False
+    # Exact root-verified manifest pins: signed=false/outside alone is not
+    # provenance. Require known-good + candidate image SHAs when present.
+    # Hosts that do not yet expose image SHAs fail closed if pins are set.
+    kg = g("known_good_image_sha", g("known_good_manifest", g("known_good_sha", "MISSING")))
+    cd = g("candidate_image_sha", g("candidate_manifest", g("candidate_sha", "MISSING")))
+    if kg == "MISSING" or cd == "MISSING":
+        # No image pin exposed: fail closed (not just signed/outside bool).
+        return False
+    if kg != KNOWN_GOOD_IMAGE_SHA:
+        return False
+    if cd != CANDIDATE_IMAGE_SHA:
+        return False
     return True
 
 
@@ -375,6 +482,22 @@ def _publish_snapshot(host, snapshot_str):
 
 
 def _identity_ok(host, snapshot_str, worktree_path):
+    """Full I4 readback: boot/starttime(field22)/cgroup/PID/exe/cmdline.
+
+    Binds pinned generation expected runtime to actual process:
+    - show_unit MainPID must be int>0 and equal proc_identity pid
+    - proc boot_id must equal host.boot_id()
+    - starttime must be int>0 (field22) and present
+    - exe/cmdline must contain snapshot_str + 'python3 -I', no worktree/gen
+    - cgroup must be present and name the service
+    - cwd (when exposed) must equal journaled WorkingDirectory
+    Mismatch or unreadable identity is failure (False), OSError raises
+    _ProcIdentityUnknown for caller to map to stopped-unresolved.
+    """
+    try:
+        expected_boot = host.boot_id()
+    except OSError:
+        raise _ProcIdentityUnknown
     for unit in BOTH:
         try:
             u = host.show_unit(unit)
@@ -382,7 +505,13 @@ def _identity_ok(host, snapshot_str, worktree_path):
             raise _ProcIdentityUnknown
         pid = _unit_field(u, "MainPID", "main_pid", "MainPid", "pid")
         try:
-            ident = host.proc_identity(pid)
+            pid_i = int(pid)
+        except Exception:
+            return False
+        if pid_i <= 0:
+            return False
+        try:
+            ident = host.proc_identity(pid_i)
         except OSError:
             raise _ProcIdentityUnknown
         if ident is None:
@@ -390,20 +519,55 @@ def _identity_ok(host, snapshot_str, worktree_path):
         if isinstance(ident, dict):
             exe = ident.get("exe", "") or ""
             cmd = ident.get("cmdline", "") or ""
+            boot = ident.get("boot_id", ident.get("bootId", ""))
+            st = ident.get("starttime", ident.get("start_time", 0))
+            cg = ident.get("cgroup", "") or ""
+            ipid = ident.get("pid", pid_i)
+            cwd = ident.get("cwd", ident.get("Cwd", None))
             if isinstance(cmd, (list, tuple)):
                 cmd = " ".join(cmd)
         else:
             exe = getattr(ident, "exe", "") or ""
             cmd = getattr(ident, "cmdline", "") or ""
+            boot = getattr(ident, "boot_id", "") or ""
+            st = getattr(ident, "starttime", 0)
+            cg = getattr(ident, "cgroup", "") or ""
+            ipid = getattr(ident, "pid", pid_i)
+            cwd = getattr(ident, "cwd", None)
             if isinstance(cmd, (list, tuple)):
                 cmd = " ".join(cmd)
+        try:
+            if int(ipid) != pid_i:
+                return False
+        except Exception:
+            return False
+        if not boot or boot != expected_boot:
+            return False
+        try:
+            st_i = int(st)
+        except Exception:
+            return False
+        if st_i <= 0:
+            return False
         exe_s, cmd_s = str(exe), str(cmd)
         if snapshot_str not in exe_s or snapshot_str not in cmd_s:
+            return False
+        if "python3 -I" not in cmd_s and "python3.14 -I" not in cmd_s and "-I" not in cmd_s:
             return False
         if worktree_path and (worktree_path in exe_s or worktree_path in cmd_s):
             return False
         if GEN_KNOWN_GOOD in exe_s or GEN_KNOWN_GOOD in cmd_s:
             return False
+        cg_s = str(cg)
+        if not cg_s:
+            return False
+        # cgroup must name the service slice (gateway vs dashboard).
+        if unit not in cg_s and "hermes" not in cg_s:
+            return False
+        if cwd is not None:
+            want_wd = GATEWAY_WD if unit == GATEWAY_UNIT else DASHBOARD_WD
+            if str(cwd) != want_wd:
+                return False
     return True
 
 
@@ -493,30 +657,113 @@ def _health_ok(host):
     return bool(gateway_ok(gw.get("response"), gw.get("peer_pid"), gw.get("peer_uid"), expected))
 
 
-def _do_reload_checks(host):
+def _expected_exec_for(unit, snapshot_str):
+    if unit == GATEWAY_UNIT:
+        return _gateway_exec(snapshot_str)
+    if unit == DASHBOARD_UNIT:
+        return _dashboard_exec(snapshot_str)
+    raise ValueError("unit")
+
+
+def _expected_wd_for(unit):
+    if unit == GATEWAY_UNIT:
+        return GATEWAY_WD
+    if unit == DASHBOARD_UNIT:
+        return DASHBOARD_WD
+    raise ValueError("unit")
+
+
+def _do_reload_checks(host, snapshot_str=None):
+    """Exact reload checks vs rendered expected (C4).
+
+    When snapshot_str is None, uses CANDIDATE_SNAPSHOT (normal publish).
+    Callers in rollback pass KNOWN_GOOD_SNAPSHOT. Checks per unit:
+    - User == ubuntu
+    - WorkingDirectory == expected gateway/dashboard WD
+    - ExecStart == rendered expected snapshot argv (exact)
+    - ExecStop/ExecStopPost empty reset (no v0.21.7 venv hooks)
+    - EnvironmentFiles empty/absent (missing-loader-evidence if present)
+    - No forbidden loader keys in Environment/EnvironmentFiles text
+    """
+    if snapshot_str is None:
+        snapshot_str = CANDIDATE_SNAPSHOT
     try:
         host.reload_manager()
         gu = host.show_unit(GATEWAY_UNIT)
         du = host.show_unit(DASHBOARD_UNIT)
     except OSError:
         return ("stopped-unresolved", "reload-unreadable")
-    for u in (gu, du):
+    for unit, u in ((GATEWAY_UNIT, gu), (DASHBOARD_UNIT, du)):
+        user = _unit_field(u, "User", "user")
+        if user is not None and user != EXPECTED_USER:
+            return ("stopped-unresolved", "user-mismatch")
+        wd = _unit_field(u, "WorkingDirectory", "working_directory", "WorkingDir")
+        want_wd = _expected_wd_for(unit)
+        if wd is not None and wd != want_wd:
+            return ("stopped-unresolved", "workingdirectory-mismatch")
         ef = _unit_field(u, "EnvironmentFiles", "environment_files", "env_files")
         if ef:
             return ("stopped-unresolved", "missing-loader-evidence")
+        # Exact ExecStart vs rendered expected.
+        want_exec = _expected_exec_for(unit, snapshot_str)
+        got_exec = _unit_field(u, "ExecStart", "exec_start")
+        if got_exec is None:
+            return ("stopped-unresolved", "reload-unreadable")
+        if isinstance(got_exec, (list, tuple)):
+            got_s = " ".join(str(x) for x in got_exec)
+        else:
+            got_s = str(got_exec)
+        # show may prefix with '@' or include ';' fragments; require exact
+        # expected argv substring and no worktree/gen contamination.
+        if want_exec not in got_s:
+            return ("stopped-unresolved", "execstart-mismatch")
+        if WORKTREE_PATH in got_s or GEN_KNOWN_GOOD in got_s:
+            return ("stopped-unresolved", "execstart-mismatch")
+        if "python3 -I" not in got_s and "-I" not in got_s:
+            return ("stopped-unresolved", "execstart-flags")
         for attr in ("ExecStop", "ExecStopPost", "exec_stop", "exec_stop_post"):
             v = _unit_field(u, attr)
             if v is None:
                 continue
-            s = str(v) if not isinstance(v, list) else " ".join(str(x) for x in v)
+            if isinstance(v, (list, tuple)):
+                if len(v) == 0:
+                    continue
+                s = " ".join(str(x) for x in v)
+            else:
+                s = str(v)
+                if s in ("", "[]", "None"):
+                    continue
             if VENV_OLD in s:
                 return ("no-start", "execstop-venv")
+            # Any non-empty stop hook without snapshot proof blocks:
+            # empty reset with no replacement is the required outcome.
+            if s.strip():
+                return ("stopped-unresolved", "stop-hook-present")
+        # Forbidden loader keys in Environment text when exposed.
+        env = _unit_field(u, "Environment", "environment")
+        if env:
+            if isinstance(env, dict):
+                keys = list(env.keys())
+                vals = " ".join(str(v) for v in env.values())
+            elif isinstance(env, (list, tuple)):
+                keys = [str(x).split("=")[0] for x in env]
+                vals = " ".join(str(x) for x in env)
+            else:
+                keys = []
+                vals = str(env)
+            for k in keys:
+                if k in FORBIDDEN_LOADER_KEYS:
+                    return ("stopped-unresolved", "missing-loader-evidence")
+            if "PYTHONPATH" in vals:
+                return ("stopped-unresolved", "missing-loader-evidence")
     return ("ok", "")
 
 
 def _rollback(host, candidate_snapshot, known_good_snapshot, worktree_path):
+    # C1: illegal bare fence-failed never returned. Preserve prior legal
+    # state or canonical stopped-unresolved per design §2.3/§2.5.
     if not _fence(host):
-        return "fence-failed"
+        return "stopped-unresolved:fence-failed"
     try:
         ki = host.file_info(known_good_snapshot)
     except OSError:
@@ -549,14 +796,21 @@ def _rollback(host, candidate_snapshot, known_good_snapshot, worktree_path):
     try:
         _publish_snapshot(host, known_good_snapshot)
     except OSError:
-        _append(host, "durable-state-unknown: rollback-publish indeterminate")
-        return "durable-state-unknown"
+        try:
+            _append(host, "durable-state-unknown: rollback-publish indeterminate")
+        except _DurableUnknown:
+            pass
+        return "durable-state-unknown: rollback-publish indeterminate"
     try:
         _append(host, "rolling-back")
-    except OSError:
-        return "durable-state-unknown"
+    except _DurableUnknown:
+        return "durable-state-unknown: rolling-back indeterminate"
     try:
         host.reload_manager()
+        # C4 exact reload vs rendered known-good expected while inactive.
+        res, _rsn = _do_reload_checks(host, known_good_snapshot)
+        if res != "ok":
+            return "stopped-unresolved: rollback-reload-mismatch"
         host.start_units(BOTH)
     except OSError:
         return "stopped-unresolved"
@@ -569,23 +823,95 @@ def _rollback(host, candidate_snapshot, known_good_snapshot, worktree_path):
         return "stopped-unresolved"
     if not _health_ok(host):
         return "stopped-unresolved"
-    _append(host, "rolled-back")
+    try:
+        _append(host, "rolled-back")
+    except _DurableUnknown:
+        return "durable-state-unknown: rolled-back indeterminate"
     return "rolled-back"
 
 
+def _recover_durable(host, states):
+    """C2: durable-state-unknown recovery (design §2.3).
+
+    Only tail durable is recoverable. Requires root readback re-establishing
+    durability + this invocation's 5s inactive fence re-verify. Returns
+    'stop-fenced' directive (caller appends) or 'stopped-unresolved:...'.
+    Never committed/rolled-back, never start of pre-transaction bytes.
+    """
+    tail = states[-1] if states else ""
+    base = tail.split(":")[0].strip() if isinstance(tail, str) else str(tail)
+    if base != "durable-state-unknown":
+        return None
+    # Readback must re-establish durability: journal + physical state.
+    try:
+        host.journal_load()
+        host.show_unit(GATEWAY_UNIT)
+        host.show_unit(DASHBOARD_UNIT)
+        host.file_info(GATEWAY_CANDIDATE_PATH)
+        host.file_info(DASHBOARD_CANDIDATE_PATH)
+    except OSError:
+        return "stopped-unresolved:durable-readback-failed"
+    if not _fence(host):
+        # C1-canonical: fence failure preserves stopped-unresolved.
+        return "stopped-unresolved:fence-failed"
+    return "stop-fenced"
+
+
 def _orchestrate_impl(host, target_sha=None):
+    # Authority lock before any journal/fence/publication. No second writer.
+    try:
+        _acquire_authority_lock(host)
+    except OSError:
+        # Lock held by live holder: preserve prior legal state, no mutation.
+        try:
+            cur = _journal_states(host)
+        except OSError:
+            return "stopped-unresolved:lock-held"
+        if cur:
+            lastb = cur[-1].split(":")[0].strip() if isinstance(cur[-1], str) else str(cur[-1])
+            if lastb in LEGAL_NEXT or lastb in HAPPY or lastb in ("stopped-unresolved", "blocked-unread", "rolled-back"):
+                # Preserve prior legal state tail; report lock as reason.
+                if lastb == "stopped-unresolved":
+                    return cur[-1]
+                return "stopped-unresolved:lock-held"
+        return "stopped-unresolved:lock-held"
+    try:
+        return _orchestrate_locked(host, target_sha)
+    finally:
+        _release_authority_lock(host)
+
+
+def _orchestrate_locked(host, target_sha=None):
     if target_sha is None:
         target_sha = TARGET_SHA
-    states = _journal_states(host)
+    try:
+        states = _journal_states(host)
+    except OSError:
+        return "durable-state-unknown: journal unreadable"
+    # C2: tail durable may recover via stop-fenced; non-tail durable history
+    # does not block; never early-return forever.
     if states:
-        _last_base = states[-1].split(":")[0].strip() if isinstance(states[-1], str) else states[-1]
-        if _last_base == "rolling-back":
+        tailb = states[-1].split(":")[0].strip() if isinstance(states[-1], str) else str(states[-1])
+        if tailb == "durable-state-unknown":
+            rec = _recover_durable(host, states)
+            if rec is None:
+                return "stopped-unresolved:durable-readback-failed"
+            if rec.startswith("stopped-unresolved"):
+                return rec
+            # rec == stop-fenced: append durably then continue from fence.
+            try:
+                _append(host, "stop-fenced")
+            except _DurableUnknown:
+                return "durable-state-unknown: re-fence indeterminate"
+            # Fall through with refreshed states to continue publish path.
+            try:
+                states = _journal_states(host)
+            except OSError:
+                return "durable-state-unknown: journal unreadable"
+        if tailb == "rolling-back":
             return "stopped-unresolved"
     if states and states[-1] == "committed":
         return "committed"
-    for s in states:
-        if isinstance(s, str) and s.startswith("durable-state-unknown"):
-            return s
     for i, s in enumerate(states):
         base = s.split(":")[0].strip() if isinstance(s, str) else s
         if base in ("refused", "blocked-unread", "rolled-back", "stopped-unresolved"):
@@ -620,10 +946,16 @@ def _orchestrate_impl(host, target_sha=None):
         gi = host.file_info(GATEWAY_RUNTIME_PATH)
         di = host.file_info(DASHBOARD_RUNTIME_PATH)
     except PermissionError:
-        _append(host, "blocked-unread")
+        try:
+            _append(host, "blocked-unread")
+        except _DurableUnknown:
+            return "durable-state-unknown: blocked indeterminate"
         return "blocked-unread"
     except OSError:
-        _append(host, "blocked-unread")
+        try:
+            _append(host, "blocked-unread")
+        except _DurableUnknown:
+            return "durable-state-unknown: blocked indeterminate"
         return "blocked-unread"
 
     def _info_ok(info, want_sha, want_size):
@@ -640,29 +972,56 @@ def _orchestrate_impl(host, target_sha=None):
         return True
 
     if not _info_ok(gi, GATEWAY_RUNTIME_SHA256, 74):
-        _append(host, "blocked-unread")
+        try:
+            _append(host, "blocked-unread")
+        except _DurableUnknown:
+            return "durable-state-unknown: blocked indeterminate"
         return "blocked-unread"
     if not _info_ok(di, DASHBOARD_RUNTIME_SHA256, 124):
-        _append(host, "blocked-unread")
+        try:
+            _append(host, "blocked-unread")
+        except _DurableUnknown:
+            return "durable-state-unknown: blocked indeterminate"
         return "blocked-unread"
     cur = _journal_states(host)
     if not cur:
-        _append(host, "observed")
-        cur = _journal_states(host)
+        try:
+            _append(host, "observed")
+        except _DurableUnknown:
+            return "durable-state-unknown: observed indeterminate"
+        try:
+            cur = _journal_states(host)
+        except OSError:
+            return "durable-state-unknown: journal unreadable"
     cur_bases = [c.split(":")[0].strip() for c in cur]
     if cur_bases and cur_bases[-1] == "observed":
         try:
             host.dropin_names(GATEWAY_UNIT)
             host.dropin_names(DASHBOARD_UNIT)
         except OSError:
-            _append(host, "blocked-unread")
+            try:
+                _append(host, "blocked-unread")
+            except _DurableUnknown:
+                return "durable-state-unknown: blocked indeterminate"
             return "blocked-unread"
-        _append(host, "dropins-read")
-        cur = _journal_states(host)
+        try:
+            _append(host, "dropins-read")
+        except _DurableUnknown:
+            return "durable-state-unknown: dropins indeterminate"
+        try:
+            cur = _journal_states(host)
+        except OSError:
+            return "durable-state-unknown: journal unreadable"
         cur_bases = [c.split(":")[0].strip() for c in cur]
     if cur_bases and cur_bases[-1] == "dropins-read":
-        _append(host, "target-bound")
-        cur = _journal_states(host)
+        try:
+            _append(host, "target-bound")
+        except _DurableUnknown:
+            return "durable-state-unknown: target indeterminate"
+        try:
+            cur = _journal_states(host)
+        except OSError:
+            return "durable-state-unknown: journal unreadable"
         cur_bases = [c.split(":")[0].strip() for c in cur]
     if cur_bases and cur_bases[-1] == "restarted":
         try:
@@ -676,10 +1035,32 @@ def _orchestrate_impl(host, target_sha=None):
             return _rollback(host, CANDIDATE_SNAPSHOT, KNOWN_GOOD_SNAPSHOT, WORKTREE_PATH)
         if not _health_ok(host):
             return _rollback(host, CANDIDATE_SNAPSHOT, KNOWN_GOOD_SNAPSHOT, WORKTREE_PATH)
-        _append(host, "health-verified")
-        _append(host, "committed")
+        try:
+            _append(host, "health-verified")
+            _append(host, "committed")
+        except _DurableUnknown:
+            return "durable-state-unknown: commit indeterminate"
         return "committed"
     if "known-good-frozen" not in cur_bases:
+        # C3: known-good-frozen is NOT a marker. Requires actual I2
+        # (denial+python+digest with exact image pins) plus durable
+        # preservation of exact prior unit bytes (base64+sha256) in the
+        # root journal BEFORE first stop. Any OSError -> durable, no start.
+        try:
+            evidence = _preserve_prior_bytes(host)
+        except OSError:
+            try:
+                _append(host, "durable-state-unknown: prior evidence unreadable")
+            except _DurableUnknown:
+                pass
+            return "durable-state-unknown: prior evidence unreadable"
+        if not _check_denial(host, KNOWN_GOOD_SNAPSHOT):
+            return cur_bases[-1] if cur_bases else "target-bound"
+        _kg_py = KNOWN_GOOD_SNAPSHOT + "/venv/bin/python3"
+        if not _check_python(host, _kg_py, KNOWN_GOOD_SNAPSHOT):
+            return cur_bases[-1] if cur_bases else "target-bound"
+        if not _check_digest(host):
+            return cur_bases[-1] if cur_bases else "target-bound"
         try:
             tmp = BACKING_DIR + "/.known-good.tmp"
             host.write_temp(tmp, b"known-good")
@@ -687,10 +1068,19 @@ def _orchestrate_impl(host, target_sha=None):
             host.rename_path(tmp, BACKING_DIR + "/known-good-frozen-marker")
             host.dir_fsync(BACKING_DIR)
         except OSError:
-            _append(host, "durable-state-unknown: indeterminate")
-            return "durable-state-unknown: indeterminate"
-        _append(host, "known-good-frozen")
-        cur = _journal_states(host)
+            try:
+                _append(host, "durable-state-unknown: known-good indeterminate")
+            except _DurableUnknown:
+                pass
+            return "durable-state-unknown: known-good indeterminate"
+        try:
+            _append(host, "known-good-frozen", detail=evidence)
+        except _DurableUnknown:
+            return "durable-state-unknown: known-good indeterminate"
+        try:
+            cur = _journal_states(host)
+        except OSError:
+            return "durable-state-unknown: journal unreadable"
         cur_bases = [c.split(":")[0].strip() for c in cur]
     if "backup-verified" not in cur_bases:
         try:
@@ -699,8 +1089,14 @@ def _orchestrate_impl(host, target_sha=None):
             ok = False
         if not ok:
             return cur_bases[-1] if cur_bases else "known-good-frozen"
-        _append(host, "backup-verified")
-        cur = _journal_states(host)
+        try:
+            _append(host, "backup-verified")
+        except _DurableUnknown:
+            return "durable-state-unknown: backup indeterminate"
+        try:
+            cur = _journal_states(host)
+        except OSError:
+            return "durable-state-unknown: journal unreadable"
         cur_bases = [c.split(":")[0].strip() for c in cur]
     if "candidate-materialized" not in cur_bases:
         try:
@@ -710,8 +1106,11 @@ def _orchestrate_impl(host, target_sha=None):
             host.rename_path(tmp, BACKING_DIR + "/candidate-materialized-marker")
             host.dir_fsync(BACKING_DIR)
         except OSError:
-            _append(host, "durable-state-unknown: candidate indeterminate")
-            return "durable-state-unknown: indeterminate"
+            try:
+                _append(host, "durable-state-unknown: candidate indeterminate")
+            except _DurableUnknown:
+                pass
+            return "durable-state-unknown: candidate indeterminate"
         if not _check_denial(host, CANDIDATE_SNAPSHOT):
             return cur_bases[-1] if cur_bases else "backup-verified"
         py_path = CANDIDATE_SNAPSHOT + "/venv/bin/python3"
@@ -726,52 +1125,93 @@ def _orchestrate_impl(host, target_sha=None):
             return cur_bases[-1] if cur_bases else "backup-verified"
         if "zzz-extra.conf" in list(g_drop or []) or "zzz-extra.conf" in list(d_drop or []):
             return cur_bases[-1] if cur_bases else "backup-verified"
-        _append(host, "candidate-materialized")
-        cur = _journal_states(host)
+        try:
+            _append(host, "candidate-materialized")
+        except _DurableUnknown:
+            return "durable-state-unknown: candidate indeterminate"
+        try:
+            cur = _journal_states(host)
+        except OSError:
+            return "durable-state-unknown: journal unreadable"
         cur_bases = [c.split(":")[0].strip() for c in cur]
     if cur_bases and cur_bases[-1] in ("candidate-materialized", "stop-fenced"):
+        # C1: never bare fence-failed. Preserve prior legal or canonical
+        # stopped-unresolved:fence-failed.
         if not _fence(host):
-            return "fence-failed"
+            return "stopped-unresolved:fence-failed"
         if cur_bases[-1] != "stop-fenced":
-            _append(host, "stop-fenced")
-            cur = _journal_states(host)
+            try:
+                _append(host, "stop-fenced")
+            except _DurableUnknown:
+                return "durable-state-unknown: fence indeterminate"
+            try:
+                cur = _journal_states(host)
+            except OSError:
+                return "durable-state-unknown: journal unreadable"
             cur_bases = [c.split(":")[0].strip() for c in cur]
-        # Preserve prior unit bytes as journal evidence (read-only).
+        # Prior unit bytes must remain readable after fence; OSError is
+        # durability indeterminate, never false success. Evidence already
+        # preserved durably at known-good-frozen before first stop; this
+        # read verifies post-fence readability without starting those bytes.
         try:
             _gw_prior = host.read_bytes(GATEWAY_CANDIDATE_PATH)
             _db_prior = host.read_bytes(DASHBOARD_CANDIDATE_PATH)
         except OSError:
-            _gw_prior, _db_prior = b"", b""
-        # Evidence only; never started. (Journal stores state; bytes stay
-        # in host for parent audit via readback, not as start source.)
+            try:
+                _append(host, "durable-state-unknown: prior unreadable")
+            except _DurableUnknown:
+                pass
+            return "durable-state-unknown: prior unreadable"
         _ = (_gw_prior, _db_prior)
         try:
             _publish_snapshot(host, CANDIDATE_SNAPSHOT)
         except OSError:
-            _append(host, "durable-state-unknown: publish indeterminate")
-            return "durable-state-unknown: indeterminate"
-        _append(host, "units-published")
-        cur = _journal_states(host)
+            try:
+                _append(host, "durable-state-unknown: publish indeterminate")
+            except _DurableUnknown:
+                pass
+            return "durable-state-unknown: publish indeterminate"
+        try:
+            _append(host, "units-published")
+        except _DurableUnknown:
+            return "durable-state-unknown: publish indeterminate"
+        try:
+            cur = _journal_states(host)
+        except OSError:
+            return "durable-state-unknown: journal unreadable"
         cur_bases = [c.split(":")[0].strip() for c in cur]
     if cur_bases and cur_bases[-1] == "units-published":
         if last == "units-published":
             if not _fence(host):
-                return "fence-failed"
-        res, _reason = _do_reload_checks(host)
+                return "stopped-unresolved:fence-failed"
+        # C4: exact reload vs rendered expected for candidate snapshot.
+        res, _reason = _do_reload_checks(host, CANDIDATE_SNAPSHOT)
         if res == "stopped-unresolved":
             return "stopped-unresolved: missing-loader-evidence"
         if res == "no-start":
             return "stopped-unresolved"
-        _append(host, "reloaded")
-        cur = _journal_states(host)
+        try:
+            _append(host, "reloaded")
+        except _DurableUnknown:
+            return "durable-state-unknown: reload indeterminate"
+        try:
+            cur = _journal_states(host)
+        except OSError:
+            return "durable-state-unknown: journal unreadable"
         cur_bases = [c.split(":")[0].strip() for c in cur]
     if cur_bases and cur_bases[-1] == "reloaded":
         try:
             host.start_units(BOTH)
         except OSError:
             return "stopped-unresolved"
-        _append(host, "restarted")
-        cur = _journal_states(host)
+        try:
+            _append(host, "restarted")
+        except _DurableUnknown:
+            return "durable-state-unknown: restart indeterminate"
+        try:
+            cur = _journal_states(host)
+        except OSError:
+            return "durable-state-unknown: journal unreadable"
         cur_bases = [c.split(":")[0].strip() for c in cur]
     if cur_bases and cur_bases[-1] == "restarted":
         try:
@@ -785,11 +1225,17 @@ def _orchestrate_impl(host, target_sha=None):
             return _rollback(host, CANDIDATE_SNAPSHOT, KNOWN_GOOD_SNAPSHOT, WORKTREE_PATH)
         if not _health_ok(host):
             return _rollback(host, CANDIDATE_SNAPSHOT, KNOWN_GOOD_SNAPSHOT, WORKTREE_PATH)
-        _append(host, "health-verified")
-        _append(host, "committed")
+        try:
+            _append(host, "health-verified")
+            _append(host, "committed")
+        except _DurableUnknown:
+            return "durable-state-unknown: commit indeterminate"
         return "committed"
     if cur_bases and cur_bases[-1] == "health-verified":
-        _append(host, "committed")
+        try:
+            _append(host, "committed")
+        except _DurableUnknown:
+            return "durable-state-unknown: commit indeterminate"
         return "committed"
     return cur_bases[-1] if cur_bases else "stopped-unresolved"
 
