@@ -34,7 +34,7 @@ PACKAGE_FILES = (
 
 _ALLOWED_TOP = frozenset({
     "hashlib", "json", "os", "stat", "subprocess", "sys",
-    "socket", "time", "re", "urllib", "http",
+    "socket", "time", "re", "urllib", "http", "importlib",
 })
 _ALLOWED_FROM_ROOT = frozenset({"urllib", "http"})
 
@@ -208,7 +208,10 @@ def _parent_readme_text(entry_shas, manifest_sha):
     lines.append(f"  /usr/bin/python3 -I {INSTALL_PREFIX}/cli.py plan")
     lines.append("")
     lines.append("Expected: status manifest-ready, signed false, activation UNEXECUTED,")
-    lines.append("service_cutover AUTHORIZED-BY-REVIEW (code path, not live).")
+    lines.append("service_cutover NOT-AUTHORIZED (no receipt; parent review required).")
+    lines.append("Preflight (read-only, verifies siblings before import):")
+    lines.append("  /usr/bin/python3 -I <EXPORT>/cli.py preflight  # exit 0, no mutation")
+    lines.append(f"  /usr/bin/python3 -I {INSTALL_PREFIX}/cli.py preflight")
     lines.append("")
     lines.append("Refusal check (must exit 3 without --execute-live, no live effects):")
     lines.append(f"  /usr/bin/python3 -I {INSTALL_PREFIX}/cli.py apply; echo $?  # must print 3")
@@ -285,7 +288,7 @@ def export_cutover_package(dest_dir):
         "format": 1,
         "signed": False,
         "activation": "UNEXECUTED",
-        "service_cutover": "AUTHORIZED-BY-REVIEW",
+        "service_cutover": "NOT-AUTHORIZED",
         "install_prefix": INSTALL_PREFIX,
         "expected_dir_mode": format(RECOVERY_DIR_MODE, "04o"),
         "expected_uid": 0,
@@ -353,7 +356,7 @@ def export_cutover_package(dest_dir):
         "template_sha256": template_sha,
         "signed": False,
         "activation": "UNEXECUTED",
-        "service_cutover": "AUTHORIZED-BY-REVIEW",
+        "service_cutover": "NOT-AUTHORIZED",
         "install_prefix": INSTALL_PREFIX,
     }
 

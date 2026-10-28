@@ -57,7 +57,7 @@ class PackageTests(unittest.TestCase):
         with open(man, "rb") as f:
             payload = json.loads(f.read().decode())
         self.assertFalse(payload["signed"])
-        self.assertEqual(payload["service_cutover"], "AUTHORIZED-BY-REVIEW")
+        self.assertEqual(payload["service_cutover"], "NOT-AUTHORIZED")
         self.assertEqual(payload["expected_uid"], 0)
         self.assertIn("journal and rollback bytes never deleted", payload["retention"])
 
@@ -92,7 +92,7 @@ class PackageTests(unittest.TestCase):
             data = json.loads(cp.stdout)
             self.assertEqual(data["status"], "manifest-ready")
             self.assertFalse(data["signed"])
-            self.assertEqual(data["service_cutover"], "AUTHORIZED-BY-REVIEW")
+            self.assertEqual(data["service_cutover"], "NOT-AUTHORIZED")
 
     def test_exported_cli_refuses_live(self):
         e = _load()
@@ -120,6 +120,58 @@ class PackageTests(unittest.TestCase):
                     "/etc/foo", "/opt/foo"):
             with self.assertRaises(ValueError, msg=bad):
                 e.export_cutover_package(bad)
+
+    def test_exported_preflight_no_git_readonly(self):
+        e = _load()
+        scratch = _home_scratch("preflight-")
+        dest = os.path.join(scratch, "pkg")
+        e.export_cutover_package(dest)
+        entry = os.path.join(dest, "cli.py")
+        self.assertFalse(os.path.lexists(os.path.join(dest, ".git")))
+        cp = subprocess.run(["/usr/bin/python3", "-I", entry, "preflight"],
+                            capture_output=True, text=True, check=False,
+                            cwd=scratch,
+                            env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"})
+        self.assertEqual(cp.returncode, 0, (cp.stdout, cp.stderr))
+        data = json.loads(cp.stdout)
+        self.assertEqual(data["status"], "preflight-complete")
+        self.assertFalse(data["signed"])
+        self.assertEqual(data["service_cutover"], "NOT-AUTHORIZED")
+        self.assertIn("checks", data)
+        self.assertIn("python_self", data["checks"])
+        # Entry ran under -I: isolated + ignore_environment must be 1.
+        self.assertEqual(data["checks"]["python_self"]["isolated"], 1)
+        self.assertEqual(data["checks"]["python_self"]["ignore_environment"], 1)
+
+    def test_adversarial_sibling_before_import_not_executed(self):
+        e = _load()
+        scratch = _home_scratch("advers-")
+        dest = os.path.join(scratch, "pkg")
+        e.export_cutover_package(dest)
+        marker = os.path.join(scratch, "SIBLING_EXECUTED")
+        # Overwrite a sibling post-export with code that would write the
+        # marker on import. Verification-before-import must refuse BEFORE
+        # any import, so the marker must never appear.
+        evil = (f"import os\nopen({marker!r}, 'w').write('pwned')\nVALUE = 1\n")
+        with open(os.path.join(dest, "cutover_host.py"), "wb") as f:
+            f.write(evil.encode())
+        entry = os.path.join(dest, "cli.py")
+        self.assertFalse(os.path.exists(marker))
+        cp = subprocess.run(["/usr/bin/python3", "-I", entry, "preflight"],
+                            capture_output=True, text=True, check=False,
+                            cwd=scratch,
+                            env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"})
+        self.assertNotEqual(cp.returncode, 0, (cp.stdout, cp.stderr))
+        self.assertFalse(os.path.exists(marker),
+                         "adversarial sibling executed despite hash mismatch")
+        # Sanity: clean export has no marker either; plan still works
+        # (plan never imports siblings).
+        cp2 = subprocess.run(["/usr/bin/python3", "-I", entry, "plan"],
+                             capture_output=True, text=True, check=False,
+                             cwd=scratch,
+                             env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"})
+        self.assertEqual(cp2.returncode, 0, cp2.stderr)
+        self.assertFalse(os.path.exists(marker))
 
     def test_manifest_parent_commands(self):
         e = _load()

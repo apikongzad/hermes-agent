@@ -307,6 +307,14 @@ def build_fixture(tmpbase, extra_files=None, symlinks=None, with_deps=False):
 
 class TestExport(unittest.TestCase):
     def test_success_known_good(self):
+        # Live may pre-exist from prior reviewed proof (loops 20/21).
+        # Never delete live to make fixture green; snapshot and prove
+        # unchanged (same rule as TestSquashfs below).
+        live_paths = (
+            "/var/lib/hermes-stock-activation/backing/staging",
+            "/run/hermes-stock-activation/known-good-snap",
+        )
+        before = {p: _snapshot_live_path(p) for p in live_paths}
         with tempfile.TemporaryDirectory() as td:
             sandbox = os.path.join(td, "sandbox")
             os.makedirs(sandbox)
@@ -355,9 +363,14 @@ class TestExport(unittest.TestCase):
             for sr in found:
                 for dp, dn, fn in os.walk(sr):
                     self.assertNotIn("sitecustomize.py", fn)
-            # live not created
-            self.assertFalse(os.path.exists("/var/lib/hermes-stock-activation/backing/staging"))
-            self.assertFalse(os.path.exists("/run/hermes-stock-activation/known-good-snap/venv"))
+            # No host mutation: isolated export must leave pre-existing
+            # live state byte-identical. Do not assert absence (loops
+            # 20/21 pre-exist); prove before/after unchanged instead.
+            # Do not open root-private content; parent metadata readback
+            # via _snapshot_live_path is sufficient.
+            after = {p: _snapshot_live_path(p) for p in live_paths}
+            for p in live_paths:
+                self.assertEqual(before[p], after[p], msg=f"live mutated: {p}")
             # check pyvenv rewritten to mount, not staging
             for sr in found:
                 for dp, dn, fn in os.walk(sr):

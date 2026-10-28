@@ -36,8 +36,13 @@ PYTHON312_BIN = "/usr/bin/python3.12"
 
 JOURNAL_DIR = "/var/lib/hermes-stock-activation"
 JOURNAL_PATH = "/var/lib/hermes-stock-activation/journal"
+JOURNAL_LOCK_PATH = "/var/lib/hermes-stock-activation/journal.lock"
 BACKING_DIR = "/var/lib/hermes-stock-activation/backing"
 RECOVERY_DIR = "/var/lib/hermes-stock-activation/recovery"
+
+TARGET_SHA = "daec3cd4c6d34f5befbc8f25a8af3e3b84b94f06"
+KNOWN_GOOD_SHA = "1d9a377fa00ce0e663e274e16b63c75e36233b9e"
+REFUSED_SHA = "1c12738cfeecc78570b3a4ba3797a49de59cfdfe"
 
 KNOWN_GOOD_MOUNT = "/run/hermes-stock-activation/known-good-snap"
 CANDIDATE_MOUNT = "/run/hermes-stock-activation/candidate-snap"
@@ -186,6 +191,70 @@ def _refuse_live_env(path):
         raise RuntimeError("refused .env read")
 
 
+def lockfile_create_args(lock_path=JOURNAL_LOCK_PATH):
+    """Pure constructor for the journal lock. Designed, NOT activated.
+
+    Returns the fixed path/mode/flags for O_CREAT|O_EXCL|O_NOFOLLOW 0600
+    uid 0. Callers must NOT activate services; orchestrate wiring is
+    deferred to the state+mutation slice. This function performs no syscall.
+    """
+    if lock_path != JOURNAL_LOCK_PATH:
+        raise ValueError("lock path fixed")
+    return {
+        "path": JOURNAL_LOCK_PATH,
+        "mode": 0o600,
+        "uid": 0,
+        "flags": "O_CREAT|O_EXCL|O_NOFOLLOW|O_WRONLY",
+        "activated": False,
+    }
+
+
+def _show_argv_for(unit, full=False):
+    if unit not in BOTH:
+        raise ValueError("unit")
+    if full:
+        return G3_PREFIX + [
+            SYSTEMCTL_BIN, "show",
+            "-p", "Id", "-p", "ActiveState", "-p", "SubState",
+            "-p", "MainPID", "-p", "NRestarts",
+            "-p", "ExecStart", "-p", "ExecStop", "-p", "ExecStopPost",
+            "-p", "EnvironmentFiles", "-p", "FragmentPath",
+            "-p", "DropInPaths",
+            "--", unit,
+        ]
+    return G3_PREFIX + [
+        SYSTEMCTL_BIN, "show",
+        "-p", "Id", "-p", "ActiveState", "-p", "SubState",
+        "-p", "MainPID", "-p", "NRestarts",
+        "--", unit,
+    ]
+
+
+def _findmnt_argv_for(mountpoint):
+    if mountpoint not in (KNOWN_GOOD_MOUNT, CANDIDATE_MOUNT):
+        raise ValueError("mountpoint")
+    return [FINDMNT_BIN, "-n", "-o", "FSTYPE,OPTIONS,SOURCE,TARGET",
+            "--target", mountpoint]
+
+
+def _parse_show_output(text):
+    out = {}
+    for line in (text or "").splitlines():
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if k in ("MainPID", "NRestarts"):
+            try:
+                out[k] = int(v) if v not in ("", "N/A") else 0
+            except ValueError:
+                out[k] = v
+        else:
+            out[k] = v
+    return out
+
+
 class RealCutoverHost(Host):
     """Root-only production effects. Never used in worker tests live.
 
@@ -193,7 +262,17 @@ class RealCutoverHost(Host):
     env. No systemctl restart. No process termination primitives.
     No .env read. All writes use
     O_EXCL|O_NOFOLLOW plus file+dir fsync, OSError fail-closed.
+
+    Read-only preflight (`show_unit`, `python_probe`, `preflight_readonly`)
+    is functional. All mutating operations remain hard-refused until the
+    state+mutation slice is reviewed.
     """
+
+    def __init__(self, runner=None):
+        # runner(argv, timeout=60) -> object with returncode/stdout/stderr.
+        # Live default is _run_fixed. Unit tests inject a fake runner;
+        # worker never spawns live systemctl/sudo via this path.
+        self._runner = runner if runner is not None else self._run_fixed
 
     def _run_fixed(self, argv, timeout=60):
         if not isinstance(argv, list) or not argv:
@@ -300,17 +379,32 @@ class RealCutoverHost(Host):
         with open("/proc/sys/kernel/random/boot_id", "rb") as f:
             return f.read().decode("utf-8").strip()
 
-    def show_unit(self, unit):
-        raise OSError("use _run_fixed show argv via parent supervisor")
+    def show_unit(self, unit, full=False):
+        # NONDESTRUCTIVE read-only preflight. Uses fixed G3_PREFIX argv via
+        # injected runner (unit tests) or _run_fixed live. No mutation.
+        if unit not in BOTH:
+            raise ValueError("unit")
+        argv = _show_argv_for(unit, full=full)
+        done = self._runner(argv, timeout=60)
+        rc = getattr(done, "returncode", None)
+        if rc != 0:
+            raise OSError(f"show failed rc={rc!r}")
+        out = getattr(done, "stdout", "")
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", "replace")
+        parsed = _parse_show_output(out)
+        if parsed.get("Id") != unit:
+            raise OSError("show Id mismatch")
+        return parsed
 
     def stop_units(self, units):
-        raise OSError("use stop_argv via parent supervisor")
+        raise OSError("refused-mutation-until-review: stop not wired")
 
     def start_units(self, units):
-        raise OSError("use start_argv via parent supervisor")
+        raise OSError("refused-mutation-until-review: start not wired")
 
     def reload_manager(self):
-        raise OSError("use daemon_reload_argv via parent supervisor")
+        raise OSError("refused-mutation-until-review: reload not wired")
 
     def read_bytes(self, path):
         _refuse_live_env(path)
@@ -394,7 +488,7 @@ class RealCutoverHost(Host):
         return _t.monotonic()
 
     def sleep_secs(self, seconds):
-        raise RuntimeError("use sleep_argv via parent supervisor")
+        raise RuntimeError("refused-mutation-until-review: sleep not wired")
 
     def proc_identity(self, pid):
         if not isinstance(pid, int) or pid <= 0:
@@ -421,16 +515,109 @@ class RealCutoverHost(Host):
         }
 
     def denial_probe(self, path):
-        raise OSError("use sudo -u #1001 probe via parent supervisor")
+        raise OSError("refused-mutation-until-review: denial probe by parent")
+
+    def python_self_probe(self):
+        # Real I2 self-probe of the running interpreter. No subprocess,
+        # no env read, no live effects. Proves entry runs under -I.
+        import sys as _sys
+        flags = _sys.flags
+        isolated = int(getattr(flags, "isolated", 0))
+        ignore_env = int(getattr(flags, "ignore_environment", 0))
+        no_site = int(getattr(flags, "no_site", 0))
+        try:
+            import importlib.util as _ilu
+            spec = _ilu.find_spec("sitecustomize")
+            origin = spec.origin if spec is not None else None
+        except Exception:
+            origin = "unknown"
+        try:
+            has_cwd = "" in _sys.path or os.getcwd() in _sys.path
+        except Exception:
+            has_cwd = "unknown"
+        try:
+            safe = bool(getattr(_sys.flags, "safe_path", False))
+        except Exception:
+            safe = False
+        return {
+            "isolated": isolated,
+            "ignore_environment": ignore_env,
+            "safe_path": safe,
+            "no_site": no_site,
+            "sitecustomize_origin": origin,
+            "sys_path_has_cwd": bool(has_cwd) if isinstance(has_cwd, bool) else has_cwd,
+            "exe": _sys.executable,
+        }
 
     def python_probe(self, python_exe):
-        raise OSError("use snapshot python -I probe via parent supervisor")
+        # Real I2 probe of a snapshot interpreter. Read-only subprocess:
+        # `<exe> -I -c <probe>` with sanitized env, cwd outside tree.
+        # No .env read, no imports from user trees.
+        _refuse_live_env(str(python_exe))
+        if not isinstance(python_exe, str) or not python_exe.startswith("/"):
+            raise ValueError("python_exe absolute")
+        probe = (
+            "import sys,json,importlib.util as u;"
+            "spec=u.find_spec('sitecustomize');"
+            "print(json.dumps({"
+            "'isolated':int(sys.flags.isolated),"
+            "'ignore_environment':int(sys.flags.ignore_environment),"
+            "'safe_path':bool(getattr(sys.flags,'safe_path',False)),"
+            "'no_site':int(sys.flags.no_site),"
+            "'sitecustomize_origin':(spec.origin if spec else None),"
+            "'sys_path_has_cwd':('' in sys.path),"
+            "'exe':sys.executable}))"
+        )
+        env = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C",
+               "LC_ALL": "C"}
+        try:
+            done = subprocess.run(
+                [python_exe, "-I", "-c", probe],
+                shell=False, check=False, capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                timeout=60, env=env, cwd="/",
+            )
+        except OSError as e:
+            raise OSError(f"python probe spawn: {e}")
+        if done.returncode != 0:
+            raise OSError(f"python probe rc={done.returncode!r}")
+        try:
+            return json.loads((done.stdout or "").strip().splitlines()[-1])
+        except Exception as e:
+            raise OSError(f"python probe parse: {e}")
+
+    def mount_show(self, mountpoint):
+        # Read-only findmnt readback via injected runner/live _run_fixed?
+        # findmnt is not under sudo launcher; run directly read-only.
+        # In unit tests the runner fakes it; live path runs real findmnt.
+        argv = _findmnt_argv_for(mountpoint)
+        if self._runner is not None and getattr(self._runner, "__name__", "") != "_run_fixed":
+            # Injected runner expects G3-style? No: findmnt is direct.
+            # Allow injected runner to handle bare findmnt argv.
+            try:
+                done = self._runner(argv, timeout=60)
+            except TypeError:
+                done = self._runner(argv)
+        else:
+            done = subprocess.run(
+                argv, shell=False, check=False, capture_output=True,
+                text=True, encoding="utf-8", errors="replace", timeout=60,
+                env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C",
+                     "LC_ALL": "C"},
+            )
+        rc = getattr(done, "returncode", None)
+        if rc != 0:
+            raise OSError(f"findmnt rc={rc!r}")
+        out = getattr(done, "stdout", "")
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", "replace")
+        return (out or "").strip()
 
     def backup_ok(self):
-        raise OSError("backup verified by parent out of band")
+        raise OSError("refused-mutation-until-review: backup by parent")
 
     def digest_record(self):
-        raise OSError("digest verified by parent out of band")
+        raise OSError("refused-mutation-until-review: digest by parent")
 
     def dashboard_fetch(self, url, headers):
         if url != "http://127.0.0.1:9119/api/health":
@@ -453,15 +640,103 @@ class RealCutoverHost(Host):
         return {"status": status, "content_type": ctype, "body": body}
 
     def gateway_talk(self, request_bytes):
-        if request_bytes != b'{"verb":"identify","id":1,"protocol":1}\n':
-            raise OSError("gateway bytes")
-        # AF_UNIX socket path is not named in accepted docs (precise gap).
-        # Parent binds the path from supervisor metadata; never guessed here.
-        raise OSError("gateway socket bound by parent supervisor")
+        raise OSError("refused-mutation-until-review: gateway by parent")
 
     def dropin_names(self, service):
-        raise OSError("use show DropInPaths via parent supervisor")
+        raise OSError("refused-mutation-until-review: dropins via show readback")
 
     def file_uid(self, path):
         _refuse_live_env(path)
         return os.lstat(path).st_uid
+
+
+def preflight_readonly(host):
+    """NONDESTRUCTIVE preflight. Read-only, no journal append, no stop/
+    start/reload/write/rename/mount, no .env open. Returns dict; every
+    unreadable area is `blocked:<reason>`, never an exception escape for
+    expected OSErrors. Caller (cli preflight) prints it as JSON.
+    """
+    out = {
+        "status": "preflight-complete",
+        "signed": False,
+        "activation": "UNEXECUTED",
+        "service_cutover": "NOT-AUTHORIZED",
+        "checks": {},
+    }
+    c = out["checks"]
+
+    try:
+        c["journal_dir"] = host.journal_dir_info()
+    except Exception as e:
+        c["journal_dir"] = {"blocked": f"{type(e).__name__}: {e}"}
+    try:
+        raw = host.journal_load()
+        tail = raw[-1] if raw else None
+        if isinstance(tail, dict):
+            tail = tail.get("state", str(tail))
+        c["journal_tail"] = tail
+        c["journal_len"] = len(raw)
+    except Exception as e:
+        c["journal_tail"] = f"blocked:{type(e).__name__}"
+        c["journal_len"] = -1
+    try:
+        c["boot_id"] = host.boot_id()
+    except Exception as e:
+        c["boot_id"] = f"blocked:{type(e).__name__}"
+    for unit in BOTH:
+        key = "show:" + unit
+        try:
+            u = host.show_unit(unit, full=True)
+            c[key] = {
+                "Id": u.get("Id"),
+                "ActiveState": u.get("ActiveState"),
+                "SubState": u.get("SubState"),
+                "MainPID": u.get("MainPID"),
+                "NRestarts": u.get("NRestarts"),
+                "ExecStart": u.get("ExecStart"),
+                "WorkingDirectory": u.get("WorkingDirectory"),
+                "EnvironmentFiles": u.get("EnvironmentFiles"),
+            }
+            try:
+                pid = int(u.get("MainPID") or 0)
+            except Exception:
+                pid = 0
+            if pid > 0:
+                try:
+                    ident = host.proc_identity(pid)
+                    c[f"identity:{pid}"] = {
+                        "boot_id": ident.get("boot_id"),
+                        "pid": ident.get("pid"),
+                        "starttime": ident.get("starttime"),
+                        "exe": ident.get("exe"),
+                        "cmdline": ident.get("cmdline"),
+                        "cgroup": ident.get("cgroup"),
+                    }
+                except Exception as e:
+                    c[f"identity:{pid}"] = {"blocked": f"{e}"}
+        except Exception as e:
+            c[key] = {"blocked": f"{type(e).__name__}: {e}"}
+    for label, path in (
+        ("zz-runtime-gateway", GATEWAY_RUNTIME_PATH),
+        ("zz-runtime-dashboard", DASHBOARD_RUNTIME_PATH),
+        ("zzz-gateway", GATEWAY_CANDIDATE_PATH),
+        ("zzz-dashboard", DASHBOARD_CANDIDATE_PATH),
+    ):
+        try:
+            c["digest:" + label] = host.file_info(path)
+        except Exception as e:
+            c["digest:" + label] = {"blocked": f"{type(e).__name__}: {e}"}
+    try:
+        c["python_self"] = host.python_self_probe()
+    except Exception as e:
+        c["python_self"] = {"blocked": f"{e}"}
+    for label, mp in (("mount:known-good", KNOWN_GOOD_MOUNT),
+                      ("mount:candidate", CANDIDATE_MOUNT)):
+        try:
+            c[label] = host.mount_show(mp)
+        except Exception as e:
+            c[label] = f"blocked:{type(e).__name__}:{e}"
+    c["lock"] = lockfile_create_args()
+    c["pins"] = {"target": TARGET_SHA, "known_good": KNOWN_GOOD_SHA,
+                 "refused": REFUSED_SHA}
+    return out

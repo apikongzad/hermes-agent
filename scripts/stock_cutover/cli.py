@@ -1,17 +1,24 @@
-"""Cutover public entry. Stdlib only. No live effects without --execute-live.
+"""Cutover public entry. Stdlib only. No live mutation in worker.
 
-plan: deterministic, no root, exit 0. apply/recover without --execute-live
-exit 3 (refusal, no live effects). With --execute-live requires euid 0 and
-installed path under /var/lib/hermes-stock-activation/recovery with mode
-0500, else exit 4. Live execution never imports user trees, never reads .env.
+plan: deterministic, no root, exit 0. preflight: read-only
+(show/proc/identity/digest/readback), verifies sibling hashes vs MANIFEST
+BEFORE importing siblings, exit 0 with JSON, no mutation. apply/recover
+without --execute-live exit 3 (refusal, no live effects). With
+--execute-live requires euid 0 and installed path under
+/var/lib/hermes-stock-activation/recovery with mode 0500, else exit 4;
+even then mutation stays refused-live-not-authorized-here (exit 1) until
+wiring is reviewed. Live execution never imports user trees, never reads
+.env.
 """
 
+import hashlib
 import json
 import os
 import stat
 import sys
 
 INSTALL_PREFIX = "/var/lib/hermes-stock-activation/recovery"
+MANIFEST_REL = "MANIFEST.json"
 
 
 def _live_file_ok():
@@ -41,12 +48,111 @@ def _live_file_ok():
     return True, ""
 
 
+def _entry_dir():
+    try:
+        p = __file__
+    except NameError:
+        return None
+    d = os.path.dirname(os.path.abspath(p))
+    return d
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(65536)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def _verify_export_dir(entry_dir):
+    """Verify every MANIFEST file hash BEFORE importing siblings.
+
+    Returns (ok, reason, entry_shas). Performs no import, opens no .env,
+    follows no symlink for hash targets (lstat + open O_NOFOLLOW via
+    refusal of symlinked siblings). Adversarial post-export overwrite
+    yields ok=False and the caller must NOT import siblings.
+    """
+    if not isinstance(entry_dir, str) or not entry_dir:
+        return False, "entry dir type", {}
+    if not os.path.isabs(entry_dir):
+        return False, "entry dir relative", {}
+    man = os.path.join(entry_dir, MANIFEST_REL)
+    try:
+        st = os.lstat(man)
+    except OSError as e:
+        return False, f"manifest missing: {e}", {}
+    if stat.S_ISLNK(st.st_mode):
+        return False, "manifest symlink", {}
+    try:
+        with open(man, "rb") as f:
+            payload = json.loads(f.read().decode("utf-8"))
+    except Exception as e:
+        return False, f"manifest parse: {e}", {}
+    files = payload.get("files")
+    if not isinstance(files, list) or not files:
+        return False, "manifest files", {}
+    entry_shas = {}
+    for ent in files:
+        if not isinstance(ent, dict):
+            return False, "manifest entry type", {}
+        rel = ent.get("rel")
+        want = ent.get("sha256")
+        if not isinstance(rel, str) or not isinstance(want, str):
+            return False, "manifest entry fields", {}
+        if "/" in rel or rel in (".", "..") or not rel.endswith(".py"):
+            return False, "manifest rel: " + rel, {}
+        if ".hermes/.env" in rel or rel == ".env":
+            return False, "manifest env", {}
+        p = os.path.join(entry_dir, rel)
+        try:
+            lst = os.lstat(p)
+        except OSError as e:
+            return False, f"sibling missing {rel}: {e}", {}
+        if stat.S_ISLNK(lst.st_mode):
+            return False, f"sibling symlink: {rel}", {}
+        if not stat.S_ISREG(lst.st_mode):
+            return False, f"sibling not file: {rel}", {}
+        try:
+            got = _sha256_file(p)
+        except OSError as e:
+            return False, f"sibling unreadable {rel}: {e}", {}
+        if got != want:
+            return False, f"sibling hash mismatch: {rel}", {}
+        entry_shas[rel] = got
+    # No extra .py siblings beyond the manifest (catches added rogue file).
+    try:
+        present = sorted(n for n in os.listdir(entry_dir) if n.endswith(".py"))
+    except OSError as e:
+        return False, f"listdir: {e}", {}
+    for n in present:
+        if n not in entry_shas:
+            return False, f"extra sibling: {n}", {}
+    if os.path.lexists(os.path.join(entry_dir, ".git")):
+        return False, "export has .git", {}
+    return True, "", entry_shas
+
+
+def _load_verified_host(entry_dir):
+    import importlib.util as _ilu
+    mod_path = os.path.join(entry_dir, "cutover_host.py")
+    spec = _ilu.spec_from_file_location("cutover_host_verified", mod_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("spec")
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _plan_result():
     return {
         "status": "manifest-ready",
         "signed": False,
         "activation": "UNEXECUTED",
-        "service_cutover": "AUTHORIZED-BY-REVIEW",
+        "service_cutover": "NOT-AUTHORIZED",
         "kernel_immutable": False,
         "gates": {k: "UNEXECUTED" for k in (
             "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8",
@@ -62,11 +168,53 @@ def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
     if not argv:
-        print("usage: cli plan|apply|recover", file=sys.stderr)
+        print("usage: cli plan|preflight|apply|recover", file=sys.stderr)
         return 2
     cmd = argv[0]
     if cmd == "plan":
         print(json.dumps(_plan_result(), sort_keys=True, indent=2))
+        return 0
+    if cmd == "preflight":
+        entry_dir = _entry_dir()
+        if entry_dir is None:
+            print(json.dumps({"status": "preflight-refused",
+                               "reason": "no entry dir",
+                               "signed": False,
+                               "activation": "UNEXECUTED",
+                               "service_cutover": "NOT-AUTHORIZED"},
+                             sort_keys=True, indent=2))
+            return 4
+        ok, reason, _shas = _verify_export_dir(entry_dir)
+        if not ok:
+            print(json.dumps({"status": "preflight-refused",
+                               "reason": reason,
+                               "signed": False,
+                               "activation": "UNEXECUTED",
+                               "service_cutover": "NOT-AUTHORIZED"},
+                             sort_keys=True, indent=2))
+            return 4
+        try:
+            host_mod = _load_verified_host(entry_dir)
+        except Exception as e:
+            print(json.dumps({"status": "preflight-refused",
+                               "reason": f"load: {e}",
+                               "signed": False,
+                               "activation": "UNEXECUTED",
+                               "service_cutover": "NOT-AUTHORIZED"},
+                             sort_keys=True, indent=2))
+            return 4
+        try:
+            host = host_mod.RealCutoverHost()
+            res = host_mod.preflight_readonly(host)
+        except Exception as e:
+            print(json.dumps({"status": "preflight-refused",
+                               "reason": f"{type(e).__name__}: {e}",
+                               "signed": False,
+                               "activation": "UNEXECUTED",
+                               "service_cutover": "NOT-AUTHORIZED"},
+                             sort_keys=True, indent=2))
+            return 4
+        print(json.dumps(res, sort_keys=True, indent=2))
         return 0
     if cmd in ("apply", "recover"):
         if "--execute-live" not in argv:
@@ -87,13 +235,14 @@ def main(argv=None):
             "status": "refused-live-not-authorized-here",
             "signed": False,
             "activation": "UNEXECUTED",
+            "service_cutover": "NOT-AUTHORIZED",
         }, sort_keys=True, indent=2))
         return 1
     if cmd == "--self-check":
         print("daec3cd4c6d34f5befbc8f25a8af3e3b84b94f06")
         print("1d9a377fa00ce0e663e274e16b63c75e36233b9e")
         return 0
-    print("usage: cli plan|apply|recover", file=sys.stderr)
+    print("usage: cli plan|preflight|apply|recover", file=sys.stderr)
     return 2
 
 
