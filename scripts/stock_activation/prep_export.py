@@ -179,6 +179,22 @@ def _run_cmd(argv, env, runner):
         return runner(argv)
 
 
+def _run_unsquashfs_verify(argv, env, runner):
+    # unsquashfs as non-root applies process umask on extraction. Canonical
+    # modes (0555/0444, no write bits) are preserved under umask 022 but
+    # masked to 0500/0400 under inherited 077, breaking round-trip manifest
+    # comparison even though the image itself (unsquashfs -ll) is correct.
+    # Pin umask 022 for verification extraction only; no live effects.
+    old = os.umask(0o022)
+    try:
+        return _run_cmd(argv, env, runner)
+    finally:
+        try:
+            os.umask(old)
+        except Exception:
+            pass
+
+
 def _sha256_file(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -662,6 +678,106 @@ def _fsync_tree(root):
             os.close(dfd)
 
 
+# Canonical image mode contract (service uid 1001 must traverse/read while
+# SquashFS stays immutable).
+#
+# Root cause: staging preserves restrictive source modes (0700 dirs, 0600
+# files, 0711 exec from 0700 home trees via rsync -a). mksquashfs -all-root
+# fixes ownership only, not modes, so squashfs-root stayed 0700 and uid 1001
+# probes failed with EACCES (13) instead of EROFS (30). Strict proof gates
+# correctly fail closed on EACCES.
+#
+# Canonical policy (narrow, in user staging only, before manifest+SquashFS):
+# - directories -> 0555 (r-x for all, no write; immutable needs no write)
+# - regular files with any exec bit in source -> 0555 (preserve exec-ness)
+# - regular files with no exec bit -> 0444 (read for all, no write)
+# - symlinks untouched (mode irrelevant); special files refuse.
+# Backing file outside (0700 dir, 0400 image, root-owned) is unchanged;
+# embedded image is root-readable by design for legitimate service use.
+_CANON_DIR_MODE = 0o555
+_CANON_FILE_MODE = 0o444
+_CANON_EXEC_MODE = 0o555
+
+
+def _canonical_file_mode(orig_mode):
+    if orig_mode & 0o111:
+        return _CANON_EXEC_MODE
+    return _CANON_FILE_MODE
+
+
+def _normalize_image_modes(staging_root):
+    """Canonicalize modes under user staging for uid-1001 readability.
+
+    Only touches paths under staging_root (caller-supplied user stage).
+    Never touches mounted/live paths. Preserves exec-ness based on actual
+    source x bits; removes all write bits; ensures o+r/o+x.
+    """
+    sroot = os.path.normpath(staging_root)
+    for dirpath, dirnames, filenames in os.walk(sroot, topdown=False, followlinks=False):
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            norm = os.path.normpath(full)
+            if norm != sroot and not _is_under(norm, sroot):
+                raise RuntimeError("normalize outside")
+            try:
+                st = os.lstat(full)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                continue
+            if stat.S_ISREG(st.st_mode):
+                orig = stat.S_IMODE(st.st_mode)
+                want = _CANON_EXEC_MODE if (orig & 0o111) else _CANON_FILE_MODE
+                if orig != want:
+                    os.chmod(full, want)
+            elif stat.S_ISDIR(st.st_mode):
+                orig = stat.S_IMODE(st.st_mode)
+                if orig != _CANON_DIR_MODE:
+                    os.chmod(full, _CANON_DIR_MODE)
+            else:
+                raise RuntimeError("special normalize")
+        for name in dirnames:
+            full = os.path.join(dirpath, name)
+            norm = os.path.normpath(full)
+            if norm != sroot and not _is_under(norm, sroot):
+                raise RuntimeError("normalize outside")
+            try:
+                st = os.lstat(full)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                orig = stat.S_IMODE(st.st_mode)
+                if orig != _CANON_DIR_MODE:
+                    os.chmod(full, _CANON_DIR_MODE)
+            elif stat.S_ISREG(st.st_mode):
+                orig = stat.S_IMODE(st.st_mode)
+                want = _CANON_EXEC_MODE if (orig & 0o111) else _CANON_FILE_MODE
+                if orig != want:
+                    os.chmod(full, want)
+            else:
+                raise RuntimeError("special normalize")
+        try:
+            st = os.lstat(dirpath)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            continue
+        if stat.S_ISDIR(st.st_mode):
+            norm = os.path.normpath(dirpath)
+            if norm != sroot and not _is_under(norm, sroot):
+                raise RuntimeError("normalize outside")
+            orig = stat.S_IMODE(st.st_mode)
+            if orig != _CANON_DIR_MODE:
+                os.chmod(dirpath, _CANON_DIR_MODE)
+        elif stat.S_ISREG(st.st_mode):
+            pass
+        else:
+            if not stat.S_ISLNK(st.st_mode):
+                raise RuntimeError("special normalize")
+
+
 def _build_manifest(staging_root, bases):
     entries = []
     sroot = os.path.normpath(staging_root)
@@ -679,18 +795,20 @@ def _build_manifest(staging_root, bases):
                         target = os.readlink(full)
                     except OSError:
                         target = ""
-                    entries.append((rel, "symlink", "-", target))
+                    entries.append((rel, "symlink", "-", "-", target))
                 elif stat.S_ISDIR(st.st_mode):
-                    entries.append((rel, "dir", "-", "-"))
+                    mode = format(stat.S_IMODE(st.st_mode), "04o")
+                    entries.append((rel, "dir", mode, "-", "-"))
                 elif stat.S_ISREG(st.st_mode):
+                    mode = format(stat.S_IMODE(st.st_mode), "04o")
                     h = _sha256_file(full)
-                    entries.append((rel, "file", h, "-"))
+                    entries.append((rel, "file", mode, h, "-"))
                 else:
                     raise RuntimeError("special manifest")
     entries.sort(key=lambda e: e[0])
     lines = []
-    for rel, typ, h, tgt in entries:
-        lines.append(f"{rel} {typ} {h} {tgt}")
+    for rel, typ, mode, h, tgt in entries:
+        lines.append(f"{rel} {typ} {mode} {h} {tgt}")
     text = "\n".join(lines) + ("\n" if lines else "")
     digest = hashlib.sha256(text.encode()).hexdigest()
     return text, digest
@@ -852,8 +970,49 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
         except Exception:
             pass
         # Remove staging_root to avoid leaving partial tree.
+        # After canonical 0555/0444 normalization parents lack write, so
+        # best-effort restore u+w under staging_root only before rmtree.
         try:
             if os.path.lexists(staging_root):
+                try:
+                    for dp, dn, fn in os.walk(staging_root, topdown=False, followlinks=False):
+                        for n in fn:
+                            fp = os.path.join(dp, n)
+                            try:
+                                st = os.lstat(fp)
+                            except OSError:
+                                continue
+                            if stat.S_ISLNK(st.st_mode):
+                                continue
+                            if stat.S_ISREG(st.st_mode):
+                                try:
+                                    os.chmod(fp, 0o600)
+                                except OSError:
+                                    pass
+                        for n in dn:
+                            fp = os.path.join(dp, n)
+                            try:
+                                st = os.lstat(fp)
+                            except OSError:
+                                continue
+                            if stat.S_ISLNK(st.st_mode):
+                                continue
+                            if stat.S_ISDIR(st.st_mode):
+                                try:
+                                    os.chmod(fp, 0o700)
+                                except OSError:
+                                    pass
+                        try:
+                            st = os.lstat(dp)
+                            if stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode):
+                                try:
+                                    os.chmod(dp, 0o700)
+                                except OSError:
+                                    pass
+                        except OSError:
+                            pass
+                except Exception:
+                    pass
                 shutil.rmtree(staging_root, ignore_errors=True)
         except Exception:
             pass
@@ -1140,6 +1299,17 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
     residual.sort()
     gate = "residual-embedded" if residual else "clean"
 
+    # Canonicalize modes for service-uid readability while immutable.
+    # mksquashfs -all-root fixes ownership only, not modes. Normalize in
+    # user staging (never mounted/live) before manifest + SquashFS.
+    try:
+        _normalize_image_modes(staging_root)
+    except RuntimeError:
+        _cleanup_on_refuse()
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
+    except OSError as e:
+        return _durable_unknown(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist, error=e)
+
     # Fsync bottom-up.
     try:
         _fsync_tree(staging_root)
@@ -1270,7 +1440,7 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
                     pass
             else:
                 shutil.rmtree(verify_dir, ignore_errors=True)
-        ru = _run_cmd(_unsquashfs_argv(final_image, verify_dir), clean_env, runner)
+        ru = _run_unsquashfs_verify(_unsquashfs_argv(final_image, verify_dir), clean_env, runner)
     except Exception:
         # Leave verify dir as is; delete success claim.
         try:

@@ -754,5 +754,287 @@ class TestContracts(unittest.TestCase):
         self.assertEqual(main(["--self-check", "extra"]), 0)
 
 
+class TestImageModes(unittest.TestCase):
+    """Canonical mode contract: service uid 1001 must traverse/read while immutable.
+
+    Root cause: staging preserved 0700/0600/0711 via rsync -a; mksquashfs
+    -all-root fixes ownership only, not modes, so squashfs-root blocked uid
+    1001 (EACCES 13, not EROFS 30). Fix normalizes in user staging before
+    manifest+SquashFS: dirs 0555, files 0444 (non-exec) / 0555 (exec, based
+    on actual x bits), no writable bits. Fixture-only, no live/mount/sudo.
+    """
+
+    def _make_restrictive(self, venv_src):
+        # Simulate real 0700 home tree: dirs 0700, files 0600, exec 0711.
+        for dp, dn, fn in os.walk(venv_src, followlinks=False):
+            try:
+                os.chmod(dp, 0o700)
+            except OSError:
+                pass
+            for n in fn:
+                fp = os.path.join(dp, n)
+                try:
+                    st = os.lstat(fp)
+                except OSError:
+                    continue
+                if stat.S_ISLNK(st.st_mode):
+                    continue
+                try:
+                    if st.st_mode & 0o111:
+                        os.chmod(fp, 0o711)
+                    else:
+                        os.chmod(fp, 0o600)
+                except OSError:
+                    pass
+
+    def _assert_canonical_tree(self, root):
+        for dp, dn, fn in os.walk(root, followlinks=False):
+            st = os.lstat(dp)
+            if not stat.S_ISLNK(st.st_mode):
+                mode = stat.S_IMODE(st.st_mode)
+                self.assertEqual(mode, 0o555, msg=f"dir {dp} mode {oct(mode)}")
+                self.assertEqual(mode & 0o222, 0, msg=f"dir writable {dp}")
+                self.assertEqual(mode & 0o444, 0o444, msg=f"dir not readable {dp}")
+                self.assertEqual(mode & 0o111, 0o111, msg=f"dir not traversable {dp}")
+            for n in fn:
+                fp = os.path.join(dp, n)
+                try:
+                    st = os.lstat(fp)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(st.st_mode):
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                mode = stat.S_IMODE(st.st_mode)
+                self.assertIn(mode, (0o444, 0o555), msg=f"file {fp} mode {oct(mode)}")
+                self.assertEqual(mode & 0o222, 0, msg=f"file writable {fp}")
+                self.assertEqual(mode & 0o444, 0o444, msg=f"file not readable {fp}")
+
+    def _parse_manifest(self, text):
+        entries = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            parts = line.split(None, 4)
+            self.assertEqual(len(parts), 5, msg=f"manifest must be 5-field rel typ mode sha target: {raw!r}")
+            rel, typ, mode, sha, target = parts
+            entries.append((rel, typ, mode, sha, target))
+        return entries
+
+    def test_dirs_555_files_444_no_writable(self):
+        from scripts.stock_activation.prep_export import export_prep_closure
+        with tempfile.TemporaryDirectory() as td:
+            repo, sha, venv_src, interp_src, deps_src = build_basic(os.path.join(td, "fix"))
+            self._make_restrictive(venv_src)
+            self._make_restrictive(deps_src)
+            stage = make_stage(os.path.join(td, "s"))
+            res = export_prep_closure(
+                stage, kind="known-good", source_repo=repo, source_sha=sha,
+                venv_src=venv_src, interpreter_src=interp_src, deps_src=deps_src,
+                finder_prefixes=[FINDER_ORIG], mount_prefix=MOUNT_KNOWN,
+            )
+            self.assertEqual(res["status"], "prep-staged")
+            self.assertFalse(res["signed"])
+            self.assertFalse(res["live_published"])
+            self.assertFalse(res["kernel_immutable"])
+            self.assertEqual(res["activation"], "UNEXECUTED")
+            sr = find_staging_root(stage)
+            self._assert_canonical_tree(sr)
+            # No legacy restrictive modes remain.
+            for dp, dn, fn in os.walk(sr, followlinks=False):
+                for n in fn:
+                    fp = os.path.join(dp, n)
+                    try:
+                        st = os.lstat(fp)
+                    except FileNotFoundError:
+                        continue
+                    if stat.S_ISLNK(st.st_mode):
+                        continue
+                    mode = stat.S_IMODE(st.st_mode)
+                    self.assertNotIn(mode, (0o700, 0o600, 0o711, 0o755, 0o644),
+                                     msg=f"legacy mode remains {fp} {oct(mode)}")
+
+    def test_exec_preserved_not_blanket_stripped(self):
+        from scripts.stock_activation.prep_export import export_prep_closure
+        with tempfile.TemporaryDirectory() as td:
+            fix = os.path.join(td, "fix")
+            repo, sha, venv_src, interp_src, deps_src = build_basic(fix)
+            # Executable script (0755) and fake lib .so (0755) must stay exec (0555).
+            script = os.path.join(venv_src, "bin", "tool.sh")
+            with open(script, "w") as f:
+                f.write("#!/bin/sh\necho tool\n")
+            os.chmod(script, 0o755)
+            lib = os.path.join(venv_src, "lib", "libfake.so")
+            os.makedirs(os.path.dirname(lib), exist_ok=True)
+            with open(lib, "wb") as f:
+                f.write(b"\x7fELF fake\n")
+            os.chmod(lib, 0o755)
+            plain = os.path.join(venv_src, "plain.txt")
+            with open(plain, "w") as f:
+                f.write("plain\n")
+            os.chmod(plain, 0o644)
+            # Also restrictive 0711 exec to prove any-x -> 0555.
+            legacy_exec = os.path.join(venv_src, "legacy.bin")
+            with open(legacy_exec, "w") as f:
+                f.write("bin\n")
+            os.chmod(legacy_exec, 0o711)
+            stage = make_stage(os.path.join(td, "s"))
+            res = export_prep_closure(
+                stage, kind="known-good", source_repo=repo, source_sha=sha,
+                venv_src=venv_src, interpreter_src=interp_src, deps_src=deps_src,
+                finder_prefixes=[FINDER_ORIG], mount_prefix=MOUNT_KNOWN,
+            )
+            self.assertEqual(res["status"], "prep-staged")
+            sr = find_staging_root(stage)
+            self.assertEqual(stat.S_IMODE(os.lstat(os.path.join(sr, "venv", "bin", "tool.sh")).st_mode), 0o555)
+            self.assertEqual(stat.S_IMODE(os.lstat(os.path.join(sr, "venv", "lib", "libfake.so")).st_mode), 0o555)
+            self.assertEqual(stat.S_IMODE(os.lstat(os.path.join(sr, "venv", "legacy.bin")).st_mode), 0o555)
+            self.assertEqual(stat.S_IMODE(os.lstat(os.path.join(sr, "venv", "plain.txt")).st_mode), 0o444)
+            # Manifest records exec vs non-exec distinctly.
+            entries = {r: (t, m) for r, t, m, h, tgt in self._parse_manifest(res["manifest"])}
+            self.assertEqual(entries["venv/bin/tool.sh"][1], "0555")
+            self.assertEqual(entries["venv/lib/libfake.so"][1], "0555")
+            self.assertEqual(entries["venv/plain.txt"][1], "0444")
+
+    def test_manifest_records_canonical_modes_sorted(self):
+        from scripts.stock_activation.prep_export import export_prep_closure
+        with tempfile.TemporaryDirectory() as td:
+            repo, sha, venv_src, interp_src, deps_src = build_basic(os.path.join(td, "fix"))
+            self._make_restrictive(venv_src)
+            stage = make_stage(os.path.join(td, "s"))
+            res = export_prep_closure(
+                stage, kind="known-good", source_repo=repo, source_sha=sha,
+                venv_src=venv_src, interpreter_src=interp_src, deps_src=deps_src,
+                finder_prefixes=[FINDER_ORIG], mount_prefix=MOUNT_KNOWN,
+            )
+            self.assertEqual(res["status"], "prep-staged")
+            entries = self._parse_manifest(res["manifest"])
+            rels = [r for r, _, _, _, _ in entries]
+            self.assertEqual(rels, sorted(rels))
+            for rel, typ, mode, sha_h, tgt in entries:
+                if typ == "dir":
+                    self.assertEqual(mode, "0555", msg=rel)
+                    self.assertEqual(sha_h, "-")
+                    self.assertEqual(tgt, "-")
+                elif typ == "file":
+                    self.assertIn(mode, ("0444", "0555"), msg=rel)
+                    self.assertEqual(len(sha_h), 64, msg=rel)
+                    self.assertEqual(tgt, "-")
+                elif typ == "symlink":
+                    self.assertEqual(mode, "-")
+                    self.assertEqual(sha_h, "-")
+                    self.assertTrue(tgt, msg=rel)
+                else:
+                    self.fail(f"unknown type {typ}")
+            # Manifest sha matches text.
+            self.assertEqual(res["manifest_sha256"], hashlib.sha256(res["manifest"].encode()).hexdigest())
+            # Verify dir round-trips same manifest (modes preserved via umask 022).
+            vdir = os.path.join(stage, "verify-known-good")
+            self.assertTrue(os.path.isdir(vdir))
+            self._assert_canonical_tree(vdir)
+            # Staging and verify manifests use same canonical modes (hash equality
+            # already enforced by export; here just ensure verify tree canonical).
+
+    def test_unpriv_1001_readable_mode_bits_and_conditional_actual(self):
+        from scripts.stock_activation.prep_export import export_prep_closure
+        with tempfile.TemporaryDirectory() as td:
+            repo, sha, venv_src, interp_src, deps_src = build_basic(os.path.join(td, "fix"))
+            self._make_restrictive(venv_src)
+            stage = make_stage(os.path.join(td, "s"))
+            res = export_prep_closure(
+                stage, kind="known-good", source_repo=repo, source_sha=sha,
+                venv_src=venv_src, interpreter_src=interp_src, deps_src=deps_src,
+                finder_prefixes=[FINDER_ORIG], mount_prefix=MOUNT_KNOWN,
+            )
+            self.assertEqual(res["status"], "prep-staged")
+            sr = find_staging_root(stage)
+            # Safe mode-bit proof uid 1001 can traverse/read: o+r and o+x set.
+            for dp, dn, fn in os.walk(sr, followlinks=False):
+                dmode = stat.S_IMODE(os.lstat(dp).st_mode)
+                self.assertTrue(dmode & 0o004 and dmode & 0o001, msg=f"dir blocks 1001 {dp} {oct(dmode)}")
+                for n in fn:
+                    fp = os.path.join(dp, n)
+                    try:
+                        st = os.lstat(fp)
+                    except FileNotFoundError:
+                        continue
+                    if stat.S_ISLNK(st.st_mode):
+                        continue
+                    fmode = stat.S_IMODE(st.st_mode)
+                    self.assertTrue(fmode & 0o004, msg=f"file blocks 1001 {fp} {oct(fmode)}")
+                    if fmode == 0o555:
+                        self.assertTrue(fmode & 0o001, msg=f"exec blocks 1001 {fp}")
+            # Conditional actual unpriv read when running as root: fork, setuid
+            # 1001, try listdir+open. Fixture-only, no live paths.
+            if os.geteuid() == 0:
+                probe_rel = os.path.join("venv", "pyvenv.cfg")
+                probe = os.path.join(sr, probe_rel)
+                self.assertTrue(os.path.exists(probe))
+                pid = os.fork()
+                if pid == 0:
+                    try:
+                        try:
+                            os.setgid(1001)
+                        except OSError:
+                            pass
+                        os.setuid(1001)
+                        os.listdir(sr)
+                        os.listdir(os.path.join(sr, "venv", "bin"))
+                        with open(probe, "rb") as f:
+                            data = f.read()
+                        if not data:
+                            os._exit(2)
+                        os._exit(0)
+                    except Exception:
+                        os._exit(1)
+                else:
+                    _, status = os.waitpid(pid, 0)
+                    # If setuid user missing or sandbox blocks, child exits non-zero;
+                    # only assert when child could run (exit 0/1 from read, not signal).
+                    if os.WIFEXITED(status):
+                        code = os.WEXITSTATUS(status)
+                        # 0 proves actual 1001 read; 1 is read failure (must not happen
+                        # with canonical modes); allow skip only if setuid itself failed
+                        # (child would still exit 1, but mode bits above already prove).
+                        # To stay safe, require 0 when root can setuid to 1001.
+                        # If environment lacks uid 1001 support, this still works
+                        # (setuid to numeric id needs no passwd entry).
+                        self.assertEqual(code, 0, msg="actual uid 1001 read failed despite 0444/0555")
+                    else:
+                        self.fail("unpriv probe child did not exit")
+
+    def test_image_ll_canonical_if_available(self):
+        import shutil as _sh
+        if not os.path.exists("/usr/bin/mksquashfs") or not os.path.exists("/usr/bin/unsquashfs"):
+            self.skipTest("no squashfs tools")
+        if _sh.which("unsquashfs") is None:
+            self.skipTest("no unsquashfs")
+        from scripts.stock_activation.prep_export import export_prep_closure
+        with tempfile.TemporaryDirectory() as td:
+            repo, sha, venv_src, interp_src, deps_src = build_basic(os.path.join(td, "fix"))
+            self._make_restrictive(venv_src)
+            stage = make_stage(os.path.join(td, "s"))
+            res = export_prep_closure(
+                stage, kind="known-good", source_repo=repo, source_sha=sha,
+                venv_src=venv_src, interpreter_src=interp_src, deps_src=deps_src,
+                finder_prefixes=[FINDER_ORIG], mount_prefix=MOUNT_KNOWN,
+            )
+            self.assertEqual(res["status"], "prep-staged")
+            img = res["image_path"]
+            self.assertTrue(os.path.exists(img))
+            cp = subprocess.run(["/usr/bin/unsquashfs", "-ll", img], capture_output=True, text=True, check=False)
+            self.assertEqual(cp.returncode, 0, cp.stderr[:1000])
+            out = cp.stdout
+            # Image must be root-owned (all-root) but world-readable, not 0700/0600.
+            self.assertIn("root/root", out)
+            self.assertNotIn("drwx------", out, msg="squashfs-root still 0700, blocks 1001")
+            self.assertNotIn("-rw-------", out)
+            # Canonical perms present.
+            self.assertIn("dr-xr-xr-x", out)
+            self.assertTrue("-r--r--r--" in out or "-r-xr-xr-x" in out)
+
+
 if __name__ == "__main__":
     unittest.main()
