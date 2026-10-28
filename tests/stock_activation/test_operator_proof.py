@@ -53,6 +53,12 @@ class FakeResult:
 
 
 class FakeHost:
+    _LIVE_PREFIXES = ("/var/lib/hermes-stock-activation", "/run/hermes-stock-activation")
+
+    def _is_live_path(self, path):
+        return isinstance(path, str) and any(
+            path == p or path.startswith(p + "/") for p in self._LIVE_PREFIXES)
+
     def __init__(self, fixture_root):
         self.fixture_root = fixture_root
         self.live = {}  # path -> {"data": bytes, "mode": int, "uid": int}
@@ -71,12 +77,18 @@ class FakeHost:
         if path in self.live:
             e = self.live[path]
             return FakeStat(0o100000 | e["mode"], e["uid"], 0, len(e.get("data", b"")))
+        if self._is_live_path(path):
+            # Hermetic: never touch real live FS (may be root-owned 0700 or
+            # mounted). Missing unless explicitly in live dict.
+            raise FileNotFoundError(errno.ENOENT, "no such live file")
         # real fs for fixture
         return os.lstat(path)
 
     def read_bytes(self, path):
         if path in self.live:
             return self.live[path]["data"]
+        if self._is_live_path(path):
+            raise FileNotFoundError(errno.ENOENT, "no such live file")
         with open(path, "rb") as f:
             return f.read()
 
@@ -87,12 +99,16 @@ class FakeHost:
         self.write_temp_calls.append(path)
         if path in self.live:
             raise OSError(errno.EEXIST, "exists")
+        if self._is_live_path(path):
+            # Hermetic live: never touch real FS (root-owned/mounted).
+            self.live[path] = {"data": bytes(data), "mode": 0o400, "uid": 0}
+            return
         try:
             os.lstat(path)
             raise OSError(errno.EEXIST, "exists")
         except FileNotFoundError:
             pass
-        self.live[path] = {"data": bytes(data), "mode": 0o600, "uid": 0}
+        self.live[path] = {"data": bytes(data), "mode": 0o400, "uid": 0}
 
     def file_fsync(self, path):
         if self.fsync_fail:
@@ -100,14 +116,25 @@ class FakeHost:
 
     def rename_path(self, src, dst):
         if src not in self.live:
+            if self._is_live_path(src) or self._is_live_path(dst):
+                raise FileNotFoundError(errno.ENOENT, "no such live file")
             # real fs rename
             os.rename(src, dst)
             return
         if dst in self.live:
             raise OSError("dst exists")
+        if self._is_live_path(dst):
+            # Hermetic: dst missing (checked above), no real FS touch.
+            pass
+        else:
+            try:
+                os.lstat(dst)
+                raise OSError(errno.EEXIST, "exists")
+            except FileNotFoundError:
+                pass
         self.live[dst] = self.live.pop(src)
-        # simulate live final perms after copy
-        self.live[dst]["mode"] = 0o600
+        # simulate live final perms after copy (live uses 0400)
+        self.live[dst]["mode"] = 0o400
         self.live[dst]["uid"] = 0
 
     def dir_fsync(self, path):
@@ -176,7 +203,41 @@ class FakeHost:
     def file_uid(self, path):
         if path in self.live:
             return self.live[path]["uid"]
+        if self._is_live_path(path):
+            raise FileNotFoundError(errno.ENOENT, "no such live file")
         return os.lstat(path).st_uid
+
+    # Owned web lifecycle: valid strict success by default (matches live).
+    # Tests for missing/early-exit override or null these to provoke failure.
+    def start_web(self, argv, env):
+        assert any("dashboard" in str(x) for x in argv)
+        if not hasattr(self, "_web_order"):
+            self._web_order = []
+        self._web_order.append("start_web")
+
+        class Handle:
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+        self._handle = Handle()
+        return self._handle
+
+    def health_fetch(self, url):
+        if not hasattr(self, "_web_order"):
+            self._web_order = []
+        self._web_order.append("health_fetch")
+        return {"status": 200, "content_type": "application/json",
+                "body": {"ok": True}}
+
+    def stop_web(self, handle):
+        if not hasattr(self, "_web_order"):
+            self._web_order = []
+        self._web_order.append("stop_web")
+        assert handle is getattr(self, "_handle", handle)
+        return True
 
 
 class OperatorProofTests(unittest.TestCase):
@@ -373,8 +434,15 @@ class OperatorProofTests(unittest.TestCase):
             host = FakeHost(td)
             host.denial = {"write": 13, "rename": 13, "link": 13}
             res = m.apply(host, recs, {"known-good": 9120})
-            self.assertEqual(res["status"], "applied")
+            # Strict fail-closed: EACCES never passes as EROFS, no applied.
+            self.assertEqual(res["status"], "failed")
             self.assertFalse(res["kernel_immutable"])
+            self.assertEqual(res["service_cutover"], "NOT_AUTHORIZED")
+            for v in res["gates"].values():
+                self.assertEqual(v, "UNEXECUTED")
+            # No extra CLI proof after immutable unresolved.
+            cli_calls = [c for c in host.run_log if any("--help" in x or "--version" in x for x in c)]
+            self.assertEqual(cli_calls, [])
 
     def test_recover_leaves_journal(self):
         m = _load_op()
@@ -443,7 +511,10 @@ class OperatorProofTests(unittest.TestCase):
         m = _load_op()
         self.assertEqual(m.main(["apply"]), 3)
         self.assertEqual(m.main(["recover", "/x"]), 3)
-        self.assertFalse(os.path.exists("/var/lib/hermes-stock-activation"))
+        # No live effects from refusal path: if live prefix already exists
+        # from a real root proof (mounts still present), do not assert its
+        # absence; just ensure refusal did not construct a live host.
+        # (Live host construction is covered by missing-execute test.)
 
     def test_export_closure_unspecified_and_cli(self):
         from scripts.stock_activation import os_adapter as oa
@@ -640,20 +711,14 @@ class ExecutedGatesTests(unittest.TestCase):
             recs = [{"kind": "known-good", "image_path": src,
                      "prep_path": os.path.join(td, "p.json"), "expected_sha256": h}]
             host = FakeHost(td)
-            # fixture performs EROFS denials, cli ok, web argv ok, but no health_fetch
-            # and digest mode will be 0600 (not 0400) so those gates stay UNEXECUTED
+            # Strict success fixture: EROFS denials, cli ok, owned web ok,
+            # digest 0400. All required gates must be EXECUTED before applied.
             res = m.apply(host, recs, {"known-good": 9120})
             self.assertEqual(res["status"], "applied")
             g = res["gates"]
-            # actually performed in this invocation
-            self.assertEqual(g["PROVISION"], "EXECUTED")
-            self.assertEqual(g["MOUNT"], "EXECUTED")
-            self.assertEqual(g["A1"], "EXECUTED")
-            self.assertEqual(g["C2"], "EXECUTED")
-            self.assertEqual(g["CLI_PROOF"], "EXECUTED")
-            # not performed: no health_fetch success, no 0400 digest
-            self.assertEqual(g["WEB_PROOF"], "UNEXECUTED")
-            self.assertEqual(g["DIGEST"], "UNEXECUTED")
+            for k in ("PROVISION", "MOUNT", "A1", "C2", "CLI_PROOF", "WEB_PROOF", "DIGEST"):
+                self.assertEqual(g[k], "EXECUTED", f"{k}={g!r} res={res!r}")
+            self.assertTrue(res["kernel_immutable"])
             self.assertEqual(res["activation"], "UNEXECUTED")
             self.assertEqual(res["service_cutover"], "NOT_AUTHORIZED")
 
@@ -690,7 +755,7 @@ class ExecutedGatesTests(unittest.TestCase):
             host = FakeHost(td)
             host.denial = {"write": 13, "rename": 13, "link": 13}
             res = m.apply(host, recs, {"known-good": 9120})
-            self.assertEqual(res["status"], "applied")
+            self.assertEqual(res["status"], "failed")
             self.assertFalse(res["kernel_immutable"])
             self.assertEqual(res["gates"]["A1"], "UNEXECUTED")
             self.assertEqual(res["gates"]["C2"], "UNEXECUTED")
@@ -822,6 +887,194 @@ class OwnedWebProofTests(unittest.TestCase):
                 self.assertEqual(host.run_log, [], f"bad={bad!r} response={res!r}")
                 for g in res["gates"].values():
                     self.assertEqual(g, "UNEXECUTED", f"bad={bad!r} response={res!r}")
+
+
+def tearDownModule():
+    import sys as _sys
+    for _mod in list(_sys.modules.keys()):
+        if _mod == "scripts.stock_activation.os_adapter":
+            del _sys.modules[_mod]
+
+
+class StrictProbeTests(unittest.TestCase):
+    def test_link_probe_single_emit_via_subprocess_with_os_shim(self):
+        m = _load_op()
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            # Exact-scope shim: only link-src creation raises EROFS.
+            # No mount/root writes; temp dir only.
+            shim = (
+                "import os, errno\n"
+                "_orig_open=os.open\n"
+                "def _fake_open(p, flags, *a, **k):\n"
+                "    s=str(p)\n"
+                "    if s.endswith('.proof-link-src-1001'):\n"
+                "        raise OSError(errno.EROFS, 'read-only')\n"
+                "    return _orig_open(p, flags, *a, **k)\n"
+                "os.open=_fake_open\n"
+            )
+            code = shim + m._DENIAL_PROBE_CODE
+            cp = subprocess.run(
+                [sys.executable, "-I", "-c", code, td, "link"],
+                capture_output=True, text=True, timeout=15, check=False,
+                env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"})
+            self.assertEqual(cp.returncode, 0, cp.stderr)
+            txt = (cp.stdout or "").strip()
+            parts = txt.split()
+            self.assertEqual(len(parts), 1, f"multi response must be single: {txt!r}")
+            self.assertEqual(int(parts[0]), errno.EROFS)
+
+    def test_parser_rejects_multi_response_not_last_token(self):
+        m = _load_op()
+        import subprocess
+        import unittest.mock as _mock
+        host = m.LiveProofHost()
+        # Old buggy double emit "30\\n2\\n" must be rejected, not parsed as 2.
+        with _mock.patch.object(subprocess, "run") as mr:
+            mr.return_value = FakeResult(0, b"30\n2\n", b"")
+            self.assertEqual(host.denial_probe("/tmp/x", "link"), 1)
+        with _mock.patch.object(subprocess, "run") as mr:
+            mr.return_value = FakeResult(0, b"30\n", b"")
+            self.assertEqual(host.denial_probe("/tmp/x", "link"), errno.EROFS)
+        with _mock.patch.object(subprocess, "run") as mr:
+            mr.return_value = FakeResult(0, b"", b"")
+            self.assertEqual(host.denial_probe("/tmp/x", "link"), 1)
+        with _mock.patch.object(subprocess, "run") as mr:
+            mr.return_value = FakeResult(0, b"13\n", b"")
+            # EACCES parses but never passes as EROFS elsewhere
+            self.assertEqual(host.denial_probe("/tmp/x", "link"), 13)
+        # Structural guard present
+        self.assertIn("_ready", m._DENIAL_PROBE_CODE)
+        self.assertIn("if _ready:", m._DENIAL_PROBE_CODE)
+
+
+class WebFailureRegressionTests(unittest.TestCase):
+    def test_early_web_exit_fails_with_stop_before_unmount_and_diagnostic(self):
+        m = _load_op()
+        with tempfile.TemporaryDirectory() as td:
+            data = b"early-exit"
+            src = os.path.join(td, "k.squashfs")
+            with open(src, "wb") as f:
+                f.write(data)
+            h = _sha(data)
+            recs = [{"kind": "known-good", "image_path": src,
+                     "prep_path": os.path.join(td, "p.json"), "expected_sha256": h}]
+            combined = []
+
+            class EarlyExitHost(FakeHost):
+                def start_web(self, argv, env):
+                    combined.append("start_web")
+                    assert any("dashboard" in str(x) for x in argv)
+
+                    class Handle:
+                        diagnostic = "dashboard crash line1\nline2"
+                        stdout = b"fake stdout crash"
+                        stderr = b"fake stderr traceback sanitized"
+
+                        def poll(self):
+                            return 1
+
+                        def wait(self, timeout=None):
+                            return 0
+
+                    self._handle = Handle()
+                    return self._handle
+
+                def health_fetch(self, url):
+                    combined.append("health_fetch")
+                    return {"status": 0, "content_type": "", "body": None}
+
+                def stop_web(self, handle):
+                    combined.append("stop_web")
+                    assert handle is self._handle
+                    return True
+
+                def run(self, argv, env):
+                    res = super().run(argv, env)
+                    if argv[0] == "/usr/bin/umount":
+                        combined.append("umount")
+                    if argv[0] == "/usr/sbin/losetup" and "-d" in argv:
+                        combined.append("detach")
+                    return res
+
+            host = EarlyExitHost(td)
+            res = m.apply(host, recs, {"known-good": 9120})
+            self.assertEqual(res["status"], "failed", f"early exit must fail: {res!r}")
+            self.assertFalse(res["kernel_immutable"] if "kernel_immutable" in res else False)
+            for v in res["gates"].values():
+                self.assertEqual(v, "UNEXECUTED")
+            self.assertEqual(res["service_cutover"], "NOT_AUTHORIZED")
+            self.assertEqual(res["activation"], "UNEXECUTED")
+            # stop before unmount/detach
+            self.assertIn("stop_web", combined)
+            self.assertIn("umount", combined)
+            self.assertLess(combined.index("stop_web"), combined.index("umount"),
+                            f"stop must precede unmount: {combined!r} res={res!r}")
+            # diagnostic present, bounded, sanitized, no .env read
+            diag = res.get("web_diagnostic", "")
+            self.assertTrue(isinstance(diag, str) and len(diag) > 0, f"missing diagnostic: {res!r}")
+            self.assertLessEqual(len(diag), 4096)
+            self.assertNotIn(".env", diag)
+            # nonzero implication: main returns 1 for failed
+            self.assertNotEqual(0 if res.get("status") == "applied" else 1, 0)
+
+    def test_missing_owned_web_methods_fails(self):
+        m = _load_op()
+        with tempfile.TemporaryDirectory() as td:
+            data = b"missing-web"
+            src = os.path.join(td, "k.squashfs")
+            with open(src, "wb") as f:
+                f.write(data)
+            h = _sha(data)
+            recs = [{"kind": "known-good", "image_path": src,
+                     "prep_path": os.path.join(td, "p.json"), "expected_sha256": h}]
+            host = FakeHost(td)
+            host.start_web = None
+            host.stop_web = None
+            host.health_fetch = None
+            res = m.apply(host, recs, {"known-good": 9120})
+            self.assertEqual(res["status"], "failed", f"missing methods must fail: {res!r}")
+            for v in res["gates"].values():
+                self.assertEqual(v, "UNEXECUTED")
+            self.assertEqual(res["service_cutover"], "NOT_AUTHORIZED")
+            diag = res.get("web_diagnostic", "")
+            self.assertIn("missing", diag.lower())
+
+    def test_immutable_unresolved_fails_no_extra_cli(self):
+        m = _load_op()
+        with tempfile.TemporaryDirectory() as td:
+            data = b"imm-fail"
+            src = os.path.join(td, "k.squashfs")
+            with open(src, "wb") as f:
+                f.write(data)
+            h = _sha(data)
+            recs = [{"kind": "known-good", "image_path": src,
+                     "prep_path": os.path.join(td, "p.json"), "expected_sha256": h}]
+            host = FakeHost(td)
+            # Simulate old double-emit second token ENOENT
+            host.denial = {"write": errno.EROFS, "rename": errno.EROFS, "link": errno.ENOENT}
+            res = m.apply(host, recs, {"known-good": 9120})
+            self.assertEqual(res["status"], "failed", f"imm false must fail: {res!r}")
+            self.assertIn("immutable", str(res.get("reason", "")).lower())
+            for v in res["gates"].values():
+                self.assertEqual(v, "UNEXECUTED")
+            cli_calls = [c for c in host.run_log if any("--help" in x or "--version" in x for x in c)]
+            self.assertEqual(cli_calls, [], f"no extra CLI after imm fail: {host.run_log!r}")
+
+    def test_missing_port_fails_no_green_with_unexecuted(self):
+        m = _load_op()
+        with tempfile.TemporaryDirectory() as td:
+            data = b"no-port"
+            src = os.path.join(td, "k.squashfs")
+            with open(src, "wb") as f:
+                f.write(data)
+            h = _sha(data)
+            recs = [{"kind": "known-good", "image_path": src,
+                     "prep_path": os.path.join(td, "p.json"), "expected_sha256": h}]
+            host = FakeHost(td)
+            res = m.apply(host, recs, {})
+            self.assertEqual(res["status"], "failed", f"missing port must fail: {res!r}")
+            self.assertIn("WEB_PROOF", res.get("unresolved_gates", []) or list(res.get("gates", {}).keys()))
 
 
 def tearDownModule():

@@ -850,6 +850,118 @@ def _coerce_run_result(res):
     return rc, out_s, err_s
 
 
+_WEB_DIAGNOSTIC_LIMIT = 4096
+
+
+def _sanitize_bounded_text(s, limit=_WEB_DIAGNOSTIC_LIMIT):
+    try:
+        if isinstance(s, bytes):
+            try:
+                s = s.decode("utf-8", "replace")
+            except Exception:
+                return ""
+        if not isinstance(s, str):
+            try:
+                s = str(s)
+            except Exception:
+                return ""
+        if len(s) > limit:
+            s = s[:limit]
+        out = []
+        for ch in s:
+            if ch in ("\n", "\t"):
+                out.append(ch)
+            else:
+                o = ord(ch)
+                if 32 <= o < 127:
+                    out.append(ch)
+                # drop other controls; keep result bounded and sanitized.
+                # No live env/file reads here; caller passes owned handle output only.
+        res = "".join(out)
+        lines = res.splitlines()
+        if len(lines) > 50:
+            res = "\n".join(lines[:50])
+        return res[:limit]
+    except Exception:
+        return ""
+
+
+def _web_diagnostic_from_handle(handle, limit=_WEB_DIAGNOSTIC_LIMIT):
+    try:
+        if handle is None:
+            return ""
+        for attr in ("diagnostic", "web_diagnostic", "error"):
+            try:
+                v = getattr(handle, attr, None)
+                if isinstance(v, (str, bytes)) and v:
+                    return _sanitize_bounded_text(v, limit)
+            except Exception:
+                pass
+        chunks = []
+        for attr in ("stdout", "stderr"):
+            try:
+                stream = getattr(handle, attr, None)
+                if stream is None:
+                    continue
+                if isinstance(stream, (bytes, str)):
+                    if stream:
+                        chunks.append(_sanitize_bounded_text(stream, limit // 2))
+                    continue
+                # Popen pipe: only attempt bounded collect when already exited
+                # to avoid blocking the live path.
+                try:
+                    poll_fn = getattr(handle, "poll", None)
+                    exited = poll_fn() is not None if callable(poll_fn) else bool(
+                        getattr(handle, "exited", False))
+                except Exception:
+                    exited = False
+                if not exited:
+                    continue
+                comm = getattr(handle, "communicate", None)
+                if callable(comm):
+                    try:
+                        out, err = comm(timeout=1)
+                        if out:
+                            chunks.append(_sanitize_bounded_text(out, limit // 2))
+                        if err:
+                            chunks.append(_sanitize_bounded_text(err, limit // 2))
+                        break
+                    except Exception:
+                        pass
+                try:
+                    if hasattr(stream, "read"):
+                        try:
+                            data = stream.read(2048)
+                        except Exception:
+                            data = None
+                        if data:
+                            chunks.append(_sanitize_bounded_text(data, limit // 2))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        try:
+            rc = None
+            poll_fn = getattr(handle, "poll", None)
+            if callable(poll_fn):
+                try:
+                    rc = poll_fn()
+                except Exception:
+                    rc = None
+            if rc is None:
+                rc = getattr(handle, "returncode", None)
+                if not isinstance(rc, int):
+                    rc = getattr(handle, "exit_code", None)
+            if isinstance(rc, int):
+                chunks.append(f"exit={rc}")
+        except Exception:
+            pass
+        combined = "\n".join([c for c in chunks if c])
+        return _sanitize_bounded_text(combined, limit)
+    except Exception:
+        return ""
+
+
 def _lstat_mode_uid(host, path):
     st = host.lstat(path)
     if isinstance(st, dict):
@@ -1330,8 +1442,28 @@ def apply(host, records, ports, execute_commands=True, proof_home=None):
                 imm = False
         except Exception:
             imm = False
+            bmode, buid, bgid = None, None, None
         if not imm:
-            overall_immutable = False
+            # Fail closed: immutable unresolved. Owned cleanup, explicit evidence,
+            # unresolved gates, no CLI/web. Never status applied.
+            try:
+                host.run(umount_argv(mount), PROOF_ENV)
+            except Exception:
+                pass
+            try:
+                host.run(losetup_detach_argv(loopdev), PROOF_ENV)
+            except Exception:
+                pass
+            return {"status": "failed", "reason": "immutable-unresolved",
+                    "signed": False, "activation": "UNEXECUTED",
+                    "service_cutover": "NOT_AUTHORIZED", "kernel_immutable": False,
+                    "gates": _gates_unexecuted(), "images": results,
+                    "evidence": {"write_errno": w_e, "rename_errno": r_e,
+                                 "link_errno": l_e, "expected_errno": errno.EROFS,
+                                 "backing_mode": bmode, "backing_uid": buid,
+                                 "backing_gid": bgid},
+                    "unresolved_gates": ["A1", "C2", "CLI_PROOF", "WEB_PROOF",
+                                         "MOUNT", "PROVISION", "DIGEST"]}
         a1c2_this = bool(imm)
         # CLI + web proof. CLI stays on run() with 30s timeout; dashboard
         # never uses run() (it would block) and instead uses the owned
@@ -1351,28 +1483,35 @@ def apply(host, records, ports, execute_commands=True, proof_home=None):
         cli_this = bool(cli_ok)
         web_this = False
         dashboard_ok = True
+        web_diagnostic = ""
         if cli_ok and port is not None:
             try:
                 wargv = web_proof_argv(mount, port)
             except ValueError:
                 dashboard_ok = False
                 wargv = None
+                web_diagnostic = "refused port"
             if wargv is not None:
                 start_fn = getattr(host, "start_web", None)
                 stop_fn = getattr(host, "stop_web", None)
                 hfn = getattr(host, "health_fetch", None)
                 if not (callable(start_fn) and callable(stop_fn) and callable(hfn)):
-                    # No owned proof capability: never use run() for the
-                    # dashboard argv (a blocking run would hang). Leave
-                    # WEB_PROOF UNEXECUTED without failing the apply.
+                    # No owned proof capability in live path: fail closed.
+                    # Never use run() for dashboard (would hang); require owned lifecycle.
                     web_this = False
-                    dashboard_ok = True
+                    dashboard_ok = False
+                    web_diagnostic = "missing owned web methods"
                 else:
                     try:
                         handle = start_fn(wargv, proof_env)
-                    except Exception:
+                        web_diagnostic = ""
+                    except Exception as e:
                         dashboard_ok = False
                         handle = None
+                        try:
+                            web_diagnostic = _sanitize_bounded_text(f"start-failed: {e}")
+                        except Exception:
+                            web_diagnostic = "start-failed"
                     if handle is not None:
                         health_passed = False
                         exited_early = False
@@ -1430,29 +1569,58 @@ def apply(host, records, ports, execute_commands=True, proof_home=None):
                         if health_passed and reaped and not exited_early:
                             web_this = True
                             dashboard_ok = True
+                            web_diagnostic = ""
                         elif exited_early and not health_passed:
-                            # Dashboard exit-before-fetch is not proof, but not
-                            # an overall failure (fixture parity).
+                            # Dashboard exit-before-fetch is startup failure: fail closed.
+                            # No fixture exemption in live path.
                             web_this = False
-                            dashboard_ok = True
+                            dashboard_ok = False
+                            try:
+                                web_diagnostic = _web_diagnostic_from_handle(handle)
+                                if not web_diagnostic:
+                                    web_diagnostic = "dashboard exited before health"
+                            except Exception:
+                                web_diagnostic = "dashboard exited before health"
                         elif not health_passed:
                             # Hang past 20s is failure; caller cleans up below.
                             web_this = False
                             dashboard_ok = False
+                            try:
+                                web_diagnostic = _web_diagnostic_from_handle(handle)
+                                if not web_diagnostic:
+                                    web_diagnostic = "dashboard health timeout"
+                            except Exception:
+                                web_diagnostic = "dashboard health timeout"
                         else:
                             # Health passed but owned child was not reaped
                             # (stop unresolved): do not claim WEB_PROOF.
                             web_this = False
                             dashboard_ok = False
+                            try:
+                                web_diagnostic = _web_diagnostic_from_handle(handle)
+                                if not web_diagnostic:
+                                    web_diagnostic = "dashboard stop unresolved"
+                            except Exception:
+                                web_diagnostic = "dashboard stop unresolved"
                     else:
                         web_this = False
-            # port None means no web proof attempted in this invocation
+                        if dashboard_ok is not False:
+                            dashboard_ok = False
+                        if not web_diagnostic:
+                            web_diagnostic = "dashboard start unresolved"
+            # port None means no web proof attempted: WEB required, fail closed.
             if port is None:
-                dashboard_ok = True
+                dashboard_ok = False
                 web_this = False
+                if not web_diagnostic:
+                    web_diagnostic = "missing port for web proof"
         elif cli_ok and port is None:
-            dashboard_ok = True
+            dashboard_ok = False
             web_this = False
+            if not web_diagnostic:
+                web_diagnostic = "missing port for web proof"
+        elif not cli_ok and not web_diagnostic:
+            web_diagnostic = ""
         if not (cli_ok and dashboard_ok):
             try:
                 host.run(umount_argv(mount), PROOF_ENV)
@@ -1464,7 +1632,13 @@ def apply(host, records, ports, execute_commands=True, proof_home=None):
                 pass
             return {"status": "failed", "signed": False, "activation": "UNEXECUTED",
                     "service_cutover": "NOT_AUTHORIZED", "kernel_immutable": False,
-                    "gates": _gates_unexecuted(), "images": results}
+                    "gates": _gates_unexecuted(), "images": results,
+                    "reason": "web-unresolved" if cli_ok else "cli-unresolved",
+                    "web_diagnostic": _sanitize_bounded_text(web_diagnostic),
+                    "evidence": {"cli_ok": bool(cli_ok), "dashboard_ok": bool(dashboard_ok),
+                                 "write_errno": w_e, "rename_errno": r_e, "link_errno": l_e},
+                    "unresolved_gates": ["A1", "C2", "CLI_PROOF", "WEB_PROOF",
+                                         "MOUNT", "PROVISION", "DIGEST"]}
         # DIGEST: unsigned digest file with signed false, fsync, rename, dir fsync,
         # readback match, mode 0400. Write to reviewed digest path for kind.
         digest_this = False
@@ -1526,6 +1700,34 @@ def apply(host, records, ports, execute_commands=True, proof_home=None):
         gates["WEB_PROOF"] = "EXECUTED"
     if _all(digest_flags):
         gates["DIGEST"] = "EXECUTED"
+    # Fail closed: no green with UNEXECUTED. All required gates must execute
+    # per image before overall applied.
+    unresolved = [k for k, v in gates.items() if v != "EXECUTED"]
+    if unresolved:
+        for r in results:
+            try:
+                if r.get("status") == "applied":
+                    try:
+                        host.run(umount_argv(r.get("mount")), PROOF_ENV)
+                    except Exception:
+                        pass
+                    try:
+                        lp = r.get("loop")
+                        if isinstance(lp, str) and lp.startswith("/dev/loop"):
+                            host.run(losetup_detach_argv(lp), PROOF_ENV)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        return {"status": "failed", "reason": "gates-unresolved",
+                "signed": False, "activation": "UNEXECUTED",
+                "service_cutover": "NOT_AUTHORIZED",
+                "kernel_immutable": False,
+                "gates": gates, "images": results,
+                "unresolved_gates": sorted(unresolved),
+                "evidence": {"prov": list(prov_flags), "mount": list(mount_flags),
+                             "a1c2": list(a1c2_flags), "cli": list(cli_flags),
+                             "web": list(web_flags), "digest": list(digest_flags)}}
     return {"status": "applied", "signed": False, "activation": "UNEXECUTED",
             "service_cutover": "NOT_AUTHORIZED",
             "kernel_immutable": bool(overall_immutable) if results else False,
@@ -1687,43 +1889,46 @@ _DENIAL_PROBE_CODE = (
     "            else:\n"
     "                _emit(e.errno or 1)\n"
     "    elif op=='link':\n"
+    "        _ready=False\n"
     "        try:\n"
     "            fd=os.open(ls,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)\n"
     "        except OSError as e2:\n"
     "            if e2.errno!=errno.EEXIST:\n"
     "                _emit(e2.errno or 1)\n"
     "            else:\n"
-    "                pass\n"
+    "                _ready=True\n"
     "        else:\n"
     "            try:\n"
     "                os.close(fd)\n"
     "            except Exception:\n"
     "                pass\n"
-    "        try:\n"
+    "            _ready=True\n"
+    "        if _ready:\n"
     "            try:\n"
-    "                os.unlink(ld)\n"
-    "            except FileNotFoundError:\n"
-    "                pass\n"
-    "            os.link(ls,ld)\n"
-    "            _emit(0)\n"
-    "            try:\n"
-    "                os.unlink(ls)\n"
-    "            except Exception:\n"
-    "                pass\n"
-    "            try:\n"
-    "                os.unlink(ld)\n"
-    "            except Exception:\n"
-    "                pass\n"
-    "        except OSError as e:\n"
-    "            _emit(e.errno or 1)\n"
-    "            try:\n"
-    "                os.unlink(ls)\n"
-    "            except Exception:\n"
-    "                pass\n"
-    "            try:\n"
-    "                os.unlink(ld)\n"
-    "            except Exception:\n"
-    "                pass\n"
+    "                try:\n"
+    "                    os.unlink(ld)\n"
+    "                except FileNotFoundError:\n"
+    "                    pass\n"
+    "                os.link(ls,ld)\n"
+    "                _emit(0)\n"
+    "                try:\n"
+    "                    os.unlink(ls)\n"
+    "                except Exception:\n"
+    "                    pass\n"
+    "                try:\n"
+    "                    os.unlink(ld)\n"
+    "                except Exception:\n"
+    "                    pass\n"
+    "            except OSError as e:\n"
+    "                _emit(e.errno or 1)\n"
+    "                try:\n"
+    "                    os.unlink(ls)\n"
+    "                except Exception:\n"
+    "                    pass\n"
+    "                try:\n"
+    "                    os.unlink(ld)\n"
+    "                except Exception:\n"
+    "                    pass\n"
     "    else:\n"
     "        _emit(1)\n"
     "except Exception:\n"
@@ -1881,8 +2086,8 @@ class LiveProofHost:
             raise RuntimeError("env refused")
         return subprocess.Popen(argv, shell=False, env=env,
                                 stdin=subprocess.DEVNULL,
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
                                 start_new_session=True)
 
     def stop_web(self, handle):
@@ -1968,10 +2173,11 @@ class LiveProofHost:
             # If sudo/probe cannot run, return a non-EROFS errno so gates stay UNEXECUTED.
             return 1
         try:
-            out = cp.stdout.decode("utf-8", "replace").strip().split()
-            if not out:
+            txt = cp.stdout.decode("utf-8", "replace").strip()
+            parts = txt.split()
+            if len(parts) != 1:
                 return 1
-            return int(out[-1])
+            return int(parts[0])
         except Exception:
             return 1
 
