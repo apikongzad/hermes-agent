@@ -60,6 +60,75 @@ DASHBOARD_CANDIDATE_PATH = (
     "/etc/systemd/system/hermes-dashboard.service.d/zzz-candidate.conf"
 )
 
+# Narrow readonly dropin inventory (actual systemd semantics, no bypass).
+# Two trusted owner-root prefixes only; no broad '/etc' allow. Write
+# authority remains ONLY the two zzz-candidate.conf paths above; the
+# system.control resource-control prefix is readonly inventory, never
+# written by this transaction.
+def _dropin_prefixes_for(service):
+    if service not in BOTH:
+        raise ValueError("service")
+    return (
+        "/etc/systemd/system/" + service + ".d/",
+        "/etc/systemd/system.control/" + service + ".d/",
+    )
+
+
+GATEWAY_ALLOWED_DROPIN_PATHS = frozenset([
+    "/etc/systemd/system/hermes-gateway.service.d/10-user-bus.conf",
+    "/etc/systemd/system/hermes-gateway.service.d/20-runtime-permissions.conf",
+    "/etc/systemd/system/hermes-gateway.service.d/30-allow-sudo.conf",
+    "/etc/systemd/system.control/hermes-gateway.service.d/50-CPUQuota.conf",
+    "/etc/systemd/system.control/hermes-gateway.service.d/50-MemoryHigh.conf",
+    "/etc/systemd/system.control/hermes-gateway.service.d/50-MemoryMax.conf",
+    "/etc/systemd/system/hermes-gateway.service.d/a1-runner-compat.conf",
+    "/etc/systemd/system/hermes-gateway.service.d/zz-performance-allocation.conf",
+    "/etc/systemd/system/hermes-gateway.service.d/zz-runtime-3.14.9.conf",
+    "/etc/systemd/system/hermes-gateway.service.d/zzz-candidate.conf",
+])
+
+DASHBOARD_ALLOWED_DROPIN_PATHS = frozenset([
+    "/etc/systemd/system/hermes-dashboard.service.d/20-runtime-permissions.conf",
+    "/etc/systemd/system.control/hermes-dashboard.service.d/50-CPUQuota.conf",
+    "/etc/systemd/system.control/hermes-dashboard.service.d/50-MemoryHigh.conf",
+    "/etc/systemd/system.control/hermes-dashboard.service.d/50-MemoryMax.conf",
+    "/etc/systemd/system/hermes-dashboard.service.d/zz-loopback-binding.conf",
+    "/etc/systemd/system/hermes-dashboard.service.d/zz-runtime-3.14.9.conf",
+    "/etc/systemd/system/hermes-dashboard.service.d/zzz-candidate.conf",
+])
+
+ALLOWED_DROPIN_PATHS = {
+    GATEWAY_UNIT: GATEWAY_ALLOWED_DROPIN_PATHS,
+    DASHBOARD_UNIT: DASHBOARD_ALLOWED_DROPIN_PATHS,
+}
+
+
+def _is_valid_dropin_basename(base):
+    if not isinstance(base, str):
+        return False
+    if not base or len(base) > 255:
+        return False
+    if not base.endswith(".conf"):
+        return False
+    if "/" in base or "\\" in base:
+        return False
+    if "\x00" in base:
+        return False
+    if ".." in base:
+        return False
+    if base in (".conf",):
+        return False
+    if not base[0].isalnum():
+        return False
+    allowed = set(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"
+    )
+    for ch in base:
+        if ch not in allowed:
+            return False
+    return True
+
+
 ENV_FILE_PATH = "/home/ubuntu/.hermes/.env"
 
 KNOWN_GOOD_IMAGE = "/var/lib/hermes-stock-activation/backing/known-good.squashfs"
@@ -1335,11 +1404,27 @@ class RealCutoverHost(Host):
             except OSError:
                 pass
 
+    def _dropin_lstat(self, path):
+        # Readonly metadata seam: lstat only (no open), no env.
+        # Worker (uid 1001) can lstat root-owned 0600 files; open would
+        # fail with EACCES, so hash reads are NOT done here. Parent root
+        # does the same lstat; content hashes for zzz-candidate are
+        # covered separately via file_info pre/post publish.
+        _refuse_live_env(path)
+        return os.lstat(path)
+
     def dropin_names(self, service):
-        # From systemctl show DropInPaths, enforce exact scope.
-        # Only basenames under /etc/systemd/system/<service>.d/, no
-        # arbitrary paths, no .., .conf only. OSError fail-closed when
-        # unreadable so orchestrate stays blocked, never drops checks.
+        # From systemctl show DropInPaths, enforce narrow readonly scope.
+        # Two trusted owner-root prefixes only:
+        #   /etc/systemd/system/<service>.d/ and
+        #   /etc/systemd/system.control/<service>.d/ (resource controls,
+        #   readonly inventory, never written by this transaction).
+        # Exact full-path allowlist, no broad '/etc' allow, no traversal,
+        # no unbounded path. Each entry must be root-owned regular
+        # non-symlink via lstat. Returns full paths in DropInPaths order
+        # to retain prefix provenance (avoids cross-prefix basename
+        # flatten collision). OSError fail-closed so orchestrate stays
+        # blocked, never drops checks.
         if service not in BOTH:
             raise ValueError("service")
         u = self.show_unit(service, full=True)
@@ -1366,22 +1451,54 @@ class RealCutoverHost(Host):
             except Exception:
                 raise OSError("dropins unreadable")
             parts = s.split()
-        prefix = "/etc/systemd/system/" + service + ".d/"
+        prefixes = _dropin_prefixes_for(service)
+        allowed = ALLOWED_DROPIN_PATHS.get(service, frozenset())
         out = []
+        seen_basenames = {}
         for p in parts:
             p = p.strip()
             if not p:
                 continue
+            _refuse_live_env(p)
             if ".." in p:
                 raise OSError("dropins scope")
-            if not p.startswith(prefix):
+            if "\x00" in p:
                 raise OSError("dropins scope")
-            base = p[len(prefix):]
-            if not base or "/" in base:
+            matched = None
+            for pref in prefixes:
+                if p.startswith(pref):
+                    matched = pref
+                    break
+            if matched is None:
                 raise OSError("dropins scope")
-            if not base.endswith(".conf"):
+            base = p[len(matched):]
+            if not base or "/" in base or "\\" in base:
                 raise OSError("dropins scope")
-            out.append(base)
+            if not _is_valid_dropin_basename(base):
+                raise OSError("dropins scope")
+            if p not in allowed:
+                raise OSError("dropins scope")
+            try:
+                st = self._dropin_lstat(p)
+            except OSError:
+                raise OSError("dropins scope")
+            try:
+                if stat.S_ISLNK(st.st_mode):
+                    raise OSError("dropins scope")
+                if not stat.S_ISREG(st.st_mode):
+                    raise OSError("dropins scope")
+                if st.st_uid != 0:
+                    raise OSError("dropins scope")
+            except OSError:
+                raise OSError("dropins scope")
+            except Exception:
+                raise OSError("dropins scope")
+            if base in seen_basenames and seen_basenames[base] != p:
+                raise OSError("dropins scope")
+            seen_basenames[base] = p
+            out.append(p)
+        if len(out) != len(set(out)):
+            raise OSError("dropins scope")
         return out
 
     def file_uid(self, path):

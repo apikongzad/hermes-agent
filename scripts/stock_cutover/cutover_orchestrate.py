@@ -73,6 +73,140 @@ CANDIDATE_IMAGE_SHA = (
 JOURNAL_LOCK_PATH = "/var/lib/hermes-stock-activation/journal.lock"
 EXPECTED_USER = "ubuntu"
 
+# Narrow readonly dropin inventory mirror (actual systemd semantics).
+# Two trusted owner-root prefixes only; no broad '/etc' allow. Write
+# authority remains ONLY the two zzz-candidate.conf paths above.
+def _dropin_prefixes_for(service):
+    if service not in BOTH:
+        raise ValueError("service")
+    return (
+        "/etc/systemd/system/" + service + ".d/",
+        "/etc/systemd/system.control/" + service + ".d/",
+    )
+
+
+GATEWAY_ALLOWED_DROPIN_PATHS = frozenset([
+    "/etc/systemd/system/hermes-gateway.service.d/10-user-bus.conf",
+    "/etc/systemd/system/hermes-gateway.service.d/20-runtime-permissions.conf",
+    "/etc/systemd/system/hermes-gateway.service.d/30-allow-sudo.conf",
+    "/etc/systemd/system.control/hermes-gateway.service.d/50-CPUQuota.conf",
+    "/etc/systemd/system.control/hermes-gateway.service.d/50-MemoryHigh.conf",
+    "/etc/systemd/system.control/hermes-gateway.service.d/50-MemoryMax.conf",
+    "/etc/systemd/system/hermes-gateway.service.d/a1-runner-compat.conf",
+    "/etc/systemd/system/hermes-gateway.service.d/zz-performance-allocation.conf",
+    "/etc/systemd/system/hermes-gateway.service.d/zz-runtime-3.14.9.conf",
+    "/etc/systemd/system/hermes-gateway.service.d/zzz-candidate.conf",
+])
+
+DASHBOARD_ALLOWED_DROPIN_PATHS = frozenset([
+    "/etc/systemd/system/hermes-dashboard.service.d/20-runtime-permissions.conf",
+    "/etc/systemd/system.control/hermes-dashboard.service.d/50-CPUQuota.conf",
+    "/etc/systemd/system.control/hermes-dashboard.service.d/50-MemoryHigh.conf",
+    "/etc/systemd/system.control/hermes-dashboard.service.d/50-MemoryMax.conf",
+    "/etc/systemd/system/hermes-dashboard.service.d/zz-loopback-binding.conf",
+    "/etc/systemd/system/hermes-dashboard.service.d/zz-runtime-3.14.9.conf",
+    "/etc/systemd/system/hermes-dashboard.service.d/zzz-candidate.conf",
+])
+
+ALLOWED_DROPIN_PATHS = {
+    GATEWAY_UNIT: GATEWAY_ALLOWED_DROPIN_PATHS,
+    DASHBOARD_UNIT: DASHBOARD_ALLOWED_DROPIN_PATHS,
+}
+
+
+def _dropin_basename(p):
+    try:
+        s = str(p)
+    except Exception:
+        return ""
+    if "/" in s:
+        return s.rsplit("/", 1)[-1]
+    return s
+
+
+def _has_forbidden_extra_dropin(paths):
+    # Preserve no-extra-zzz: zzz-extra.conf blocks, plus any other
+    # zzz-* beyond zzz-candidate.conf blocks (stronger, same gate).
+    for p in (paths or []):
+        b = _dropin_basename(p)
+        if b == "zzz-extra.conf":
+            return True
+        if b.startswith("zzz-") and b != "zzz-candidate.conf":
+            return True
+    return False
+
+
+def _has_dropin_collision(paths):
+    # Same basename from different full paths = ambiguous override.
+    # Retain prefix provenance: full paths must be distinct and basenames
+    # must not collide across prefixes.
+    seen = {}
+    try:
+        lst = [str(x) for x in (paths or [])]
+    except Exception:
+        return True
+    for s, orig in zip(lst, (paths or [])):
+        try:
+            b = _dropin_basename(s)
+        except Exception:
+            return True
+        if not b:
+            return True
+        if b in seen and seen[b] != s:
+            return True
+        seen[b] = s
+    if len(lst) != len(set(lst)):
+        return True
+    return False
+
+
+def _allowed_dropins_ok(service, paths):
+    # Checks actual named files (full paths when available), not a
+    # flattened guess. Bare basenames (legacy fakes) are accepted only
+    # if they map to an allowed basename; full paths must be exactly in
+    # the allowed set under the two trusted prefixes.
+    if service not in BOTH:
+        return False
+    if not isinstance(paths, (list, tuple)):
+        return False
+    allowed = ALLOWED_DROPIN_PATHS.get(service, frozenset())
+    allowed_basenames = set(a.rsplit("/", 1)[-1] for a in allowed)
+    prefixes = _dropin_prefixes_for(service)
+    for p in paths:
+        try:
+            s = str(p)
+        except Exception:
+            return False
+        if not s or ".." in s or "\x00" in s:
+            return False
+        if "/" in s:
+            if s not in allowed:
+                return False
+            ok_prefix = False
+            for pref in prefixes:
+                if s.startswith(pref):
+                    ok_prefix = True
+                    break
+            if not ok_prefix:
+                return False
+        else:
+            # Legacy bare basename: must be allowed basename, no traversal.
+            if "/" in s or "\\" in s or not s.endswith(".conf"):
+                return False
+            if s not in allowed_basenames:
+                return False
+    if _has_forbidden_extra_dropin(paths):
+        return False
+    if _has_dropin_collision(paths):
+        # Collision with distinct full paths is ambiguous; but identical
+        # full paths already checked above. Bare-basename lists cannot
+        # collide across prefixes (no provenance), so only fail when full
+        # paths collide.
+        has_slash = any("/" in str(x) for x in paths)
+        if has_slash:
+            return False
+    return True
+
 
 def _gateway_exec(mount):
     return (
@@ -1516,7 +1650,19 @@ def _orchestrate_locked(host, target_sha=None, _boot_changed=False):
             d_drop = host.dropin_names(DASHBOARD_UNIT)
         except OSError:
             return cur_bases[-1] if cur_bases else "backup-verified"
-        if "zzz-extra.conf" in list(g_drop or []) or "zzz-extra.conf" in list(d_drop or []):
+        # Provenance-aware gate: actual named files, no flatten guess.
+        # Legacy bare-basename fakes still blocked on zzz-extra; full
+        # paths additionally require allowed-set + no collision.
+        if _has_forbidden_extra_dropin(g_drop) or _has_forbidden_extra_dropin(d_drop):
+            return cur_bases[-1] if cur_bases else "backup-verified"
+        if _has_dropin_collision(g_drop) or _has_dropin_collision(d_drop):
+            # Only full-path collisions are ambiguous; bare lists lack
+            # provenance so collision check applies when slashes present.
+            if any("/" in str(x) for x in list(g_drop or []) + list(d_drop or [])):
+                return cur_bases[-1] if cur_bases else "backup-verified"
+        if not _allowed_dropins_ok(GATEWAY_UNIT, g_drop):
+            return cur_bases[-1] if cur_bases else "backup-verified"
+        if not _allowed_dropins_ok(DASHBOARD_UNIT, d_drop):
             return cur_bases[-1] if cur_bases else "backup-verified"
         try:
             _append(host, "candidate-materialized")

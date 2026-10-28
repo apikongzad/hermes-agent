@@ -118,12 +118,29 @@ class _FixtureRunner:
         cand_exec = (f"{py} -I {entry} "
                      f"{'gateway run' if is_gw else 'dashboard --port 9119 --host 127.0.0.1 --no-open --skip-build'}")
         wd = C.GATEWAY_WD if is_gw else C.DASHBOARD_WD
-        drops = " ".join(
-            f"/etc/systemd/system/{unit}.d/{n}" for n in
-            ["10-user-bus.conf", "20-runtime-permissions.conf",
-             "30-allow-sudo.conf", "a1-runner-compat.conf",
-             "zz-performance-allocation.conf",
-             "zz-runtime-3.14.9.conf", "zzz-candidate.conf"])
+        if is_gw:
+            drops = " ".join([
+                f"/etc/systemd/system/{unit}.d/10-user-bus.conf",
+                f"/etc/systemd/system/{unit}.d/20-runtime-permissions.conf",
+                f"/etc/systemd/system/{unit}.d/30-allow-sudo.conf",
+                f"/etc/systemd/system.control/{unit}.d/50-CPUQuota.conf",
+                f"/etc/systemd/system.control/{unit}.d/50-MemoryHigh.conf",
+                f"/etc/systemd/system.control/{unit}.d/50-MemoryMax.conf",
+                f"/etc/systemd/system/{unit}.d/a1-runner-compat.conf",
+                f"/etc/systemd/system/{unit}.d/zz-performance-allocation.conf",
+                f"/etc/systemd/system/{unit}.d/zz-runtime-3.14.9.conf",
+                f"/etc/systemd/system/{unit}.d/zzz-candidate.conf",
+            ])
+        else:
+            drops = " ".join([
+                f"/etc/systemd/system/{unit}.d/20-runtime-permissions.conf",
+                f"/etc/systemd/system.control/{unit}.d/50-CPUQuota.conf",
+                f"/etc/systemd/system.control/{unit}.d/50-MemoryHigh.conf",
+                f"/etc/systemd/system.control/{unit}.d/50-MemoryMax.conf",
+                f"/etc/systemd/system/{unit}.d/zz-loopback-binding.conf",
+                f"/etc/systemd/system/{unit}.d/zz-runtime-3.14.9.conf",
+                f"/etc/systemd/system/{unit}.d/zzz-candidate.conf",
+            ])
         # In-memory flags first (same-process fence/start shape).
         if self._started:
             return (f"Id={unit}\nActiveState=active\nSubState=running\n"
@@ -221,6 +238,32 @@ class _FixtureRunner:
                     unit = "hermes-gateway.service"
                 return _sp.CompletedProcess(argv, 0, self._show_text(unit), "")
         raise AssertionError(f"unexpected argv: {argv!r}")
+
+
+def _real_dropins_for(service):
+    # Real shapes: gateway 10, dashboard 7, with system.control prefix.
+    if "gateway" in service:
+        return [
+            "/etc/systemd/system/hermes-gateway.service.d/10-user-bus.conf",
+            "/etc/systemd/system/hermes-gateway.service.d/20-runtime-permissions.conf",
+            "/etc/systemd/system/hermes-gateway.service.d/30-allow-sudo.conf",
+            "/etc/systemd/system.control/hermes-gateway.service.d/50-CPUQuota.conf",
+            "/etc/systemd/system.control/hermes-gateway.service.d/50-MemoryHigh.conf",
+            "/etc/systemd/system.control/hermes-gateway.service.d/50-MemoryMax.conf",
+            "/etc/systemd/system/hermes-gateway.service.d/a1-runner-compat.conf",
+            "/etc/systemd/system/hermes-gateway.service.d/zz-performance-allocation.conf",
+            "/etc/systemd/system/hermes-gateway.service.d/zz-runtime-3.14.9.conf",
+            "/etc/systemd/system/hermes-gateway.service.d/zzz-candidate.conf",
+        ]
+    return [
+        "/etc/systemd/system/hermes-dashboard.service.d/20-runtime-permissions.conf",
+        "/etc/systemd/system.control/hermes-dashboard.service.d/50-CPUQuota.conf",
+        "/etc/systemd/system.control/hermes-dashboard.service.d/50-MemoryHigh.conf",
+        "/etc/systemd/system.control/hermes-dashboard.service.d/50-MemoryMax.conf",
+        "/etc/systemd/system/hermes-dashboard.service.d/zz-loopback-binding.conf",
+        "/etc/systemd/system/hermes-dashboard.service.d/zz-runtime-3.14.9.conf",
+        "/etc/systemd/system/hermes-dashboard.service.d/zzz-candidate.conf",
+    ]
 
 
 def _make_real_host(fixture_root, runner=None, gateway_sock=None,
@@ -592,10 +635,7 @@ class TestOwnerAndPublicationFsyncFault(unittest.TestCase):
                                       "candidate_manifest": H.CANDIDATE_IMAGE_SHA,
                                       "known_good_sha": H.KNOWN_GOOD_IMAGE_SHA,
                                       "candidate_sha": H.CANDIDATE_IMAGE_SHA}
-        host.dropin_names = lambda s: ["10-user-bus.conf", "20-runtime-permissions.conf",
-                                       "30-allow-sudo.conf", "a1-runner-compat.conf",
-                                       "zz-performance-allocation.conf",
-                                       "zz-runtime-3.14.9.conf", "zzz-candidate.conf"]
+        host.dropin_names = lambda s: _real_dropins_for(s)
         host.proc_identity = lambda pid: {"boot_id": host.boot_id(), "pid": pid,
                                           "starttime": 8000001 if pid == 590001 else 8000002,
                                           "exe": f"{C.CANDIDATE_SNAPSHOT}/venv/bin/python3.14",
@@ -644,10 +684,7 @@ class TestHealthRollbackRealFixture(unittest.TestCase):
                                       "candidate_manifest": H.CANDIDATE_IMAGE_SHA,
                                       "known_good_sha": H.KNOWN_GOOD_IMAGE_SHA,
                                       "candidate_sha": H.CANDIDATE_IMAGE_SHA}
-        host.dropin_names = lambda s: ["10-user-bus.conf", "20-runtime-permissions.conf",
-                                       "30-allow-sudo.conf", "a1-runner-compat.conf",
-                                       "zz-performance-allocation.conf",
-                                       "zz-runtime-3.14.9.conf", "zzz-candidate.conf"]
+        host.dropin_names = lambda s: _real_dropins_for(s)
 
         def _proc(pid):
             try:
@@ -739,10 +776,7 @@ class TestThreeKillsRealSigkill(unittest.TestCase):
                                           "candidate_manifest": H.CANDIDATE_IMAGE_SHA,
                                           "known_good_sha": H.KNOWN_GOOD_IMAGE_SHA,
                                           "candidate_sha": H.CANDIDATE_IMAGE_SHA}
-            host.dropin_names = lambda s: ["10-user-bus.conf", "20-runtime-permissions.conf",
-                                           "30-allow-sudo.conf", "a1-runner-compat.conf",
-                                           "zz-performance-allocation.conf",
-                                           "zz-runtime-3.14.9.conf", "zzz-candidate.conf"]
+            host.dropin_names = lambda s: _real_dropins_for(s)
             host.proc_identity = lambda pid: {"boot_id": host.boot_id(), "pid": pid,
                                               "starttime": 8000001 if pid == 590001 else 8000002,
                                               "exe": f"{C.CANDIDATE_SNAPSHOT}/venv/bin/python3.14",
@@ -819,10 +853,7 @@ class TestThreeKillsRealSigkill(unittest.TestCase):
                                       "candidate_manifest": H.CANDIDATE_IMAGE_SHA,
                                       "known_good_sha": H.KNOWN_GOOD_IMAGE_SHA,
                                       "candidate_sha": H.CANDIDATE_IMAGE_SHA}
-        host.dropin_names = lambda s: ["10-user-bus.conf", "20-runtime-permissions.conf",
-                                       "30-allow-sudo.conf", "a1-runner-compat.conf",
-                                       "zz-performance-allocation.conf",
-                                       "zz-runtime-3.14.9.conf", "zzz-candidate.conf"]
+        host.dropin_names = lambda s: _real_dropins_for(s)
         host.proc_identity = lambda pid: {"boot_id": host.boot_id(), "pid": pid,
                                           "starttime": 8000001 if pid == 590001 else 8000002,
                                           "exe": f"{C.CANDIDATE_SNAPSHOT}/venv/bin/python3.14",

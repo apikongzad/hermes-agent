@@ -565,12 +565,40 @@ class FakeCutoverHost:
         self.log.append(f"dropins:{service}")
         if self.dropin_oserror:
             raise OSError("unreadable")
-        base = ["10-user-bus.conf", "20-runtime-permissions.conf", "30-allow-sudo.conf",
-                "a1-runner-compat.conf", "zz-performance-allocation.conf",
-                "zz-runtime-3.14.9.conf", "zzz-candidate.conf"]
-        if self.dropins_mode == "stacked":
-            return base + ["zzz-extra.conf"]
-        return base
+        # Real shapes: gateway 10, dashboard 7, with system.control prefix.
+        if service == C.GATEWAY_UNIT:
+            base = [
+                "/etc/systemd/system/hermes-gateway.service.d/10-user-bus.conf",
+                "/etc/systemd/system/hermes-gateway.service.d/20-runtime-permissions.conf",
+                "/etc/systemd/system/hermes-gateway.service.d/30-allow-sudo.conf",
+                "/etc/systemd/system.control/hermes-gateway.service.d/50-CPUQuota.conf",
+                "/etc/systemd/system.control/hermes-gateway.service.d/50-MemoryHigh.conf",
+                "/etc/systemd/system.control/hermes-gateway.service.d/50-MemoryMax.conf",
+                "/etc/systemd/system/hermes-gateway.service.d/a1-runner-compat.conf",
+                "/etc/systemd/system/hermes-gateway.service.d/zz-performance-allocation.conf",
+                "/etc/systemd/system/hermes-gateway.service.d/zz-runtime-3.14.9.conf",
+                "/etc/systemd/system/hermes-gateway.service.d/zzz-candidate.conf",
+            ]
+            if self.dropins_mode == "stacked":
+                return base + [
+                    "/etc/systemd/system/hermes-gateway.service.d/zzz-extra.conf"
+                ]
+            return base
+        else:
+            base = [
+                "/etc/systemd/system/hermes-dashboard.service.d/20-runtime-permissions.conf",
+                "/etc/systemd/system.control/hermes-dashboard.service.d/50-CPUQuota.conf",
+                "/etc/systemd/system.control/hermes-dashboard.service.d/50-MemoryHigh.conf",
+                "/etc/systemd/system.control/hermes-dashboard.service.d/50-MemoryMax.conf",
+                "/etc/systemd/system/hermes-dashboard.service.d/zz-loopback-binding.conf",
+                "/etc/systemd/system/hermes-dashboard.service.d/zz-runtime-3.14.9.conf",
+                "/etc/systemd/system/hermes-dashboard.service.d/zzz-candidate.conf",
+            ]
+            if self.dropins_mode == "stacked":
+                return base + [
+                    "/etc/systemd/system/hermes-dashboard.service.d/zzz-extra.conf"
+                ]
+            return base
 
 
 def make_happy():
@@ -1137,21 +1165,33 @@ class TestRealHostOrchestrate(unittest.TestCase):
         state = {"stopped": False, "reloaded": False, "started": False,
                  "published": False}
 
-        def _dropin_paths():
-            base = "/etc/systemd/system/%s.d/"
-            gw = base % "hermes-gateway.service"
-            db = base % "hermes-dashboard.service"
-            # Same 7 legit basenames for both units (exact scope).
-            names = ["10-user-bus.conf", "20-runtime-permissions.conf",
-                     "30-allow-sudo.conf", "a1-runner-compat.conf",
-                     "zz-performance-allocation.conf",
-                     "zz-runtime-3.14.9.conf", "zzz-candidate.conf"]
-            return names, gw, db
+        def _dropin_paths(unit):
+            # Real shapes: gateway 10, dashboard 7, with system.control.
+            if "gateway" in unit:
+                return " ".join([
+                    "/etc/systemd/system/hermes-gateway.service.d/10-user-bus.conf",
+                    "/etc/systemd/system/hermes-gateway.service.d/20-runtime-permissions.conf",
+                    "/etc/systemd/system/hermes-gateway.service.d/30-allow-sudo.conf",
+                    "/etc/systemd/system.control/hermes-gateway.service.d/50-CPUQuota.conf",
+                    "/etc/systemd/system.control/hermes-gateway.service.d/50-MemoryHigh.conf",
+                    "/etc/systemd/system.control/hermes-gateway.service.d/50-MemoryMax.conf",
+                    "/etc/systemd/system/hermes-gateway.service.d/a1-runner-compat.conf",
+                    "/etc/systemd/system/hermes-gateway.service.d/zz-performance-allocation.conf",
+                    "/etc/systemd/system/hermes-gateway.service.d/zz-runtime-3.14.9.conf",
+                    "/etc/systemd/system/hermes-gateway.service.d/zzz-candidate.conf",
+                ])
+            return " ".join([
+                "/etc/systemd/system/hermes-dashboard.service.d/20-runtime-permissions.conf",
+                "/etc/systemd/system.control/hermes-dashboard.service.d/50-CPUQuota.conf",
+                "/etc/systemd/system.control/hermes-dashboard.service.d/50-MemoryHigh.conf",
+                "/etc/systemd/system.control/hermes-dashboard.service.d/50-MemoryMax.conf",
+                "/etc/systemd/system/hermes-dashboard.service.d/zz-loopback-binding.conf",
+                "/etc/systemd/system/hermes-dashboard.service.d/zz-runtime-3.14.9.conf",
+                "/etc/systemd/system/hermes-dashboard.service.d/zzz-candidate.conf",
+            ])
 
         def _show_text(unit):
-            names, gw_prefix, db_prefix = _dropin_paths()
-            prefix = gw_prefix if "gateway" in unit else db_prefix
-            drops = " ".join(prefix + n for n in names)
+            drops = _dropin_paths(unit)
             is_gw = "gateway" in unit
             snap = C.CANDIDATE_SNAPSHOT
             py = f"{snap}/venv/bin/python3"
@@ -1235,6 +1275,17 @@ class TestRealHostOrchestrate(unittest.TestCase):
 
         runner = Runner()
         real = H.RealCutoverHost(runner=runner)
+        # Hermetic lstat for dropins: root-owned regular, no live /etc open.
+        # Prefix/allowlist/collision logic still runs on real full paths.
+        def _happy_lstat(path):
+            import stat as _stat
+            s = str(path)
+            if s in C.ALLOWED_DROPIN_PATHS.get("hermes-gateway.service", frozenset()) or \
+               s in C.ALLOWED_DROPIN_PATHS.get("hermes-dashboard.service", frozenset()):
+                return type("S", (), {"st_mode": 0o100644, "st_uid": 0})()
+            # Unknown prefix for this test is still OSError (fail-closed).
+            raise OSError("no such dropin")
+        real._dropin_lstat = _happy_lstat
         # In-memory journal/lock/boot (no live /var/lib).
         real.journal_load = fake.journal_load
         real.journal_append = fake.journal_append
@@ -1334,6 +1385,77 @@ class TestRealHostOrchestrate(unittest.TestCase):
         sleeps = [a for a in runner.calls if a[9:10] == ["/usr/bin/sleep"]]
         self.assertEqual(len(sleeps), 1)
         self.assertEqual(sleeps[0], H.sleep_argv())
+
+
+class TestAllowedDropinsProvenance(unittest.TestCase):
+    """Provenance-aware dropin gate: full paths, no flatten, no-extra-zzz."""
+
+    def test_real_full_paths_accepted(self):
+        gw = [
+            "/etc/systemd/system/hermes-gateway.service.d/10-user-bus.conf",
+            "/etc/systemd/system/hermes-gateway.service.d/20-runtime-permissions.conf",
+            "/etc/systemd/system/hermes-gateway.service.d/30-allow-sudo.conf",
+            "/etc/systemd/system.control/hermes-gateway.service.d/50-CPUQuota.conf",
+            "/etc/systemd/system.control/hermes-gateway.service.d/50-MemoryHigh.conf",
+            "/etc/systemd/system.control/hermes-gateway.service.d/50-MemoryMax.conf",
+            "/etc/systemd/system/hermes-gateway.service.d/a1-runner-compat.conf",
+            "/etc/systemd/system/hermes-gateway.service.d/zz-performance-allocation.conf",
+            "/etc/systemd/system/hermes-gateway.service.d/zz-runtime-3.14.9.conf",
+            "/etc/systemd/system/hermes-gateway.service.d/zzz-candidate.conf",
+        ]
+        db = [
+            "/etc/systemd/system/hermes-dashboard.service.d/20-runtime-permissions.conf",
+            "/etc/systemd/system.control/hermes-dashboard.service.d/50-CPUQuota.conf",
+            "/etc/systemd/system.control/hermes-dashboard.service.d/50-MemoryHigh.conf",
+            "/etc/systemd/system.control/hermes-dashboard.service.d/50-MemoryMax.conf",
+            "/etc/systemd/system/hermes-dashboard.service.d/zz-loopback-binding.conf",
+            "/etc/systemd/system/hermes-dashboard.service.d/zz-runtime-3.14.9.conf",
+            "/etc/systemd/system/hermes-dashboard.service.d/zzz-candidate.conf",
+        ]
+        self.assertTrue(C._allowed_dropins_ok(C.GATEWAY_UNIT, gw))
+        self.assertTrue(C._allowed_dropins_ok(C.DASHBOARD_UNIT, db))
+        self.assertFalse(C._has_forbidden_extra_dropin(gw))
+        self.assertFalse(C._has_forbidden_extra_dropin(db))
+        self.assertFalse(C._has_dropin_collision(gw))
+        self.assertFalse(C._has_dropin_collision(db))
+
+    def test_zzz_extra_blocked_full_and_bare(self):
+        gw_extra = [
+            "/etc/systemd/system/hermes-gateway.service.d/10-user-bus.conf",
+            "/etc/systemd/system/hermes-gateway.service.d/zzz-extra.conf",
+        ]
+        self.assertTrue(C._has_forbidden_extra_dropin(gw_extra))
+        self.assertFalse(C._allowed_dropins_ok(C.GATEWAY_UNIT, gw_extra))
+        # Legacy bare still blocked (preserves old protection).
+        self.assertTrue(C._has_forbidden_extra_dropin(["zzz-extra.conf"]))
+        # Other zzz-* beyond candidate blocked.
+        self.assertTrue(C._has_forbidden_extra_dropin(
+            ["/etc/systemd/system/hermes-gateway.service.d/zzz-evil.conf"]))
+
+    def test_broad_etc_and_collision_blocked(self):
+        broad = ["/etc/other/hermes-gateway.service.d/10-user-bus.conf"]
+        self.assertFalse(C._allowed_dropins_ok(C.GATEWAY_UNIT, broad))
+        # Same basename from different prefixes = ambiguous.
+        coll = [
+            "/etc/systemd/system/hermes-gateway.service.d/10-user-bus.conf",
+            "/etc/systemd/system.control/hermes-gateway.service.d/10-user-bus.conf",
+        ]
+        self.assertTrue(C._has_dropin_collision(coll))
+        # Orchestrator shape: single-unit show still enforced via host;
+        # here collision alone must block allowed check when slashes present.
+        self.assertFalse(C._allowed_dropins_ok(C.GATEWAY_UNIT, coll))
+
+    def test_stacked_blocks_no_publish_no_start(self):
+        h = make_happy()
+        h.dropins_mode = "stacked"
+        r = C.orchestrate(h, C.Request(target_sha=TARGET))
+        # Stacked extra never reaches candidate-materialized.
+        self.assertNotIn("candidate-materialized", r.journal)
+        self.assertNotEqual(r.state, "committed")
+        pubs = [e for e in h.log if e.startswith("rename:") and "zzz-candidate" in e]
+        self.assertEqual(pubs, [])
+        starts = [e for e in h.log if e.startswith("start:")]
+        self.assertEqual(starts, [])
 
 
 if __name__ == "__main__":
