@@ -172,6 +172,11 @@ class FilesystemAdapter:
         finally:
             os.close(fd)
 
+    def file_uid(self, path):
+        resolved = self._resolve(path)
+        st = os.lstat(resolved)
+        return st.st_uid
+
     def file_info(self, path):
         self._forbidden_check(path)
         candidate = self._lexical(path)
