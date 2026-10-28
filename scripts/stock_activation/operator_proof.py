@@ -28,9 +28,9 @@ def _proof_home_refused(path):
     if not os.path.isabs(path):
         return True
     norm = os.path.normpath(path)
-    if norm in ("/home/ubuntu", "/home/ubuntu/.hermes"):
+    if norm == "/home/ubuntu" or norm.startswith("/home/ubuntu/"):
         return True
-    if ".env" in norm:
+    if ".env" in norm.split("/"):
         return True
     return False
 
@@ -479,9 +479,7 @@ def _immutable_from_evidence(ev):
         return False
     if w != errno.EROFS or r != errno.EROFS or l != errno.EROFS:
         return False
-    if bw is True:
-        return False
-    if bw is None:
+    if bw is not False:
         # require explicit False; missing means unobserved
         return False
     return True

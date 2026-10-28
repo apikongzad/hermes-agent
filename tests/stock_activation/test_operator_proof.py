@@ -535,6 +535,30 @@ class OperatorProofTests(unittest.TestCase):
             res = m.apply(Bare(), recs, {})
             self.assertEqual(res["status"], "refused")
 
+    def test_proof_home_refuses_live_home_and_env_component(self):
+        m = _load_op()
+        for bad in ("/home/ubuntu", "/home/ubuntu/",
+                    "/home/ubuntu/.hermes", "/home/ubuntu/sub/dir",
+                    "/home/ubuntu//sub"):
+            self.assertTrue(m._proof_home_refused(bad), bad)
+        for bad in ("/tmp/x/.env", "/tmp/.env/y", "/a/.env",
+                    "/a/b/.env/c"):
+            self.assertTrue(m._proof_home_refused(bad), bad)
+        self.assertFalse(
+            m._proof_home_refused("/var/lib/hermes-stock-activation/proof-home"))
+        self.assertFalse(m._proof_home_refused("/tmp/my.env/file"))
+        self.assertFalse(m._proof_home_refused("/tmp/.env2/file"))
+
+    def test_immutable_requires_exact_false_backing(self):
+        m = _load_op()
+        base = {"executed": True, "write_errno": errno.EROFS,
+                "rename_errno": errno.EROFS, "link_errno": errno.EROFS}
+        good = dict(base, backing_writable_by_1001=False)
+        self.assertTrue(m._immutable_from_evidence(good))
+        for bad_val in (1, 0, True, None, "false"):
+            ev = dict(base, backing_writable_by_1001=bad_val)
+            self.assertFalse(m._immutable_from_evidence(ev), repr(bad_val))
+
 
 class LiveEntrypointTests(unittest.TestCase):
     def test_apply_execute_live_calls_apply_not_4(self):
