@@ -710,8 +710,17 @@ class OwnedWebProofTests(unittest.TestCase):
             h = _sha(data)
             recs = [{"kind": "known-good", "image_path": src,
                      "prep_path": os.path.join(td, "p.json"), "expected_sha256": h}]
-            proof_home = os.path.join(td, "proof-home")
-            os.makedirs(proof_home, mode=0o700, exist_ok=True)
+            # Legitimate symbolic proof-home: never created on real FS.
+            # Real scratch files (src/prep) stay under provided TMPDIR (td).
+            proof_home = m.PROOF_HOME_LIVE_DEFAULT
+            self.assertEqual(
+                proof_home, "/var/lib/hermes-stock-activation/proof-home",
+                f"unexpected live default: {proof_home!r}",
+            )
+            self.assertFalse(
+                m._proof_home_refused(proof_home),
+                f"legitimate proof_home refused: {proof_home!r}",
+            )
             order = []
             blocking_calls = []
 
@@ -750,17 +759,50 @@ class OwnedWebProofTests(unittest.TestCase):
                     assert handle is self._handle
                     return True
 
-            host = OwnedFake(td)
-            res = m.apply(host, recs, {"known-good": 9120}, proof_home=proof_home)
-            self.assertEqual(res["status"], "applied")
-            self.assertEqual(order, ["start_web", "health_fetch", "stop_web"])
-            self.assertEqual(blocking_calls, [])
+            import unittest.mock as _mock
+            with _mock.patch.object(
+                m, "_proof_home_refused", wraps=m._proof_home_refused
+            ) as _spy:
+                host = OwnedFake(td)
+                res = m.apply(host, recs, {"known-good": 9120}, proof_home=proof_home)
+            self.assertEqual(res["status"], "applied", f"unexpected response: {res!r}")
+            _evaluated = [
+                c for c in _spy.call_args_list if c.args and c.args[0] == proof_home
+            ]
+            self.assertTrue(
+                _evaluated,
+                f"guard never evaluated legitimate proof_home {proof_home!r}: "
+                f"calls={_spy.call_args_list!r} response={res!r}",
+            )
+            self.assertEqual(
+                order, ["start_web", "health_fetch", "stop_web"],
+                f"order={order!r} response={res!r}",
+            )
+            self.assertEqual(
+                blocking_calls, [],
+                f"blocking run used for dashboard: {blocking_calls!r} response={res!r}",
+            )
             run_cmds = [" ".join(c) for c in host.run_log]
-            self.assertTrue(any("--help" in c for c in run_cmds))
-            self.assertFalse(any("dashboard" in c for c in run_cmds))
-            self.assertEqual(res["gates"]["WEB_PROOF"], "EXECUTED")
-            self.assertEqual(host._start_env.get("HOME"), proof_home)
-            self.assertEqual(host._start_env.get("HERMES_HOME"), proof_home)
+            self.assertTrue(
+                any("--help" in c for c in run_cmds),
+                f"missing cli proof: {run_cmds!r} response={res!r}",
+            )
+            self.assertFalse(
+                any("dashboard" in c for c in run_cmds),
+                f"dashboard via blocking run: {run_cmds!r} response={res!r}",
+            )
+            self.assertEqual(
+                res["gates"]["WEB_PROOF"], "EXECUTED",
+                f"unexpected gates: {res['gates']!r} response={res!r}",
+            )
+            self.assertEqual(
+                host._start_env.get("HOME"), proof_home,
+                f"start_env={host._start_env!r} response={res!r}",
+            )
+            self.assertEqual(
+                host._start_env.get("HERMES_HOME"), proof_home,
+                f"start_env={host._start_env!r} response={res!r}",
+            )
 
     def test_proof_home_refused(self):
         m = _load_op()
@@ -776,10 +818,10 @@ class OwnedWebProofTests(unittest.TestCase):
                         "/tmp/x/.env", "/tmp/.env/y"):
                 host = FakeHost(td)
                 res = m.apply(host, recs, {"known-good": 9120}, proof_home=bad)
-                self.assertEqual(res["status"], "refused")
-                self.assertEqual(host.run_log, [])
+                self.assertEqual(res["status"], "refused", f"bad={bad!r} response={res!r}")
+                self.assertEqual(host.run_log, [], f"bad={bad!r} response={res!r}")
                 for g in res["gates"].values():
-                    self.assertEqual(g, "UNEXECUTED")
+                    self.assertEqual(g, "UNEXECUTED", f"bad={bad!r} response={res!r}")
 
 
 def tearDownModule():
