@@ -609,6 +609,58 @@ class TestWebDistVerifyRealNode(unittest.TestCase):
             os.environ["PATH"] = _orig_path
 
 
+class TestDeniedArchiveExclusion(unittest.TestCase):
+    def test_tracked_envrc_authjson_excluded_not_refused(self):
+        from scripts.stock_activation.prep_export import export_prep_closure
+        with tempfile.TemporaryDirectory() as td:
+            fix = os.path.join(td, "fix")
+            repo = os.path.join(fix, "repo")
+            files = {
+                "hermes_cli/main.py": f"print({FIXTURE_NONCE!r})\n",
+                ".envrc": "export FIXTURE_C040=1\n",
+                "auth.json": '{"token": "fixture"}\n',
+                "nested/config.yaml": "x: 1\n",
+                "nested/.env": "SECRET=1\n",
+            }
+            sha = init_repo(repo, files)
+            venv_src = os.path.join(fix, "venvsrc")
+            make_venv(venv_src)
+            interp_src = os.path.join(fix, "interpsrc")
+            make_interp(interp_src)
+            deps_src = os.path.join(fix, "depssrc")
+            make_venv(deps_src)
+            stage = make_stage(os.path.join(td, "s"))
+            res = export_prep_closure(
+                stage, kind="known-good", source_repo=repo, source_sha=sha,
+                venv_src=venv_src, interpreter_src=interp_src, deps_src=deps_src,
+                finder_prefixes=[FINDER_ORIG], mount_prefix=MOUNT_KNOWN,
+            )
+            self.assertEqual(res["status"], "prep-staged")
+            sr = find_staging_root(stage)
+            for rel in (".envrc", "auth.json", "nested/config.yaml", "nested/.env"):
+                self.assertFalse(os.path.lexists(os.path.join(sr, "source", rel)), msg=rel)
+            excl = res.get("excluded_denylist", [])
+            self.assertEqual(excl, sorted(excl))
+            self.assertTrue(any(p.endswith(".envrc") for p in excl), msg=str(excl))
+            self.assertTrue(any(p.endswith("auth.json") for p in excl), msg=str(excl))
+            self.assertTrue(any(p.endswith("config.yaml") for p in excl), msg=str(excl))
+            # venv fifo must still be tested separately; source itself is clean here.
+
+    def test_fifo_in_venv_still_refuses(self):
+        from scripts.stock_activation.prep_export import export_prep_closure
+        with tempfile.TemporaryDirectory() as td:
+            repo, sha, venv_src, interp_src, deps_src = build_basic(os.path.join(td, "fix"))
+            os.mkfifo(os.path.join(venv_src, "fifo-c040"))
+            stage = make_stage(os.path.join(td, "s"))
+            res = export_prep_closure(
+                stage, kind="known-good", source_repo=repo, source_sha=sha,
+                venv_src=venv_src, interpreter_src=interp_src, deps_src=deps_src,
+                finder_prefixes=[FINDER_ORIG], mount_prefix=MOUNT_KNOWN,
+            )
+            self.assertEqual(res["status"], "prep-refused")
+            self.assertEqual(list_images(stage), [])
+
+
 class TestContracts(unittest.TestCase):
     def test_export_closure_stub_and_cli(self):
         from scripts.stock_activation.os_adapter import export_closure

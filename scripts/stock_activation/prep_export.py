@@ -191,7 +191,7 @@ def _sha256_file(path):
 
 
 def _refused(kind, *, archive_sha256=None, web_dist="omitted-unverified",
-             design_absolute_gate="clean", residual=None):
+             design_absolute_gate="clean", residual=None, excluded_denylist=None):
     return {
         "status": "prep-refused",
         "success": False,
@@ -211,12 +211,13 @@ def _refused(kind, *, archive_sha256=None, web_dist="omitted-unverified",
         "web_dist": web_dist,
         "design_absolute_gate": design_absolute_gate,
         "residual_embedded_paths": list(residual) if residual else [],
+        "excluded_denylist": list(excluded_denylist) if excluded_denylist else [],
         "rollback_clean": True,
         "source_sha": None,
     }
 
 
-def _durable_unknown(kind, *, archive_sha256=None, error=None):
+def _durable_unknown(kind, *, archive_sha256=None, error=None, excluded_denylist=None):
     return {
         "status": "durable-state-unknown",
         "success": False,
@@ -236,6 +237,7 @@ def _durable_unknown(kind, *, archive_sha256=None, error=None):
         "web_dist": "omitted-unverified",
         "design_absolute_gate": "clean",
         "residual_embedded_paths": [],
+        "excluded_denylist": list(excluded_denylist) if excluded_denylist else [],
         "rollback_clean": False,
         "source_sha": None,
         "error": str(error) if error is not None else "",
@@ -309,13 +311,15 @@ def _deny_tree(root):
         parts = [] if rel_dir == "." else rel_dir.split(os.sep)
         for comp in parts:
             if comp in (".git", ".env", ".envrc", "__pycache__", ".leases",
-                        "state.db", "state.db-wal", "state.db-shm"):
+                        "state.db", "state.db-wal", "state.db-shm",
+                        "auth.json", "config.yaml"):
                 raise RuntimeError("denylist " + comp)
             if comp.endswith(".pyc"):
                 raise RuntimeError("denylist pyc")
         for name in filenames:
-            if name in ("state.db", "state.db-wal", "state.db-shm"):
-                raise RuntimeError("denylist state")
+            if name in ("state.db", "state.db-wal", "state.db-shm",
+                        "auth.json", "config.yaml"):
+                raise RuntimeError("denylist state" if name.startswith("state.db") else "denylist " + name)
             if name.endswith(".pyc"):
                 raise RuntimeError("denylist pyc")
             if name in (".env", ".envrc", ".leases"):
@@ -324,10 +328,92 @@ def _deny_tree(root):
                 raise RuntimeError("denylist .git")
         for name in dirnames:
             if name in (".git", ".env", ".envrc", "__pycache__", ".leases",
-                        "state.db", "state.db-wal", "state.db-shm"):
+                        "state.db", "state.db-wal", "state.db-shm",
+                        "auth.json", "config.yaml"):
                 raise RuntimeError("denylist " + name)
             if name.endswith(".pyc"):
                 raise RuntimeError("denylist pyc")
+
+
+_DENIED_PATH_COMPONENTS = frozenset({".git", ".env", ".envrc", "__pycache__", ".leases"})
+_DENIED_FILENAMES = frozenset({
+    "state.db", "state.db-wal", "state.db-shm",
+    "auth.json", "config.yaml",
+})
+
+
+def _is_denied_dirname(name):
+    if name in _DENIED_PATH_COMPONENTS:
+        return True
+    if name in _DENIED_FILENAMES:
+        return True
+    if name.endswith(".pyc"):
+        return True
+    return False
+
+
+def _is_denied_filename(name):
+    if name in _DENIED_PATH_COMPONENTS:
+        return True
+    if name in _DENIED_FILENAMES:
+        return True
+    if name.endswith(".pyc"):
+        return True
+    return False
+
+
+def _prune_denied_from_source(source_dir, staging_root):
+    # Remove only explicit denylist names from the extracted source tree.
+    # This is an explicit exclusion (recorded in excluded_denylist), not a
+    # silent drop of a required file. Never touches library paths merely
+    # because a parent contains the substring "sessions".
+    # Special files (fifo/socket/device) are left for _deny_tree to refuse.
+    excluded = []
+    sroot_norm = os.path.normpath(staging_root)
+    for dirpath, dirnames, filenames in os.walk(source_dir, topdown=True, followlinks=False):
+        for name in list(dirnames):
+            if not _is_denied_dirname(name):
+                continue
+            full = os.path.join(dirpath, name)
+            try:
+                st = os.lstat(full)
+            except FileNotFoundError:
+                try:
+                    dirnames.remove(name)
+                except ValueError:
+                    pass
+                continue
+            if stat.S_ISFIFO(st.st_mode) or stat.S_ISSOCK(st.st_mode):
+                continue
+            if stat.S_ISCHR(st.st_mode) or stat.S_ISBLK(st.st_mode):
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                os.unlink(full)
+            elif stat.S_ISDIR(st.st_mode):
+                shutil.rmtree(full, ignore_errors=False)
+            else:
+                os.unlink(full)
+            excluded.append(os.path.relpath(full, sroot_norm))
+            try:
+                dirnames.remove(name)
+            except ValueError:
+                pass
+        for name in list(filenames):
+            if not _is_denied_filename(name):
+                continue
+            full = os.path.join(dirpath, name)
+            try:
+                st = os.lstat(full)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISFIFO(st.st_mode) or stat.S_ISSOCK(st.st_mode):
+                continue
+            if stat.S_ISCHR(st.st_mode) or stat.S_ISBLK(st.st_mode):
+                continue
+            os.unlink(full)
+            excluded.append(os.path.relpath(full, sroot_norm))
+    excluded.sort()
+    return excluded
 
 
 def _prune_user_sessions(staging_root):
@@ -810,22 +896,23 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
         _cleanup_on_refuse()
         return _refused(kind, archive_sha256=h1)
     archive_sha256 = h1
+    excluded_denylist = []
 
     source_dir = os.path.join(staging_root, "source")
     try:
         os.makedirs(source_dir, exist_ok=False)
     except OSError:
         _cleanup_on_refuse()
-        return _refused(kind, archive_sha256=archive_sha256)
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
 
     try:
         rt = _run_cmd(_tar_extract_argv(source_dir, tar1), clean_env, runner)
     except Exception:
         _cleanup_on_refuse()
-        return _refused(kind, archive_sha256=archive_sha256)
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
     if getattr(rt, "returncode", 1) != 0:
         _cleanup_on_refuse()
-        return _refused(kind, archive_sha256=archive_sha256)
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
 
     # Remove tars so they never enter the image.
     for t in (tar1, tar2):
@@ -835,7 +922,16 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
             pass
         except OSError:
             _cleanup_on_refuse()
-            return _refused(kind, archive_sha256=archive_sha256)
+            return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
+
+    # Explicit exclusion: remove denylist names that git archive extracted
+    # from the source tree before deny checks. Recorded in excluded_denylist,
+    # not a silent drop. .envrc/.env etc are denied names, not required files.
+    try:
+        excluded_denylist = _prune_denied_from_source(source_dir, staging_root)
+    except Exception:
+        _cleanup_on_refuse()
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
 
     # Web dist verification before copy.
     web_status = "omitted-unverified"
@@ -871,10 +967,10 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
             rr = _run_cmd(_rsync_argv(src, dst), clean_env, runner)
             if getattr(rr, "returncode", 1) != 0:
                 _cleanup_on_refuse()
-                return _refused(kind, archive_sha256=archive_sha256)
+                return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
     except Exception:
         _cleanup_on_refuse()
-        return _refused(kind, archive_sha256=archive_sha256)
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
 
     # Web dist copy on match only.
     if web_verified:
@@ -884,7 +980,7 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
             rw = _run_cmd(_rsync_argv(web_dist, web_dest), clean_env, runner)
             if getattr(rw, "returncode", 1) != 0:
                 _cleanup_on_refuse()
-                return _refused(kind, archive_sha256=archive_sha256)
+                return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
             # Ensure .env never copied from dist (rsync already excludes).
             # Extra guard: remove any .env that slipped via other names? No, keep rsync policy.
             for dp, dn, fn in os.walk(web_dest, followlinks=False):
@@ -896,14 +992,14 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
                         pass
         except Exception:
             _cleanup_on_refuse()
-            return _refused(kind, archive_sha256=archive_sha256)
+            return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
 
     # Prune user sessions (preserve library sessions).
     try:
         _prune_user_sessions(staging_root)
     except Exception:
         _cleanup_on_refuse()
-        return _refused(kind, archive_sha256=archive_sha256)
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
 
     # Deny checks.
     image_roots = [source_dir, venv_dst, interp_dst] + ([deps_dst] if deps_dst else [])
@@ -912,7 +1008,7 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
             _deny_tree(r)
     except Exception:
         _cleanup_on_refuse()
-        return _refused(kind, archive_sha256=archive_sha256)
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
 
     # Symlink policy.
     venv_bins = set()
@@ -926,17 +1022,17 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
             continue
         except OSError:
             _cleanup_on_refuse()
-            return _refused(kind, archive_sha256=archive_sha256)
+            return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
     try:
         _handle_symlinks(staging_root, venv_bins)
     except Exception:
         _cleanup_on_refuse()
-        return _refused(kind, archive_sha256=archive_sha256)
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
     try:
         _replace_python_links(venv_bins)
     except Exception:
         _cleanup_on_refuse()
-        return _refused(kind, archive_sha256=archive_sha256)
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
 
     # Rewrites, mount path only.
     mount_source = mount_prefix + "/source"
@@ -946,7 +1042,7 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
         finder_files, pth_files, direct_url_files, pyvenv_files = _collect_rewrite_candidates(staging_root)
     except Exception:
         _cleanup_on_refuse()
-        return _refused(kind, archive_sha256=archive_sha256)
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
 
     # Rewrite finder/direct_url/pth that reference prefixes.
     try:
@@ -963,7 +1059,7 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
                     data = f.read()
             except OSError:
                 _cleanup_on_refuse()
-                return _refused(kind, archive_sha256=archive_sha256)
+                return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
             needs = False
             for pref in finder_prefixes:
                 if pref.encode() in data:
@@ -975,10 +1071,10 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
             _rewrite_pyvenv(full, mount_prefix)
     except OSError:
         # Secure write fsync failure -> durable unknown.
-        return _durable_unknown(kind, archive_sha256=archive_sha256, error="rewrite fsync")
+        return _durable_unknown(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist, error="rewrite fsync")
     except Exception:
         _cleanup_on_refuse()
-        return _refused(kind, archive_sha256=archive_sha256)
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
 
     # After rewrite, refuse if finder prefixes or stage bytes remain.
     try:
@@ -1003,13 +1099,13 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
             for pref in finder_prefixes:
                 if pref.encode() in data:
                     _cleanup_on_refuse()
-                    return _refused(kind, archive_sha256=archive_sha256)
+                    return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
             if stage_b in data:
                 _cleanup_on_refuse()
-                return _refused(kind, archive_sha256=archive_sha256)
+                return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
     except Exception:
         _cleanup_on_refuse()
-        return _refused(kind, archive_sha256=archive_sha256)
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
 
     # Residuals: regular files not in rewrite targets containing /home/ubuntu.
     residual = []
@@ -1040,7 +1136,7 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
                     residual.append(rel)
     except Exception:
         _cleanup_on_refuse()
-        return _refused(kind, archive_sha256=archive_sha256)
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
     residual.sort()
     gate = "residual-embedded" if residual else "clean"
 
@@ -1048,29 +1144,29 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
     try:
         _fsync_tree(staging_root)
     except OSError as e:
-        return _durable_unknown(kind, archive_sha256=archive_sha256, error=e)
+        return _durable_unknown(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist, error=e)
 
     # Image temp: direct child of stage, not inside staged tree.
     image_tmp = os.path.join(stage_norm, f".prep-{nonce}.tmp.squashfs")
     if os.path.lexists(image_tmp):
         _cleanup_on_refuse(temp_image=image_tmp)
-        return _refused(kind, archive_sha256=archive_sha256)
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
     # Guard: must be direct child and not under /var/lib.
     if os.path.dirname(os.path.normpath(image_tmp)) != stage_norm:
         _cleanup_on_refuse()
-        return _refused(kind, archive_sha256=archive_sha256)
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
     if _is_under(os.path.normpath(image_tmp), "/var/lib"):
         _cleanup_on_refuse()
-        return _refused(kind, archive_sha256=archive_sha256)
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
 
     try:
         rm = _run_cmd(_mksquashfs_argv(staging_root, image_tmp), clean_env, runner)
     except Exception:
         _cleanup_on_refuse(temp_image=image_tmp)
-        return _refused(kind, archive_sha256=archive_sha256)
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
     if getattr(rm, "returncode", 1) != 0:
         _cleanup_on_refuse(temp_image=image_tmp)
-        return _refused(kind, archive_sha256=archive_sha256)
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
 
     # Fsync image, rename to final, fsync stage.
     final_image = os.path.join(stage_norm, f"{kind}.squashfs")
@@ -1082,7 +1178,7 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
                 os.unlink(image_tmp)
         except OSError:
             pass
-        return _durable_unknown(kind, archive_sha256=archive_sha256, error=e)
+        return _durable_unknown(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist, error=e)
     try:
         # If final already exists, replace atomically via rename (overwrite).
         # Ensure no leftover verify confusion: allow overwrite.
@@ -1093,7 +1189,7 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
                 os.unlink(image_tmp)
         except OSError:
             pass
-        return _durable_unknown(kind, archive_sha256=archive_sha256, error=e)
+        return _durable_unknown(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist, error=e)
     try:
         dfd = os.open(stage_norm, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW)
         try:
@@ -1101,7 +1197,7 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
         finally:
             os.close(dfd)
     except OSError as e:
-        return _durable_unknown(kind, archive_sha256=archive_sha256, error=e)
+        return _durable_unknown(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist, error=e)
 
     # Manifest + image hashes.
     try:
@@ -1109,7 +1205,7 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
         image_sha = _sha256_file(final_image)
         image_bytes = os.lstat(final_image).st_size
     except OSError as e:
-        return _durable_unknown(kind, archive_sha256=archive_sha256, error=e)
+        return _durable_unknown(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist, error=e)
 
     prep_path = os.path.join(stage_norm, f"{kind}.prep.json")
     payload = {
@@ -1129,6 +1225,7 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
         "web_dist": web_status,
         "design_absolute_gate": gate,
         "residual_embedded_paths": residual,
+        "excluded_denylist": excluded_denylist,
     }
     try:
         tmpj = prep_path + ".tmp." + os.urandom(4).hex()
@@ -1160,7 +1257,7 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
         finally:
             os.close(dfd2)
     except OSError as e:
-        return _durable_unknown(kind, archive_sha256=archive_sha256, error=e)
+        return _durable_unknown(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist, error=e)
 
     # Verify: unsquashfs and recompute.
     verify_dir = os.path.join(stage_norm, f"verify-{kind}")
@@ -1186,7 +1283,7 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
                 os.unlink(prep_path)
         except OSError:
             pass
-        return _refused(kind, archive_sha256=archive_sha256)
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
     if getattr(ru, "returncode", 1) != 0:
         try:
             if os.path.lexists(final_image):
@@ -1198,7 +1295,7 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
                 os.unlink(prep_path)
         except OSError:
             pass
-        return _refused(kind, archive_sha256=archive_sha256)
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
 
     try:
         v_source = os.path.join(verify_dir, "source")
@@ -1220,7 +1317,7 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
                 os.unlink(prep_path)
         except OSError:
             pass
-        return _refused(kind, archive_sha256=archive_sha256)
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
     if v_text != manifest_text or v_sha != manifest_sha:
         try:
             if os.path.lexists(final_image):
@@ -1232,7 +1329,7 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
                 os.unlink(prep_path)
         except OSError:
             pass
-        return _refused(kind, archive_sha256=archive_sha256)
+        return _refused(kind, archive_sha256=archive_sha256, excluded_denylist=excluded_denylist)
 
     return {
         "status": "prep-staged",
@@ -1253,6 +1350,7 @@ def export_prep_closure(stage_root, *, kind, source_repo, source_sha,
         "web_dist": web_status,
         "design_absolute_gate": gate,
         "residual_embedded_paths": residual,
+        "excluded_denylist": excluded_denylist,
         "rollback_clean": True,
         "source_sha": source_sha,
     }
