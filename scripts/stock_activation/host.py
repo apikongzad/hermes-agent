@@ -76,6 +76,9 @@ class Host:
     def dropin_names(self, service):
         raise NotImplementedError
 
+    def file_uid(self, path):
+        raise NotImplementedError
+
 
 class LiveRootHost(Host):
     """Present only behind refusal. Never used by tests or CLI."""
@@ -155,4 +158,7 @@ class LiveRootHost(Host):
         self._refuse()
 
     def dropin_names(self, service):
+        self._refuse()
+
+    def file_uid(self, path):
         self._refuse()
