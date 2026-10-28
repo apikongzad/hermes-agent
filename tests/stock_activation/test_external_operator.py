@@ -93,6 +93,13 @@ class FakeHost(Host):
         self.proc_mismatch = False
         self.rollback_snapshot_missing = False
         self.rollback_snapshot_writable = False
+        self.rollback_snapshot_uid = 0
+        self.rollback_denial_fail = False
+        self.journal_dir_oserror = False
+        self.dropin_oserror = False
+        self.proc_identity_oserror = False
+        self.rollback_dashboard_mode = None
+        self.rollback_gateway_mode = None
         self.post_start_forbidden_key = False
         self.files = {
             GATEWAY_RUNTIME_PATH: b"G" * GATEWAY_RUNTIME_SIZE,
@@ -120,6 +127,8 @@ class FakeHost(Host):
 
     def journal_dir_info(self):
         self.log.append("dir-info")
+        if self.journal_dir_oserror:
+            raise OSError("journal dir unreadable")
         return {
             "path": JOURNAL_DIR,
             "mode": 0o700,
@@ -290,7 +299,7 @@ class FakeHost(Host):
             if path == KNOWN_GOOD_SNAPSHOT and self.rollback_snapshot_missing:
                 return {"exists": False, "mode": 0, "uid": 0, "size": 0, "sha256": "", "writable_by_1001": False}
             writable = bool(self.rollback_snapshot_writable) if path == KNOWN_GOOD_SNAPSHOT else False
-            return {"exists": True, "mode": 0o755, "uid": 0, "size": 0, "sha256": "", "writable_by_1001": writable}
+            return {"exists": True, "mode": 0o755, "uid": self.rollback_snapshot_uid if path == KNOWN_GOOD_SNAPSHOT else 0, "size": 0, "sha256": "", "writable_by_1001": writable}
         if path == JOURNAL_DIR:
             return {"exists": True, "mode": 0o700, "uid": 0, "size": 0, "sha256": "", "writable_by_1001": False}
         return {"exists": True, "mode": 0o644, "uid": 0, "size": 0, "sha256": "", "writable_by_1001": False}
@@ -333,6 +342,8 @@ class FakeHost(Host):
 
     def proc_identity(self, pid):
         self.log.append(f"proc:{pid}")
+        if self.proc_identity_oserror:
+            raise OSError("proc identity unreadable")
         if pid in (LIVE_GATEWAY_PID, LIVE_DASHBOARD_PID) and not self.started:
             is_gateway = pid == LIVE_GATEWAY_PID
             return {
@@ -393,7 +404,7 @@ class FakeHost(Host):
                 "write_denied": False, "rename_denied": False, "hardlink_denied": False, "kernel_enforced": False,
                 "second_write_denied": False, "second_rename_denied": False, "second_hardlink_denied": False, "second_kernel_enforced": False,
             }
-        if path == KNOWN_GOOD_SNAPSHOT and self.rollback_snapshot_writable:
+        if path == KNOWN_GOOD_SNAPSHOT and (self.rollback_snapshot_writable or self.rollback_denial_fail):
             return {
                 "write_denied": False, "rename_denied": False, "hardlink_denied": False, "kernel_enforced": False,
                 "second_write_denied": False, "second_rename_denied": False, "second_hardlink_denied": False, "second_kernel_enforced": False,
@@ -441,6 +452,20 @@ class FakeHost(Host):
         self.log.append(f"dashboard:{phase}:{url}|headers={sorted((headers or {}).keys())}")
         if url != DASHBOARD_URL:
             return {"status": 404, "content_type": "text/html", "body": "<html>not found</html>"}
+        if self.published_kind == "rollback" and self.rollback_dashboard_mode is not None:
+            mode = self.rollback_dashboard_mode
+            if mode == "401":
+                return {"status": 401, "content_type": "application/json", "body": {"ok": False}}
+            if mode == "403":
+                return {"status": 403, "content_type": "application/json", "body": {"ok": False}}
+            if mode == "timeout":
+                return {"status": 0, "content_type": "", "body": None}
+            if mode == "html":
+                return {"status": 200, "content_type": "text/html", "body": "<html>ok</html>"}
+            if mode == "ok-false":
+                return {"status": 200, "content_type": "application/json", "body": {"ok": False}}
+            if mode == "ok":
+                return {"status": 200, "content_type": "application/json", "body": {"ok": True}}
         if url == DASHBOARD_URL and self.published_kind == "rollback" and self.dashboard_mode != "ok":
             return {"status": 200, "content_type": "application/json", "body": {"ok": True}}
         if self.dashboard_mode == "401":
@@ -458,6 +483,10 @@ class FakeHost(Host):
     def gateway_talk(self, request_bytes):
         self.log.append(f"gateway:{request_bytes!r}")
         if self.published_kind == "rollback":
+            if self.rollback_gateway_mode == "uid-mismatch":
+                return {"response": {"ok": True, "result": {"protocol": 1, "pid": NEW_GATEWAY_PID}}, "peer_pid": NEW_GATEWAY_PID, "peer_uid": 1002}
+            if self.rollback_gateway_mode == "ok-false":
+                return {"response": {"ok": False, "result": {"protocol": 1, "pid": NEW_GATEWAY_PID}}, "peer_pid": NEW_GATEWAY_PID, "peer_uid": 1001}
             return {"response": {"ok": True, "result": {"protocol": 1, "pid": NEW_GATEWAY_PID}}, "peer_pid": NEW_GATEWAY_PID, "peer_uid": 1001}
         if self.gateway_mode == "peer-mismatch":
             return {"response": {"ok": True, "result": {"protocol": 1, "pid": NEW_GATEWAY_PID}}, "peer_pid": 999999, "peer_uid": 1001}
@@ -468,6 +497,8 @@ class FakeHost(Host):
 
     def dropin_names(self, service):
         self.log.append(f"dropins:{service}")
+        if self.dropin_oserror:
+            raise OSError("dropin unreadable")
         base = ["10-user-bus.conf", "20-runtime-permissions.conf", "30-allow-sudo.conf", "a1-runner-compat.conf", "zz-performance-allocation.conf", "zz-runtime-3.14.9.conf", "zzz-candidate.conf"]
         if self.dropins_mode == "stacked":
             return base + ["zzz-extra.conf"]
@@ -685,9 +716,120 @@ class TestExternalOperator(unittest.TestCase):
         host.dashboard_mode = "ok-false"
         r = orchestrate(host, Request(target_sha=TARGET_SHA))
         self.assertEqual(r.state, "rolled-back")
-        # rollback must use snapshot paths, not worktree/gen
-        self.assertIn(KNOWN_GOOD_SNAPSHOT, "\n".join(host.log) if False else KNOWN_GOOD_SNAPSHOT)
-        # starting pre-transaction bytes is failure: covered by proc_mismatch case in A7
+        self.assertIn("rolling-back", r.journal)
+        self.assertIn(f"denial:{KNOWN_GOOD_SNAPSHOT}", host.log)
+        for path in (GATEWAY_CANDIDATE_PATH, DASHBOARD_CANDIDATE_PATH):
+            body = host.files[path]
+            self.assertIn(KNOWN_GOOD_SNAPSHOT.encode(), body)
+            self.assertIn(b" -I ", body)
+            self.assertNotIn(WORKTREE_PATH.encode(), body)
+            self.assertNotIn(b"gen-1d9a377fa00c", body)
+        gw = host.proc_identity(NEW_GATEWAY_PID)
+        db = host.proc_identity(NEW_DASHBOARD_PID)
+        for ident in (gw, db):
+            blob = ident["exe"] + " " + ident["cmdline"]
+            self.assertIn(KNOWN_GOOD_SNAPSHOT, blob)
+            self.assertNotIn(WORKTREE_PATH, blob)
+            self.assertNotIn("gen-1d9a377fa00c", blob)
+        info = host.file_info(KNOWN_GOOD_SNAPSHOT)
+        self.assertEqual(info["uid"], 0)
+        self.assertFalse(info["writable_by_1001"])
+        denial = host.denial_probe(KNOWN_GOOD_SNAPSHOT)
+        self.assertEqual(denial["kernel_enforced"], True)
+        self.assertEqual(denial["second_write_denied"], True)
+
+        def _no_rollback_start(bad_host):
+            rr = orchestrate(bad_host, Request(target_sha=TARGET_SHA))
+            self.assertEqual(rr.state, "stopped-unresolved")
+            self.assertNotIn("rolled-back", rr.journal)
+            starts = [e for e in bad_host.log if e.startswith("start:")]
+            self.assertEqual(len(starts), 1)
+            renames = [e for e in bad_host.log if e.startswith("rename:") and "zzz-candidate" in e]
+            self.assertEqual(len(renames), 2)
+            for path in (GATEWAY_CANDIDATE_PATH, DASHBOARD_CANDIDATE_PATH):
+                self.assertNotIn(b"gen-1d9a377fa00c", bad_host.files[path])
+                self.assertNotIn(WORKTREE_PATH.encode(), bad_host.files[path])
+
+        from scripts.stock_activation import states
+        saved = states.KNOWN_GOOD_SNAPSHOT
+        try:
+            for bad in (WORKTREE_PATH, "/tmp/not-backing/snap", BACKING_DIR + "/gen-1d9a377fa00c"):
+                states.KNOWN_GOOD_SNAPSHOT = bad
+                bad_host = make_happy_host()
+                bad_host.dashboard_mode = "ok-false"
+                _no_rollback_start(bad_host)
+        finally:
+            states.KNOWN_GOOD_SNAPSHOT = saved
+
+        writable = make_happy_host()
+        writable.dashboard_mode = "ok-false"
+        writable.rollback_snapshot_writable = True
+        _no_rollback_start(writable)
+
+        owned = make_happy_host()
+        owned.dashboard_mode = "ok-false"
+        owned.rollback_snapshot_uid = 1001
+        _no_rollback_start(owned)
+
+        replaceable = make_happy_host()
+        replaceable.dashboard_mode = "ok-false"
+        replaceable.rollback_denial_fail = True
+        _no_rollback_start(replaceable)
+
+    def test_journal_dir_oserror_stops_before_publish(self):
+        host = make_happy_host()
+        host.journal_dir_oserror = True
+        r = orchestrate(host, Request(target_sha=TARGET_SHA))
+        self.assertEqual(r.state, "stopped-unresolved")
+        self.assertEqual([e for e in host.log if e.startswith("rename:")], [])
+        self.assertEqual([e for e in host.log if e.startswith("start:")], [])
+        self.assertEqual([e for e in host.log if e.startswith("write-temp:")], [])
+        self.assertNotIn("dropins-read", r.journal)
+
+    def test_dropin_read_oserror_does_not_append_dropins_read(self):
+        host = make_happy_host()
+        host.dropin_oserror = True
+        r = orchestrate(host, Request(target_sha=TARGET_SHA))
+        self.assertEqual(r.state, "blocked-unread")
+        self.assertIn("blocked-unread", r.journal)
+        self.assertNotIn("dropins-read", r.journal)
+        self.assertEqual([e for e in host.log if e.startswith("rename:")], [])
+        self.assertEqual([e for e in host.log if e.startswith("start:")], [])
+
+    def test_proc_identity_oserror_does_not_spawn_rollback(self):
+        host = make_happy_host()
+        host.proc_identity_oserror = True
+        r = orchestrate(host, Request(target_sha=TARGET_SHA))
+        self.assertEqual(r.state, "stopped-unresolved")
+        self.assertNotIn("rolled-back", r.journal)
+        self.assertNotEqual(r.state, "committed")
+        starts = [e for e in host.log if e.startswith("start:")]
+        self.assertEqual(len(starts), 1)
+        idx = host.log.index(next(e for e in host.log if e.startswith("proc:")))
+        tail = host.log[idx + 1:]
+        self.assertEqual([e for e in tail if e.startswith("start:") or e.startswith("rename:") or e.startswith("write-temp:")], [])
+
+    def test_rollback_health_failure_stopped_unresolved(self):
+        host = make_happy_host()
+        host.dashboard_mode = "ok-false"
+        host.rollback_dashboard_mode = "ok-false"
+        r = orchestrate(host, Request(target_sha=TARGET_SHA))
+        self.assertEqual(r.state, "stopped-unresolved")
+        self.assertNotIn("rolled-back", r.journal)
+        starts = [e for e in host.log if e.startswith("start:")]
+        self.assertEqual(len(starts), 2)
+        rollback_probes = [e for e in host.log if e.startswith("dashboard:rollback:")]
+        self.assertEqual(len(rollback_probes), 1)
+        self.assertIn("|headers=[]", rollback_probes[0])
+        idx = host.log.index(rollback_probes[0])
+        self.assertEqual([e for e in host.log[idx + 1:] if e.startswith("start:")], [])
+        gw = make_happy_host()
+        gw.dashboard_mode = "ok-false"
+        gw.rollback_gateway_mode = "uid-mismatch"
+        rg = orchestrate(gw, Request(target_sha=TARGET_SHA))
+        self.assertEqual(rg.state, "stopped-unresolved")
+        self.assertNotIn("rolled-back", rg.journal)
+        self.assertEqual(len([e for e in gw.log if e.startswith("start:")]), 2)
 
     def test_B2_journal_root_owned(self):
         host = make_happy_host()

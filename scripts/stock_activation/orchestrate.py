@@ -9,6 +9,10 @@ from scripts.stock_activation import states as S
 from scripts.stock_activation import health as H
 
 
+class _ProcIdentityUnknown(Exception):
+    pass
+
+
 class Request:
     def __init__(self, target_sha):
         if not isinstance(target_sha, str) or not target_sha:
@@ -259,8 +263,10 @@ def _identity_ok(host, snapshot_str, worktree_path):
         pid = _unit_field(u, "MainPID", "main_pid", "MainPid", "pid")
         try:
             ident = host.proc_identity(pid)
-        except OSError:
-            return False
+        except OSError as exc:
+            raise _ProcIdentityUnknown from exc
+        if ident is None:
+            raise _ProcIdentityUnknown
         if isinstance(ident, dict):
             exe = ident.get("exe", "") or ""
             cmd = ident.get("cmdline", "") or ""
@@ -295,8 +301,10 @@ def _forbidden_loader_present(host):
         pid = _unit_field(u, "MainPID", "main_pid", "MainPid", "pid")
         try:
             ident = host.proc_identity(pid)
-        except OSError:
-            continue
+        except OSError as exc:
+            raise _ProcIdentityUnknown from exc
+        if ident is None:
+            raise _ProcIdentityUnknown
         if isinstance(ident, dict):
             keys = ident.get("environ_keys", ident.get("environ", []))
         else:
@@ -369,6 +377,22 @@ def _rollback(host, candidate_snapshot, known_good_snapshot, worktree_path):
         return "stopped-unresolved"
     if w:
         return "stopped-unresolved"
+    backing = _get("BACKING_DIR", "/var/lib/hermes-stock-activation/backing")
+    prefix = backing.rstrip("/") + "/"
+    if not isinstance(known_good_snapshot, str) or not known_good_snapshot.startswith(prefix):
+        return "stopped-unresolved"
+    if worktree_path and worktree_path in known_good_snapshot:
+        return "stopped-unresolved"
+    if "gen-1d9a377fa00c" in known_good_snapshot:
+        return "stopped-unresolved"
+    uid = ki.get("uid") if isinstance(ki, dict) else getattr(ki, "uid", None)
+    if uid != 0:
+        return "stopped-unresolved"
+    try:
+        if not _check_denial(host, known_good_snapshot):
+            return "stopped-unresolved"
+    except OSError:
+        return "stopped-unresolved"
     # publish known-good bytes (not WORKTREE_PATH), reload, one start,
     # readback inside known-good, health, append rolled-back
     try:
@@ -376,15 +400,19 @@ def _rollback(host, candidate_snapshot, known_good_snapshot, worktree_path):
     except OSError:
         _append(host, "durable-state-unknown: rollback-publish indeterminate")
         return "durable-state-unknown"
-    _append(host, "units-published-rollback") if False else None
-    # Note: happy path uses units-published; rollback path appends rolled-back at end.
-    # We reuse reload logic but must not append reloaded twice? For rollback we do reload+start.
+    try:
+        _append(host, "rolling-back")
+    except OSError:
+        return "durable-state-unknown"
     host.reload_manager()
     host.start_units(BOTH)
     # readback inside known-good snapshot: read_bytes? ensure exe/cmdline inside known-good
-    if not _identity_ok(host, known_good_snapshot, worktree_path):
+    try:
+        ident_ok = _identity_ok(host, known_good_snapshot, worktree_path)
+        forbidden = _forbidden_loader_present(host)
+    except _ProcIdentityUnknown:
         return "stopped-unresolved"
-    if _forbidden_loader_present(host):
+    if not ident_ok or forbidden:
         return "stopped-unresolved"
     # health
     if not _health_ok(host):
@@ -407,6 +435,10 @@ def _orchestrate_impl(host, target_sha=None):
         target_sha = TARGET_SHA
 
     states = _journal_states(host)
+    if states:
+        _last_base = states[-1].split(":")[0].strip() if isinstance(states[-1], str) else states[-1]
+        if _last_base == "rolling-back":
+            return "stopped-unresolved"
     if states and states[-1] == "committed":
         return "committed"
     for s in states:
@@ -454,7 +486,7 @@ def _orchestrate_impl(host, target_sha=None):
         if pw:
             return "stopped-unresolved: parent writable"
     except OSError:
-        pass
+        return "stopped-unresolved"
 
     # Recovery shortcuts based on journal end
     last = states[-1].split(":")[0].strip() if states else None
@@ -504,7 +536,8 @@ def _orchestrate_impl(host, target_sha=None):
             host.dropin_names(GATEWAY_UNIT)
             host.dropin_names(DASHBOARD_UNIT)
         except OSError:
-            pass
+            _append(host, "blocked-unread")
+            return "blocked-unread"
         _append(host, "dropins-read")
         cur = _journal_states(host)
         cur_bases = [c.split(":")[0].strip() for c in cur]
@@ -518,10 +551,15 @@ def _orchestrate_impl(host, target_sha=None):
     # handle recovery branches
     if cur_bases and cur_bases[-1] == "restarted":
         # readback and health only
-        if not _identity_ok(host, CANDIDATE_SNAPSHOT, WORKTREE_PATH):
+        try:
+            ident_ok = _identity_ok(host, CANDIDATE_SNAPSHOT, WORKTREE_PATH)
+            forbidden = _forbidden_loader_present(host)
+        except _ProcIdentityUnknown:
+            return "stopped-unresolved"
+        if not ident_ok:
             # rollback path
             return _rollback(host, CANDIDATE_SNAPSHOT, KNOWN_GOOD_SNAPSHOT, WORKTREE_PATH)
-        if _forbidden_loader_present(host):
+        if forbidden:
             return _rollback(host, CANDIDATE_SNAPSHOT, KNOWN_GOOD_SNAPSHOT, WORKTREE_PATH)
         if not _health_ok(host):
             return _rollback(host, CANDIDATE_SNAPSHOT, KNOWN_GOOD_SNAPSHOT, WORKTREE_PATH)
@@ -646,9 +684,14 @@ def _orchestrate_impl(host, target_sha=None):
         cur_bases = [c.split(":")[0].strip() for c in cur]
 
     if cur_bases and cur_bases[-1] == "restarted":
-        if not _identity_ok(host, CANDIDATE_SNAPSHOT, WORKTREE_PATH):
+        try:
+            ident_ok = _identity_ok(host, CANDIDATE_SNAPSHOT, WORKTREE_PATH)
+            forbidden = _forbidden_loader_present(host)
+        except _ProcIdentityUnknown:
+            return "stopped-unresolved"
+        if not ident_ok:
             return _rollback(host, CANDIDATE_SNAPSHOT, KNOWN_GOOD_SNAPSHOT, WORKTREE_PATH)
-        if _forbidden_loader_present(host):
+        if forbidden:
             return _rollback(host, CANDIDATE_SNAPSHOT, KNOWN_GOOD_SNAPSHOT, WORKTREE_PATH)
         if not _health_ok(host):
             return _rollback(host, CANDIDATE_SNAPSHOT, KNOWN_GOOD_SNAPSHOT, WORKTREE_PATH)
