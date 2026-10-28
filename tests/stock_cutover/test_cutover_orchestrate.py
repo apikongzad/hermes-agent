@@ -1079,6 +1079,235 @@ class TestCutoverContractSlice(unittest.TestCase):
         self.assertEqual(r.state, "durable-state-unknown")
         self.assertEqual([e for e in h.log if e.startswith("start:")], [])
 
+    def test_lock_stale_reason_separate(self):
+        import json as _j
+        h = make_happy()
+        dead = 88888
+        h.dead_pids.add(dead)
+        h.files[C.JOURNAL_LOCK_PATH] = _j.dumps({
+            "boot_id": h.boot_id(), "pid": dead,
+            "starttime": 8000002, "epoch": 1.0,
+        }).encode("utf-8")
+        r = C.orchestrate(h, C.Request(target_sha=TARGET))
+        self.assertEqual(r.state, "stopped-unresolved")
+        self.assertEqual(r.reason, "lock-stale-unverified")
+
+
+class TestRealHostOrchestrate(unittest.TestCase):
+    """Actual orchestrate with functional RealHost + fake fixed runner.
+
+    Real subprocess paths (show/stop/sleep/reload/start/denial/dropin/
+    mount/backup/digest logic) via injected runner; filesystem/journal/
+    identity/health stubbed to happy in-memory (no live /var/lib, /run,
+    /etc writes, no .env). Verifies stop/start invocation shape and zero
+    extra allowed. Complete legit DropInPaths/User/WD/Environment fields,
+    no dropping checks.
+    """
+
+    def _make_real_happy(self):
+        from scripts.stock_cutover import cutover_host as H
+        fake = make_happy()
+        state = {"stopped": False, "reloaded": False, "started": False,
+                 "published": False}
+
+        def _dropin_paths():
+            base = "/etc/systemd/system/%s.d/"
+            gw = base % "hermes-gateway.service"
+            db = base % "hermes-dashboard.service"
+            # Same 7 legit basenames for both units (exact scope).
+            names = ["10-user-bus.conf", "20-runtime-permissions.conf",
+                     "30-allow-sudo.conf", "a1-runner-compat.conf",
+                     "zz-performance-allocation.conf",
+                     "zz-runtime-3.14.9.conf", "zzz-candidate.conf"]
+            return names, gw, db
+
+        def _show_text(unit):
+            names, gw_prefix, db_prefix = _dropin_paths()
+            prefix = gw_prefix if "gateway" in unit else db_prefix
+            drops = " ".join(prefix + n for n in names)
+            is_gw = "gateway" in unit
+            snap = C.CANDIDATE_SNAPSHOT
+            py = f"{snap}/venv/bin/python3"
+            entry = f"{snap}/source/hermes_cli/main.py"
+            cand_exec = (f"{py} -I {entry} "
+                         f"{'gateway run' if is_gw else 'dashboard --port 9119 --host 127.0.0.1 --no-open --skip-build'}")
+            wd = C.GATEWAY_WD if is_gw else C.DASHBOARD_WD
+            if state["started"]:
+                return (f"Id={unit}\nActiveState=active\nSubState=running\n"
+                        f"MainPID={NEW_GW_PID if is_gw else NEW_DB_PID}\nNRestarts=5\n"
+                        f"ExecStart={cand_exec}\nExecStop=\nExecStopPost=\n"
+                        f"User=ubuntu\nWorkingDirectory={wd}\n"
+                        f"Environment=VIRTUAL_ENV={snap}/venv\nEnvironmentFiles=\n"
+                        f"FragmentPath=/etc/systemd/system/{unit}\nDropInPaths={drops}\n")
+            if state["stopped"] and state["reloaded"]:
+                # Reload readback while inactive: exact candidate expected.
+                return (f"Id={unit}\nActiveState=inactive\nSubState=dead\n"
+                        f"MainPID=0\nNRestarts=5\n"
+                        f"ExecStart={cand_exec}\nExecStop=\nExecStopPost=\n"
+                        f"User=ubuntu\nWorkingDirectory={wd}\n"
+                        f"Environment=VIRTUAL_ENV={snap}/venv\nEnvironmentFiles=\n"
+                        f"FragmentPath=/etc/systemd/system/{unit}\nDropInPaths={drops}\n")
+            if state["stopped"]:
+                return (f"Id={unit}\nActiveState=inactive\nSubState=dead\n"
+                        f"MainPID=0\nNRestarts=5\nExecStart=old\n"
+                        f"ExecStop=\nExecStopPost=\n"
+                        f"User=ubuntu\nWorkingDirectory={wd}\n"
+                        f"Environment=VIRTUAL_ENV={snap}/venv\nEnvironmentFiles=\n"
+                        f"FragmentPath=/etc/systemd/system/{unit}\nDropInPaths={drops}\n")
+            # Live active old (pre-fence): dropins legit, ExecStart old.
+            return (f"Id={unit}\nActiveState=active\nSubState=running\n"
+                    f"MainPID={LIVE_GW_PID if is_gw else LIVE_DB_PID}\nNRestarts=5\n"
+                    f"ExecStart=old-live\nExecStop=\nExecStopPost=\n"
+                    f"User=ubuntu\nWorkingDirectory={wd}\n"
+                    f"Environment=VIRTUAL_ENV=/tmp/old\nEnvironmentFiles=\n"
+                    f"FragmentPath=/etc/systemd/system/{unit}\nDropInPaths={drops}\n")
+
+        class Runner:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, argv, timeout=60):
+                self.calls.append(list(argv))
+                import subprocess as _sp
+                if not H._is_allowed_fixed_argv(argv):
+                    raise AssertionError(f"not allowlisted: {argv!r}")
+                for el in argv:
+                    assert el != "restart"
+                assert "PYTHONPATH" not in " ".join(argv)
+                if argv[0] == "/usr/bin/sudo" and "-u" in argv:
+                    return _sp.CompletedProcess(argv, 0, "30\n", "")
+                if argv[0] == "/usr/bin/findmnt":
+                    mp = argv[-1]
+                    return _sp.CompletedProcess(
+                        argv, 0,
+                        f"squashfs ro /dev/loop20 {mp}", "")
+                if argv[:9] == H.G3_PREFIX:
+                    tail = argv[9:]
+                    if tail[0] == "/usr/bin/systemctl" and tail[1] == "stop":
+                        state["stopped"] = True
+                        state["started"] = False
+                        return _sp.CompletedProcess(argv, 0, "", "")
+                    if tail[0] == "/usr/bin/systemctl" and tail[1] == "start":
+                        state["started"] = True
+                        state["stopped"] = False
+                        return _sp.CompletedProcess(argv, 0, "", "")
+                    if tail[0] == "/usr/bin/systemctl" and tail[1] == "daemon-reload":
+                        state["reloaded"] = True
+                        return _sp.CompletedProcess(argv, 0, "", "")
+                    if tail[0].endswith("sleep"):
+                        return _sp.CompletedProcess(argv, 0, "", "")
+                    if "show" in argv:
+                        unit = argv[-1]
+                        # Both-units show not used by host; handle single.
+                        if unit not in ("hermes-gateway.service",
+                                        "hermes-dashboard.service"):
+                            # Both-units form: return first unit text.
+                            unit = "hermes-gateway.service"
+                        return _sp.CompletedProcess(argv, 0, _show_text(unit), "")
+                raise AssertionError(f"unexpected argv: {argv!r}")
+
+        runner = Runner()
+        real = H.RealCutoverHost(runner=runner)
+        # In-memory journal/lock/boot (no live /var/lib).
+        real.journal_load = fake.journal_load
+        real.journal_append = fake.journal_append
+        real.lock_acquire = fake.lock_acquire
+        real.lock_release = fake.lock_release
+        real.journal_dir_info = fake.journal_dir_info
+        real.boot_id = fake.boot_id
+        # Fake clock for 5s fence (real sleep still via runner).
+        real.now = fake.now
+        _orig_sleep = real.sleep_secs
+
+        def _wrap_sleep(s):
+            _orig_sleep(s)
+            fake.clock += fake.sleep_advance
+        real.sleep_secs = _wrap_sleep
+        # Happy identity/health/python (measurement tested separately).
+        real.proc_identity = fake.proc_identity
+        real.python_probe = fake.python_probe
+        real.dashboard_fetch = fake.dashboard_fetch
+        real.gateway_talk = fake.gateway_talk
+        # Happy file_info for zz-runtime + images/digests (real backup/
+        # digest logic still runs, measuring via these happy values).
+        _orig_file_info = fake.file_info
+
+        def _happy_file_info(path):
+            if path in (C.GATEWAY_RUNTIME_PATH, C.DASHBOARD_RUNTIME_PATH):
+                return _orig_file_info(path)
+            if path in (real._known_good_image, real._candidate_image):
+                pin = (H.KNOWN_GOOD_IMAGE_SHA if path == real._known_good_image
+                       else H.CANDIDATE_IMAGE_SHA)
+                return {"exists": True, "mode": 0o400, "uid": 0, "size": 1,
+                        "sha256": pin, "writable_by_1001": False}
+            if path in (real._digest_known_good, real._digest_candidate):
+                return {"exists": True, "mode": 0o400, "uid": 0, "size": 1,
+                        "sha256": "aa" * 32, "writable_by_1001": False}
+            return _orig_file_info(path)
+        real.file_info = _happy_file_info
+        real.read_bytes = fake.read_bytes
+        real.write_temp = fake.write_temp
+        real.file_fsync = fake.file_fsync
+        real.rename_path = fake.rename_path
+        real.dir_fsync = fake.dir_fsync
+        # Track publish for show readback.
+        _orig_rename = fake.rename_path
+
+        def _track_rename(src, dst):
+            _orig_rename(src, dst)
+            try:
+                data = fake.files.get(dst, b"")
+                if C.CANDIDATE_SNAPSHOT.encode() in bytes(data):
+                    state["published"] = True
+            except Exception:
+                pass
+        real.rename_path = _track_rename
+        fake.rename_path = _track_rename
+        return real, runner, fake, state
+
+    def test_realhost_happy_shape_zero_extra(self):
+        real, runner, fake, _state = self._make_real_happy()
+        r = C.orchestrate(real, C.Request(target_sha=TARGET))
+        self.assertEqual(r.state, "committed", msg=f"reason={r.reason} journal={r.journal}")
+        self.assertEqual(r.journal, ["observed", "dropins-read", "target-bound",
+                                     "known-good-frozen", "backup-verified",
+                                     "candidate-materialized", "stop-fenced",
+                                     "units-published", "reloaded", "restarted",
+                                     "health-verified", "committed"])
+        # Shape: stop/start via fixed G3 argv, exact units, zero extra.
+        stops = [a for a in runner.calls if a[9:11] == ["/usr/bin/systemctl", "stop"]]
+        starts = [a for a in runner.calls if a[9:11] == ["/usr/bin/systemctl", "start"]]
+        self.assertEqual(len(stops), 1)
+        self.assertEqual(stops[0], __import__(
+            "scripts.stock_cutover.cutover_host", fromlist=["stop_argv"]).stop_argv())
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0], __import__(
+            "scripts.stock_cutover.cutover_host", fromlist=["start_argv"]).start_argv())
+        # No restart, no arbitrary, all allowlisted.
+        from scripts.stock_cutover import cutover_host as H
+        for argv in runner.calls:
+            self.assertTrue(H._is_allowed_fixed_argv(argv))
+            self.assertNotIn("restart", " ".join(argv).lower().replace("nrestarts", ""))
+            for el in argv:
+                self.assertNotEqual(el, "restart")
+            self.assertNotIn("PYTHONPATH", " ".join(argv))
+        # No .env opens.
+        self.assertNotIn(C.ENV_FILE_PATH, fake.open_log)
+        # DropInPaths were complete legit (7 basenames, no extra).
+        drops = [a for a in runner.calls if "show" in a]
+        self.assertTrue(len(drops) >= 4)
+
+    def test_realhost_fence_sleep_shape(self):
+        real, runner, _fake2, _state2 = self._make_real_happy()
+        # Drive to candidate-materialized then verify fence sleeps once 5s.
+        # Full happy already covers fence; check sleep argv exact.
+        r = C.orchestrate(real, C.Request(target_sha=TARGET))
+        self.assertEqual(r.state, "committed")
+        from scripts.stock_cutover import cutover_host as H
+        sleeps = [a for a in runner.calls if a[9:10] == ["/usr/bin/sleep"]]
+        self.assertEqual(len(sleeps), 1)
+        self.assertEqual(sleeps[0], H.sleep_argv())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -253,11 +253,12 @@ def _acquire_authority_lock(host):
     Uses host.lock_acquire() when present (O_EXCL+flock authority with
     epoch/boot semantics inside the host). Hosts without lock support
     raise OSError -> caller maps to durable/stopped. Returns True on
-    authority held by this invocation. Raises OSError if second writer
-    holds a live lock (same boot, holder proc alive). Stale holder
-    (dead pid, boot mismatch, pid reuse with different starttime) allows
-    takeover only after retained-journal verification by the caller;
-    this function itself only acquires, never pretends release after kill.
+    authority held by this invocation. Raises OSError('lock-held') if a
+    live holder owns it. Raises OSError('lock-stale-unverified') if the
+    holder is stale: the stale file is preserved, there is no automatic
+    takeover (exact stale->new handoff is not designed in accepted bytes,
+    no delete-then-create race invented here). Caller maps to stopped-unresolved
+    with the same reason. Never pretends release after kill.
     """
     acquire = getattr(host, "lock_acquire", None)
     if acquire is None:
@@ -1114,22 +1115,29 @@ def _recover_durable(host, states):
 
 def _orchestrate_impl(host, target_sha=None):
     # Authority lock before any journal/fence/publication. No second writer.
+    # Stale lock is preserved fail-closed (no delete-then-create race, no
+    # automatic takeover: exact stale->new authority handoff is not
+    # designed in accepted bytes). Receipts distinguish lock-held vs
+    # lock-stale-unverified (stale preserved). Atomic external recovery
+    # lock design is a later narrow-exact slice, not a broad generic.
     try:
         _acquire_authority_lock(host)
-    except OSError:
-        # Lock held by live holder: preserve prior legal state, no mutation.
+    except OSError as e:
+        msg = str(e)
+        reason = "lock-stale-unverified" if "lock-stale-unverified" in msg else "lock-held"
+        # Preserve prior legal state, no mutation, no takeover.
         try:
             cur = _journal_states(host)
         except OSError:
-            return "stopped-unresolved:lock-held"
+            return f"stopped-unresolved:{reason}"
         if cur:
             lastb = cur[-1].split(":")[0].strip() if isinstance(cur[-1], str) else str(cur[-1])
             if lastb in LEGAL_NEXT or lastb in HAPPY or lastb in ("stopped-unresolved", "blocked-unread", "rolled-back"):
                 # Preserve prior legal state tail; report lock as reason.
                 if lastb == "stopped-unresolved":
                     return cur[-1]
-                return "stopped-unresolved:lock-held"
-        return "stopped-unresolved:lock-held"
+                return f"stopped-unresolved:{reason}"
+        return f"stopped-unresolved:{reason}"
     try:
         return _orchestrate_locked(host, target_sha)
     finally:

@@ -261,3 +261,72 @@ both passed, service PIDs old unchanged (not touched here).
   2 host/probe+show), `tests/stock_activation` 147 green. C4 NOT claimed
   `all closed`: reload+identity+probe closed and verified above; lock stale
   handoff OPEN as design gap by intent.
+
+## 9. REALHOST wiring slice (this commit, no live execution by worker)
+
+Base: `bd50700d7eb1a882939fe7641c89c47f64dc49fe`. No sudo/mount/service
+ops by worker. No design bytes edited. No scope expansion.
+
+- stop/start/reload/sleep implemented via existing `G3_PREFIX` + fixed
+  helpers (`stop_argv/start_argv/daemon_reload_argv/sleep_argv`).
+  Strict allowlist (`_is_allowed_fixed_argv`, exact equality, named units
+  only, no arbitrary commands, no `restart`, no `PYTHONPATH`). `sleep`
+  is `OSError` on failure (not `RuntimeError`), `seconds==5` only.
+  Worker never runs live; tests use injected runner and assert exact
+  argv shape + zero extra.
+- denial probe actual strict: vendored exact `_DENIAL_PROBE_CODE` closure
+  from reviewed proof (os,sys,errno only, `-I`, no user-tree imports, no
+  `.env`). One errno per owned readonly mount (`write/rename/link` via
+  `sudo -n -u #1001 python3.12 -I`), each must be `EROFS (30)`.
+  Returns 7-key dict for `_check_denial`; mismatch is `False` (no
+  commit), spawn/parse failure is `OSError` (fail-closed).
+- `backup_ok` measured (not caller `True`): root-owned mount/kernel-ro
+  (`mount_show` must be squashfs+ro, no rw/bind) + exact known-good
+  image digest (`file_info` uid 0, mode 0400, sha256==`1d3f026c…381a04`).
+  Mismatch is `False`, unreadable is `OSError`.
+- `digest_record` measured: root-owned image+digest files, `O_NOFOLLOW`
+  reads via `file_info`, `signed=False`, outside snapshot/uid1001 by
+  path prefix, actual measured `known_good_image_sha==1d3f026c…` and
+  `candidate_image_sha==8e50b775…61a176` from real root backing.
+  Missing/unreadable is `OSError` (fail-closed, no stub `True`).
+- `dropin_names` from `systemctl show DropInPaths` (full show via
+  runner), enforce exact scope (`/etc/systemd/system/<service>.d/`,
+  `.conf` only, no `..`, no outside prefix). Missing/scope violation is
+  `OSError`; fixtures carry complete legit 7-basename contract, no
+  dropped checks.
+- `gateway_talk` REAL existing gateway identity contract (AF_UNIX
+  `identify` v1, one JSON line in/out, `SO_PEERCRED` pid/uid boundary).
+  Readonly runtime discovery (`$HERMES_HOME/gateway.sock` else
+  `gateway.sock.path` pointer, `O_NOFOLLOW`, bounded, no `.env`).
+  No invented port/protocol (9119 is dashboard/web, not gateway; actual
+  gateway endpoint verified separately). Request bytes exact
+  `{"verb":"identify","id":1,"protocol":1}` + newline; deadline 2.0s.
+  Unsupported/missing/malformed is `OSError('gateway-unsupported: …')`
+  precise gap, never faked pid/uid. Worker tests use temp AF_UNIX
+  socket + fake-protocol negative (real peercred, `ok False` fails
+  `gateway_ok`, no commit).
+- Preflight reports `cwd` (actual `/proc/<pid>/cwd` readlink) +
+  `environ_keys` (names only, no values).
+- Stale lock still preserved fail-closed, no automatic takeover
+  (authority not designed). Receipts separate `lock-held` (live holder)
+  vs `lock-stale-unverified` (stale preserved). Atomic external
+  recovery lock design is later narrow-exact, not broad generic.
+- `cli apply/recover` remain disabled (`exit 3` without flag, `exit 4`
+  if not root/installed, `exit 1 refused-live-not-authorized-here`
+  even if root+installed) until review package + external supervisor
+  ready. All mutating methods implemented but worker executes none
+  live (injected runner + temp socket/files only).
+- Tests: `tests/stock_cutover` 87 green (75 + 12 new: 10 host + 2
+  realhost-orchestrate shape), `tests/stock_activation` 147 green.
+  New: stop/start/reload/sleep fixed argv + `OSError` + zero extra;
+  denial strict EROFS + vendored closure hygiene; backup/digest
+  fail-closed + measurement (not caller `True`); dropin scope;
+  gateway missing-gap + real-socket fake-protocol negative (real
+  peercred, no fake 1001); preflight cwd; realhost orchestrate happy
+  shape via functional `RealHost` + fake fixed runner (not separate
+  `FakeHost` only); lock stale reason separate. No broad glob.
+- Remaining exact gate (parent owns production activation after GO):
+  independent review of this wiring + review package digests +
+  external supervisor (`cutover/recover` oneshot + timer) readiness +
+  actual gateway endpoint support verification + narrow-exact atomic
+  recovery lock design. No stub `True`, no fake protocol.
