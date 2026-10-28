@@ -192,11 +192,11 @@ class TestExactArgv(unittest.TestCase):
     def test_pins(self):
         self.assertEqual(cb.KNOWN_GOOD_REPO, "/home/ubuntu/.hermes/hermes-agent")
         self.assertEqual(cb.KNOWN_GOOD_SHA, "1d9a377fa00ce0e663e274e16b63c75e36233b9e")
-        self.assertIn("gen-1d9a377fa00c/venv", cb.KNOWN_GOOD_VENV_SRC)
-        self.assertIn("fb097378e0b9d4af/environments/3db97cb527a04c959b19c09c3c48bf7c/venv", cb.KNOWN_GOOD_DEPS_SRC)
+        self.assertEqual(cb.KNOWN_GOOD_VENV_SRC, "/home/ubuntu/.hermes/runtime/cutover-generations/gen-1d9a377fa00c/venv")
+        self.assertEqual(cb.KNOWN_GOOD_DEPS_SRC, "/home/ubuntu/.hermes/installs/fb097378e0b9d4af/environments/3db97cb527a04c959b19c09c3c48bf7c/venv")
         self.assertEqual(cb.CANDIDATE_REPO, "/home/ubuntu/.hermes/runtime/stock-candidates/daec3cd4c6d34f5befbc8f25a8af3e3b84b94f06")
         self.assertEqual(cb.CANDIDATE_SHA, "daec3cd4c6d34f5befbc8f25a8af3e3b84b94f06")
-        self.assertIn("gen-daec3cd4c6d3/venv", cb.CANDIDATE_VENV_SRC)
+        self.assertEqual(cb.CANDIDATE_VENV_SRC, "/home/ubuntu/.hermes/runtime/cutover-generations/gen-daec3cd4c6d3/venv")
 
     def test_candidate_no_deps_known_good_has_deps(self):
         kg = cb.known_good_plan()
@@ -216,6 +216,37 @@ class TestHost(unittest.TestCase):
         h = Host()
         with self.assertRaises(NotImplementedError):
             h.file_uid("/tmp/x")
+
+    def test_sandbox_temp_allowed(self):
+        self.assertTrue(issubclass(cb.SandboxHost, Host))
+        with tempfile.TemporaryDirectory() as td:
+            sandbox = os.path.join(td, "sandbox")
+            os.makedirs(sandbox)
+            host = cb.SandboxHost(sandbox)
+            uid = host.file_uid(sandbox)
+            self.assertIsInstance(uid, int)
+            self.assertNotIsInstance(uid, bool)
+            self.assertFalse(cb._is_live_path(sandbox))
+            self.assertFalse(cb._is_live_path("/home/ubuntu/.hermes/cache/scratch/abc-459595"))
+            for p in (
+                "/var/lib/hermes-stock-activation",
+                "/var/lib/hermes-stock-activation/backing/staging/x",
+                "/run/hermes-stock-activation",
+                "/run/hermes-stock-activation/known-good-snap",
+                "/home/ubuntu/.hermes",
+                "/home/ubuntu/.hermes/.env",
+                "/home/ubuntu/.hermes/hermes-agent",
+                "/home/ubuntu/.hermes/hermes-agent/venv",
+                "/home/ubuntu/.hermes/runtime",
+                "/home/ubuntu/.hermes/runtime/cutover-generations/gen-1d9a377fa00c/venv",
+                "/home/ubuntu/.hermes/installs",
+                "/home/ubuntu/.hermes/installs/fb097378e0b9d4af/environments/3db97cb527a04c959b19c09c3c48bf7c/venv",
+                "/home/ubuntu/.hermes/tools",
+                "/home/ubuntu/.hermes/tools/python-3.14.9+20261021-linux-arm64",
+            ):
+                self.assertTrue(cb._is_live_path(p), msg=p)
+            with self.assertRaises(cb.SandboxRefused):
+                cb.SandboxHost("/home/ubuntu/.hermes/hermes-agent")
 
     def test_exporter_missing_file_uid_zero_calls(self):
         class Empty:

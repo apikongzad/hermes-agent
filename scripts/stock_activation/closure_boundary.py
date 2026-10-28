@@ -4,6 +4,8 @@ import hashlib
 import os
 import stat
 
+from scripts.stock_activation.host import Host
+
 TOOLS_ROOT = "/home/ubuntu/.hermes/tools"
 _INTERPRETER_DIR_HEX = "707974686f6e2d332e31342e392b32303236313032312d6c696e75782d61726d3634"
 INTERPRETER_DIR_NAME = bytes.fromhex(_INTERPRETER_DIR_HEX).decode("ascii")
@@ -12,15 +14,15 @@ INTERPRETER_PREFIX = os.path.join(TOOLS_ROOT, INTERPRETER_DIR_NAME)
 LIVE_LIB = "/var/lib/hermes-stock-activation"
 LIVE_RUN = "/run/hermes-stock-activation"
 HERMES_HOME = "/home/ubuntu/.hermes"
-STOCK_CLONE = "/home/ubuntu/.hermes/runtime/stock-candidates/daec3cd4c6d34f5befbc8f25a8af3e3b84b94f06"
+STOCK_CLONE = "/home/ubuntu/.hermes/hermes-agent"
 
 KNOWN_GOOD_REPO = "/home/ubuntu/.hermes/hermes-agent"
 KNOWN_GOOD_SHA = "1d9a377fa00ce0e663e274e16b63c75e36233b9e"
-KNOWN_GOOD_VENV_SRC = "/home/ubuntu/.hermes/venvs/gen-1d9a377fa00c/venv"
-KNOWN_GOOD_DEPS_SRC = "/home/ubuntu/.hermes/venvs/fb097378e0b9d4af/environments/3db97cb527a04c959b19c09c3c48bf7c/venv"
+KNOWN_GOOD_VENV_SRC = "/home/ubuntu/.hermes/runtime/cutover-generations/gen-1d9a377fa00c/venv"
+KNOWN_GOOD_DEPS_SRC = "/home/ubuntu/.hermes/installs/fb097378e0b9d4af/environments/3db97cb527a04c959b19c09c3c48bf7c/venv"
 CANDIDATE_REPO = "/home/ubuntu/.hermes/runtime/stock-candidates/daec3cd4c6d34f5befbc8f25a8af3e3b84b94f06"
 CANDIDATE_SHA = "daec3cd4c6d34f5befbc8f25a8af3e3b84b94f06"
-CANDIDATE_VENV_SRC = "/home/ubuntu/.hermes/venvs/gen-daec3cd4c6d3/venv"
+CANDIDATE_VENV_SRC = "/home/ubuntu/.hermes/runtime/cutover-generations/gen-daec3cd4c6d3/venv"
 
 KNOWN_GOOD_IMAGE = "/var/lib/hermes-stock-activation/backing/known-good.squashfs"
 CANDIDATE_IMAGE = "/var/lib/hermes-stock-activation/backing/candidate.squashfs"
@@ -72,19 +74,34 @@ def _is_under(path, prefix):
 
 def _is_live_path(path):
     n = os.path.normpath(path)
-    for prefix in (LIVE_LIB, LIVE_RUN, HERMES_HOME, STOCK_CLONE):
+    for prefix in (
+        LIVE_LIB,
+        LIVE_RUN,
+        STOCK_CLONE,
+        HERMES_HOME + "/hermes-agent",
+        HERMES_HOME + "/runtime",
+        HERMES_HOME + "/installs",
+        HERMES_HOME + "/tools",
+    ):
         if _is_under(n, prefix):
             return True
+    if n == HERMES_HOME:
+        return True
+    if n == HERMES_HOME + "/.env":
+        return True
     return False
 
 
-class SandboxHost:
+class SandboxHost(Host):
     def __init__(self, sandbox_root):
         if not isinstance(sandbox_root, str):
             raise SandboxRefused("root type")
         if not os.path.isabs(sandbox_root):
             raise SandboxRefused("root not absolute")
-        self._root = os.path.normpath(sandbox_root)
+        norm = os.path.normpath(sandbox_root)
+        if _is_live_path(norm):
+            raise SandboxRefused("live root")
+        self._root = norm
 
     def _check(self, path):
         if not isinstance(path, str):
