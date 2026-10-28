@@ -148,6 +148,8 @@ class TestFailClosedParserContracts(unittest.TestCase):
     def test_mount_names_match_systemd_escape(self):
         # Correct escaped names or systemd-analyze verify refuses (Where mismatch).
         # Proves via real systemd-escape (bounded, no install), not grep-alone.
+        # Byte-level single-escape proof: repr shows \\ for one 0x5c byte;
+        # double-escaped would be \\\\ in repr and 0x5c 0x5c in bytes.
         for path, const in ((R.KNOWN_GOOD_MOUNT, R.KNOWN_GOOD_MOUNT_UNIT),
                             (R.CANDIDATE_MOUNT, R.CANDIDATE_MOUNT_UNIT)):
             cp = subprocess.run(
@@ -156,6 +158,16 @@ class TestFailClosedParserContracts(unittest.TestCase):
                 env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"})
             self.assertEqual(cp.returncode, 0, cp.stderr)
             self.assertEqual(cp.stdout.strip(), const)
+            # Complete fname byte comparison (not prefix-only).
+            self.assertEqual(cp.stdout.strip().encode("utf-8"), const.encode("utf-8"))
+            # Single backslash only: actual contains \x2d (one 0x5c), never \\.
+            self.assertIn("\\x2d", const)
+            self.assertNotIn("\\\\x2d", const)
+            self.assertNotIn(b"\x5c\x5c", const.encode("utf-8"))
+            # Expected escape counts: known-good 4, candidate 3.
+            want = 4 if "known" in path else 3
+            self.assertEqual(const.count("\\"), want)
+            self.assertEqual(const.count("\\x2d"), want)
 
     def test_validator_rejects_missing_prereq(self):
         cut = R.cutover_service_unit()
@@ -202,6 +214,161 @@ class TestFailClosedParserContracts(unittest.TestCase):
         bad8 = kgm.replace(R.GATEWAY_UNIT, "other.service")
         with self.assertRaises(ValueError):
             R.validate_mount_units(bad8, cdm)
+        # Cutover missing --execute-live (would exit 3, never execute) -> fail.
+        bad9 = cut.replace(" apply --execute-live", " apply")
+        with self.assertRaises(ValueError):
+            R.validate_supervision(bad9, rec, tim)
+        # Recover missing --execute-live -> fail.
+        bad10 = rec.replace(" recover --execute-live", " recover")
+        with self.assertRaises(ValueError):
+            R.validate_supervision(cut, bad10, tim)
+        # Substring without flag is insufficient: ExecStart line must be exact.
+        bad11 = cut.replace(
+            "ExecStart=/usr/bin/python3.12 -I /var/lib/hermes-stock-activation/recovery/cli.py apply --execute-live",
+            "ExecStart=/usr/bin/python3.12 -I /var/lib/hermes-stock-activation/recovery/cli.py apply")
+        with self.assertRaises(ValueError):
+            R.validate_supervision(bad11, rec, tim)
+        # OnFailure must be a separate exact line, not substring inside other text.
+        bad12 = cut.replace(
+            "OnFailure=hermes-stock-cutover-recover.service",
+            "# OnFailure=hermes-stock-cutover-recover.service")
+        with self.assertRaises(ValueError):
+            R.validate_supervision(bad12, rec, tim)
+        bad13 = cut.replace(
+            "OnFailure=hermes-stock-cutover-recover.service",
+            "XOnFailure=hermes-stock-cutover-recover.service")
+        with self.assertRaises(ValueError):
+            R.validate_supervision(bad13, rec, tim)
+        # Recover with OnFailure line (even commented as directive) -> fail.
+        bad14 = rec.replace("After=network.target",
+                            "After=network.target\nOnFailure=hermes-stock-cutover-recover.service")
+        with self.assertRaises(ValueError):
+            R.validate_supervision(cut, bad14, tim)
+
+    def test_execstart_exact_flag_via_parser(self):
+        # Exact full argv binding via parser (not grep-alone): rendered
+        # ExecStart must equal python -I program + subcommand + flag.
+        for text, sub in ((R.cutover_service_unit(), "apply"),
+                          (R.recover_service_unit(), "recover")):
+            secs = _parse_unit(text)
+            execs = _values(secs, "Service", "ExecStart")
+            self.assertEqual(len(execs), 1)
+            parts = execs[0].split()
+            self.assertEqual(parts, [R.PYTHON_BIN, "-I", R.RECOVERY_PROGRAM,
+                                     sub, "--execute-live"])
+        # Constants match rendered exact argv (no drift).
+        self.assertEqual(R.APPLY_ARGV,
+                         [R.PYTHON_BIN, "-I", R.RECOVERY_PROGRAM,
+                          "apply", "--execute-live"])
+        self.assertEqual(R.RECOVERY_ARGV,
+                         [R.PYTHON_BIN, "-I", R.RECOVERY_PROGRAM,
+                          "recover", "--execute-live"])
+
+    def test_render_execstart_traces_to_actual_cli(self):
+        # Trace render -> actual CLI: parsed ExecStart tail must be accepted
+        # past the flag gate (not exit 3), while unflagged refuses exit 3
+        # with no execution. Safe: worker uid 1001, HOME scratch only, no
+        # live systemctl/mount/service effects; flagged in worker exits 4
+        # (fails root/installed, no live ops), never 0/1 execution.
+        import sys as _sys
+        _sys.path.insert(0, ".")
+        try:
+            from scripts.stock_cutover import cli as _cli
+        finally:
+            try:
+                _sys.path.remove(".")
+            except ValueError:
+                pass
+        for text, sub in ((R.cutover_service_unit(), "apply"),
+                          (R.recover_service_unit(), "recover")):
+            secs = _parse_unit(text)
+            execs = _values(secs, "Service", "ExecStart")
+            self.assertEqual(len(execs), 1)
+            parts = execs[0].split()
+            # Rendered tail is [sub, --execute-live].
+            self.assertEqual(parts[-2:], [sub, "--execute-live"])
+            # Unflagged refuses exit 3, no execution.
+            self.assertEqual(_cli.main([sub]), 3)
+            # Flagged passes flag gate (not 3) but worker refuses exit 4,
+            # no live effects (not root/installed, no systemctl).
+            rc = _cli.main([sub, "--execute-live"])
+            self.assertNotEqual(rc, 3)
+            self.assertEqual(rc, 4)
+        # Exported CLI subprocess (real binary, temp HOME scratch, no live):
+        # unflagged rc3, flagged rc4 (accepted past flag only).
+        from scripts.stock_cutover import cutover_package as _E
+        scratch = _home_scratch("cli-flag-")
+        dest = os.path.join(scratch, "pkg")
+        _E.export_cutover_package(dest)
+        entry = os.path.join(scratch, "pkg", "cli.py")
+        env = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
+        for sub in ("apply", "recover"):
+            cp0 = subprocess.run(["/usr/bin/python3", "-I", entry, sub],
+                                 capture_output=True, text=True, check=False,
+                                 cwd=scratch, env=env)
+            self.assertEqual(cp0.returncode, 3, (sub, cp0.stdout, cp0.stderr))
+            cp1 = subprocess.run(["/usr/bin/python3", "-I", entry, sub, "--execute-live"],
+                                 capture_output=True, text=True, check=False,
+                                 cwd=scratch, env=env)
+            # Worker: passes flag gate, then fails root/installed (exit 4),
+            # never executes live (never 0/1).
+            self.assertEqual(cp1.returncode, 4, (sub, cp1.stdout, cp1.stderr))
+            self.assertNotIn("committed", cp1.stdout)
+
+    def test_dropin_requires_after_parser(self):
+        # Boot hard prereq must be effective for gateway/dashboard, not
+        # Before-only. Dropins carry [Unit] Requires+After both mounts.
+        # Parser-based (not grep-alone), only-named-override enforced.
+        from scripts.stock_cutover import cutover_units as _U
+        from scripts.stock_cutover import cutover_orchestrate as _C
+        for mod, gw_fn, db_fn, gw_wd, db_wd in (
+                (_U, _U.render_gateway_dropin, _U.render_dashboard_dropin,
+                 _U.GATEWAY_WD, _U.DASHBOARD_WD),
+                (_C, _C._render_gateway_dropin, _C._render_dashboard_dropin,
+                 _C.GATEWAY_WD, _C.DASHBOARD_WD)):
+            for fn, mount, wd in ((gw_fn, _U.CANDIDATE_MOUNT, gw_wd),
+                                  (db_fn, _U.CANDIDATE_MOUNT, db_wd),
+                                  (gw_fn, _U.KNOWN_GOOD_MOUNT, gw_wd),
+                                  (db_fn, _U.KNOWN_GOOD_MOUNT, db_wd)):
+                body = fn(mount)
+                text = body.decode("utf-8")
+                # Parse dropin sections manually (dropins have [Unit]+[Service]).
+                secs = {}
+                cur = None
+                for raw in text.splitlines():
+                    s = raw.strip()
+                    if not s:
+                        continue
+                    if s.startswith("[") and s.endswith("]"):
+                        cur = s[1:-1]
+                        secs.setdefault(cur, [])
+                        continue
+                    self.assertIsNotNone(cur)
+                    k, _, v = s.partition("=")
+                    secs[cur].append((k.strip(), v.strip()))
+                self.assertIn("Unit", secs)
+                self.assertIn("Service", secs)
+                reqs = [v for k, v in secs["Unit"] if k == "Requires"]
+                afts = [v for k, v in secs["Unit"] if k == "After"]
+                self.assertEqual(len(reqs), 1)
+                self.assertEqual(len(afts), 1)
+                for unit in (_U.KNOWN_GOOD_MOUNT_UNIT, _U.CANDIDATE_MOUNT_UNIT):
+                    self.assertIn(unit, reqs[0])
+                    self.assertIn(unit, afts[0])
+                # Only-named-override: Unit has only Requires/After.
+                for k, _v in secs["Unit"]:
+                    self.assertIn(k, ("Requires", "After"))
+                # No Condition/OnFailure/Restart in dropins.
+                for sec, pairs in secs.items():
+                    for k, _v in pairs:
+                        self.assertFalse(k.startswith("Condition"))
+                        self.assertNotEqual(k, "OnFailure")
+                        self.assertNotEqual(k, "Restart")
+                # Validators enforce the same contract.
+                if mod is _U:
+                    self.assertTrue(_U.validate_dropin_bytes(body, mount, wd))
+                else:
+                    self.assertTrue(_C._validate_dropin_bytes(body, mount, wd))
 
 
 class TestSystemdAnalyzeVerifyOffline(unittest.TestCase):

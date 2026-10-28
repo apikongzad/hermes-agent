@@ -46,6 +46,9 @@ VENV_OLD = "/home/ubuntu/.hermes/hermes-agent/venv"
 ENV_FILE_PATH = "/home/ubuntu/.hermes/.env"
 GATEWAY_WD = "/home/ubuntu/.hermes"
 DASHBOARD_WD = "/home/ubuntu"
+# Systemd-escaped mount unit names (must match cutover_units + recovery).
+KNOWN_GOOD_MOUNT_UNIT = r"run-hermes\x2dstock\x2dactivation-known\x2dgood\x2dsnap.mount"
+CANDIDATE_MOUNT_UNIT = r"run-hermes\x2dstock\x2dactivation-candidate\x2dsnap.mount"
 FORBIDDEN_LOADER_KEYS = (
     "PYTHONPATH",
     "PYTHONHOME",
@@ -86,8 +89,17 @@ def _dashboard_exec(mount):
     )
 
 
+def _unit_requires_after_lines():
+    return [
+        "[Unit]",
+        f"Requires={KNOWN_GOOD_MOUNT_UNIT} {CANDIDATE_MOUNT_UNIT}",
+        f"After={KNOWN_GOOD_MOUNT_UNIT} {CANDIDATE_MOUNT_UNIT}",
+        "",
+    ]
+
+
 def _render_gateway_dropin(mount):
-    lines = [
+    lines = _unit_requires_after_lines() + [
         "[Service]",
         "ExecStart=",
         f"ExecStart={_gateway_exec(mount)}",
@@ -100,7 +112,7 @@ def _render_gateway_dropin(mount):
 
 
 def _render_dashboard_dropin(mount):
-    lines = [
+    lines = _unit_requires_after_lines() + [
         "[Service]",
         "ExecStart=",
         f"ExecStart={_dashboard_exec(mount)}",
@@ -118,6 +130,34 @@ def _validate_dropin_bytes(data, mount, working_dir):
     text = bytes(data).decode("utf-8")
     if "[Service]" not in text:
         raise ValueError("missing Service")
+    if "[Unit]" not in text:
+        raise ValueError("missing Unit (Requires+After mount prereq required)")
+    _unit_lines = []
+    _in_unit = False
+    for raw in text.splitlines():
+        s = raw.strip()
+        if s.startswith("[") and s.endswith("]"):
+            _in_unit = (s == "[Unit]")
+            continue
+        if _in_unit and s:
+            _unit_lines.append(s)
+    _req = [v for v in _unit_lines if v.startswith("Requires=")]
+    _aft = [v for v in _unit_lines if v.startswith("After=")]
+    if len(_req) != 1 or KNOWN_GOOD_MOUNT_UNIT not in _req[0] or CANDIDATE_MOUNT_UNIT not in _req[0]:
+        raise ValueError("dropin Requires both mounts required")
+    if len(_aft) != 1 or KNOWN_GOOD_MOUNT_UNIT not in _aft[0] or CANDIDATE_MOUNT_UNIT not in _aft[0]:
+        raise ValueError("dropin After both mounts required")
+    for ln in _unit_lines:
+        if not (ln.startswith("Requires=") or ln.startswith("After=")):
+            raise ValueError("dropin Unit only-named-override: " + ln[:60])
+    for raw in text.splitlines():
+        s = raw.strip()
+        if s.startswith("Condition"):
+            raise ValueError("dropin Condition forbidden: " + s)
+        if s.startswith("OnFailure="):
+            raise ValueError("dropin OnFailure forbidden")
+        if s.startswith("Restart="):
+            raise ValueError("dropin Restart forbidden")
     for needle in ("ExecStart=\n", "ExecStop=\n", "ExecStopPost=\n",
                    "EnvironmentFile=\n"):
         if needle not in text:

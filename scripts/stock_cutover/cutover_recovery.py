@@ -49,8 +49,10 @@ DASHBOARD_UNIT = "hermes-dashboard.service"
 PYTHON_BIN = "/usr/bin/python3.12"
 
 # Fixed recovery argv: python -I recovery program, no worktree, no restart.
-RECOVERY_ARGV = [PYTHON_BIN, "-I", RECOVERY_PROGRAM, "recover"]
-APPLY_ARGV = [PYTHON_BIN, "-I", RECOVERY_PROGRAM, "apply"]
+# Includes --execute-live: systemd units must pass the CLI flag gate
+# (cli apply/recover without the flag exit 3 refusal, no live effects).
+RECOVERY_ARGV = [PYTHON_BIN, "-I", RECOVERY_PROGRAM, "recover", "--execute-live"]
+APPLY_ARGV = [PYTHON_BIN, "-I", RECOVERY_PROGRAM, "apply", "--execute-live"]
 
 
 def _cutover_after():
@@ -82,7 +84,9 @@ def cutover_service_unit():
     # timeouts. Mount deps: After+Requires both escaped mounts, Assert (NOT
     # Condition) for both snaps + both backing images so missing prereq
     # FAILS (failed + OnFailure) instead of skipping with success.
-    # OnFailure recover (no loop elsewhere). No systemctl restart argv;
+    # OnFailure recover (no loop elsewhere). ExecStart carries
+    # --execute-live: without it cli apply exits 3 refusal (no live
+    # effects), so the unit would never execute. No systemctl restart argv;
     # only stop/show/sleep5/daemon-reload/show/start via G3 launcher in the
     # program, never in units.
     return (
@@ -100,7 +104,7 @@ def cutover_service_unit():
         "Type=oneshot\n"
         "RemainAfterExit=no\n"
         "Restart=no\n"
-        f"ExecStart={PYTHON_BIN} -I {RECOVERY_PROGRAM} apply\n"
+        f"ExecStart={PYTHON_BIN} -I {RECOVERY_PROGRAM} apply --execute-live\n"
         "NoNewPrivileges=yes\n"
         "PrivateTmp=yes\n"
         "TimeoutStartSec=300\n"
@@ -120,6 +124,8 @@ def recover_service_unit():
     # on recovery itself would prevent that receipt, so it is forbidden.
     # Boot ordering still holds via mount Before=recover; independence is
     # via absence of Requires/Assert here. No OnFailure (no loop).
+    # ExecStart carries --execute-live: without it cli recover exits 3
+    # refusal (no live effects), so the unit would never execute.
     # Same hardening/timeouts as cutover.
     return (
         "[Unit]\n"
@@ -130,7 +136,7 @@ def recover_service_unit():
         "Type=oneshot\n"
         "RemainAfterExit=no\n"
         "Restart=no\n"
-        f"ExecStart={PYTHON_BIN} -I {RECOVERY_PROGRAM} recover\n"
+        f"ExecStart={PYTHON_BIN} -I {RECOVERY_PROGRAM} recover --execute-live\n"
         "NoNewPrivileges=yes\n"
         "PrivateTmp=yes\n"
         "TimeoutStartSec=300\n"
@@ -240,12 +246,18 @@ def unit_filenames():
 def validate_supervision(cutover_text, recover_text, timer_text):
     if not all(isinstance(t, str) for t in (cutover_text, recover_text, timer_text)):
         raise ValueError("unit type")
-    # Cutover must own recovery via OnFailure, not via restart.
-    if "OnFailure=hermes-stock-cutover-recover.service" not in cutover_text:
-        raise ValueError("missing OnFailure")
-    # Recover must NOT carry OnFailure (no OnFailure loop).
-    if "OnFailure=" in recover_text:
-        raise ValueError("recover must not have OnFailure")
+    # Cutover must own recovery via a separate external OnFailure line,
+    # not via restart and not via substring inside other text. Require an
+    # exact standalone line (line-exact, not `in` grep).
+    _cut_lines = [ln.strip() for ln in cutover_text.splitlines()]
+    if _cut_lines.count("OnFailure=hermes-stock-cutover-recover.service") != 1:
+        raise ValueError("missing OnFailure (separate exact line required)")
+    # Recover must NOT carry OnFailure (no OnFailure loop). Line-exact:
+    # any stripped line starting with OnFailure= refuses, even if the
+    # substring appears elsewhere it must not be a directive line.
+    for ln in recover_text.splitlines():
+        if ln.strip().startswith("OnFailure="):
+            raise ValueError("recover must not have OnFailure")
     if "Type=oneshot" not in cutover_text or "Type=oneshot" not in recover_text:
         raise ValueError("oneshot required")
     for bad in ("Restart=always", "Restart=on-failure", "systemctl restart",
@@ -309,10 +321,26 @@ def validate_supervision(cutover_text, recover_text, timer_text):
         raise ValueError("recover must not gate on snap paths")
     if KNOWN_GOOD_IMAGE in recover_text or CANDIDATE_IMAGE in recover_text:
         raise ValueError("recover must not gate on image paths")
-    # Fixed interpreter, -I, recovery path outside user trees.
-    for t in (cutover_text, recover_text):
-        if f"{PYTHON_BIN} -I {RECOVERY_PROGRAM}" not in t:
-            raise ValueError("recovery ExecStart")
+    # Fixed interpreter, -I, recovery path + subcommand + --execute-live.
+    # Exact full argv binding: without --execute-live cli apply/recover
+    # exit 3 refusal (no live effects), so units missing the flag would
+    # never execute. Substring without flag is insufficient; require the
+    # complete ExecStart line exactly.
+    _expect_cut_exec = f"ExecStart={PYTHON_BIN} -I {RECOVERY_PROGRAM} apply --execute-live"
+    _expect_rec_exec = f"ExecStart={PYTHON_BIN} -I {RECOVERY_PROGRAM} recover --execute-live"
+    _cut_exec_lines = [ln.strip() for ln in cutover_text.splitlines()
+                       if ln.strip().startswith("ExecStart=")]
+    _rec_exec_lines = [ln.strip() for ln in recover_text.splitlines()
+                       if ln.strip().startswith("ExecStart=")]
+    if _cut_exec_lines != [_expect_cut_exec]:
+        raise ValueError("cutover ExecStart must be exact full argv with --execute-live")
+    if _rec_exec_lines != [_expect_rec_exec]:
+        raise ValueError("recover ExecStart must be exact full argv with --execute-live")
+    # Constants must match the rendered exact argv (no drift).
+    if APPLY_ARGV != [PYTHON_BIN, "-I", RECOVERY_PROGRAM, "apply", "--execute-live"]:
+        raise ValueError("APPLY_ARGV must carry --execute-live")
+    if RECOVERY_ARGV != [PYTHON_BIN, "-I", RECOVERY_PROGRAM, "recover", "--execute-live"]:
+        raise ValueError("RECOVERY_ARGV must carry --execute-live")
     if "Unit=hermes-stock-cutover-recover.service" not in timer_text:
         raise ValueError("timer unit")
     if "OnBootSec=1min" not in timer_text:

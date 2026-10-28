@@ -548,6 +548,9 @@ class TestSupervision(unittest.TestCase):
         self.assertIn("Type=oneshot", rec)
         self.assertIn("/usr/bin/python3.12 -I /var/lib/hermes-stock-activation/recovery/cli.py", cut)
         self.assertIn("/usr/bin/python3.12 -I /var/lib/hermes-stock-activation/recovery/cli.py", rec)
+        # Exact full argv with --execute-live (missing flag would exit 3).
+        self.assertIn("ExecStart=/usr/bin/python3.12 -I /var/lib/hermes-stock-activation/recovery/cli.py apply --execute-live", cut)
+        self.assertIn("ExecStart=/usr/bin/python3.12 -I /var/lib/hermes-stock-activation/recovery/cli.py recover --execute-live", rec)
         self.assertIn("Unit=hermes-stock-cutover-recover.service", tim)
         for bad in ("Restart=always", "systemctl restart", "/home/ubuntu/worktrees",
                     "gen-1d9a377fa00c", "/home/ubuntu/.hermes/hermes-agent/venv"):
@@ -557,10 +560,12 @@ class TestSupervision(unittest.TestCase):
     def test_recovery_argv_fixed(self):
         self.assertEqual(R.RECOVERY_ARGV,
                          ["/usr/bin/python3.12", "-I",
-                          "/var/lib/hermes-stock-activation/recovery/cli.py", "recover"])
+                          "/var/lib/hermes-stock-activation/recovery/cli.py", "recover",
+                          "--execute-live"])
         self.assertEqual(R.APPLY_ARGV,
                          ["/usr/bin/python3.12", "-I",
-                          "/var/lib/hermes-stock-activation/recovery/cli.py", "apply"])
+                          "/var/lib/hermes-stock-activation/recovery/cli.py", "apply",
+                          "--execute-live"])
 
 
 class TestRunnerIdentityObject(unittest.TestCase):

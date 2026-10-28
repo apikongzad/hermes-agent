@@ -9,6 +9,9 @@ class TestCutoverUnits(unittest.TestCase):
         body = U.render_gateway_dropin(U.CANDIDATE_MOUNT)
         text = body.decode()
         self.assertIn("[Service]", text)
+        self.assertIn("[Unit]", text)
+        self.assertIn(f"Requires={U.KNOWN_GOOD_MOUNT_UNIT} {U.CANDIDATE_MOUNT_UNIT}", text)
+        self.assertIn(f"After={U.KNOWN_GOOD_MOUNT_UNIT} {U.CANDIDATE_MOUNT_UNIT}", text)
         self.assertIn("ExecStart=\n", text)
         self.assertIn("ExecStop=\n", text)
         self.assertIn("ExecStopPost=\n", text)
@@ -25,10 +28,14 @@ class TestCutoverUnits(unittest.TestCase):
         for k in U.FORBIDDEN_LOADER_KEYS:
             self.assertNotIn(k + "=", text)
         self.assertEqual(text.count("ExecStart="), 2)
+        self.assertTrue(U.validate_dropin_bytes(body, U.CANDIDATE_MOUNT, U.GATEWAY_WD))
 
     def test_dashboard_exact(self):
         body = U.render_dashboard_dropin(U.CANDIDATE_MOUNT)
         text = body.decode()
+        self.assertIn("[Unit]", text)
+        self.assertIn(f"Requires={U.KNOWN_GOOD_MOUNT_UNIT} {U.CANDIDATE_MOUNT_UNIT}", text)
+        self.assertIn(f"After={U.KNOWN_GOOD_MOUNT_UNIT} {U.CANDIDATE_MOUNT_UNIT}", text)
         self.assertIn(U.CANDIDATE_DASHBOARD_EXEC, text)
         self.assertIn("--port 9119", text)
         self.assertIn("--host 127.0.0.1", text)
@@ -38,6 +45,7 @@ class TestCutoverUnits(unittest.TestCase):
         self.assertNotIn(U.WORKTREE_PATH, text)
         self.assertNotIn("Authorization", text)
         self.assertEqual(text.count("ExecStart="), 2)
+        self.assertTrue(U.validate_dropin_bytes(body, U.CANDIDATE_MOUNT, U.DASHBOARD_WD))
 
     def test_known_good_mounts(self):
         self.assertEqual(U.KNOWN_GOOD_MOUNT, "/run/hermes-stock-activation/known-good-snap")
@@ -61,6 +69,13 @@ class TestCutoverUnits(unittest.TestCase):
         bad3 = good.replace(b"python3 -I", b"python3")
         with self.assertRaises(ValueError):
             U.validate_dropin_bytes(bad3, U.CANDIDATE_MOUNT, U.GATEWAY_WD)
+        # Missing [Unit] Requires+After must fail (Before-only is not effective).
+        bad4 = good.replace(f"Requires={U.KNOWN_GOOD_MOUNT_UNIT} {U.CANDIDATE_MOUNT_UNIT}\n".encode(), b"")
+        with self.assertRaises(ValueError):
+            U.validate_dropin_bytes(bad4, U.CANDIDATE_MOUNT, U.GATEWAY_WD)
+        bad5 = good.replace(f"After={U.KNOWN_GOOD_MOUNT_UNIT} {U.CANDIDATE_MOUNT_UNIT}\n".encode(), b"")
+        with self.assertRaises(ValueError):
+            U.validate_dropin_bytes(bad5, U.CANDIDATE_MOUNT, U.GATEWAY_WD)
 
 
 if __name__ == "__main__":

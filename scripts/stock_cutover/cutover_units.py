@@ -8,6 +8,11 @@ keys, no worktree/gen/.env/opt paths.
 
 KNOWN_GOOD_MOUNT = "/run/hermes-stock-activation/known-good-snap"
 CANDIDATE_MOUNT = "/run/hermes-stock-activation/candidate-snap"
+# Systemd-escaped mount unit names (systemd-escape -p --suffix=mount <Where>).
+# Raw strings so literal backslash-x2d escapes survive Python parsing.
+# Single backslash only (repr shows \\, bytes contain one 0x5c).
+KNOWN_GOOD_MOUNT_UNIT = r"run-hermes\x2dstock\x2dactivation-known\x2dgood\x2dsnap.mount"
+CANDIDATE_MOUNT_UNIT = r"run-hermes\x2dstock\x2dactivation-candidate\x2dsnap.mount"
 
 GATEWAY_WD = "/home/ubuntu/.hermes"
 DASHBOARD_WD = "/home/ubuntu"
@@ -81,8 +86,22 @@ CANDIDATE_DASHBOARD_EXEC = (
 )
 
 
+def _unit_requires_after_lines():
+    # Boot hard dependency: gateway/dashboard must not start when either
+    # backing mount failed. Mount Before= alone does not block gateway
+    # boot (WantedBy enables mount but does not hard-require for gateway);
+    # Requires+After in the dropin makes the prereq effective. Both mounts
+    # required (fail-closed: services cannot start invalid images).
+    return [
+        "[Unit]",
+        f"Requires={KNOWN_GOOD_MOUNT_UNIT} {CANDIDATE_MOUNT_UNIT}",
+        f"After={KNOWN_GOOD_MOUNT_UNIT} {CANDIDATE_MOUNT_UNIT}",
+        "",
+    ]
+
+
 def render_gateway_dropin(mount):
-    lines = [
+    lines = _unit_requires_after_lines() + [
         "[Service]",
         "ExecStart=",
         f"ExecStart={gateway_exec(mount)}",
@@ -95,7 +114,7 @@ def render_gateway_dropin(mount):
 
 
 def render_dashboard_dropin(mount):
-    lines = [
+    lines = _unit_requires_after_lines() + [
         "[Service]",
         "ExecStart=",
         f"ExecStart={dashboard_exec(mount)}",
@@ -122,6 +141,39 @@ def validate_dropin_bytes(data, mount, working_dir):
     text = bytes(data).decode("utf-8")
     if "[Service]" not in text:
         raise ValueError("missing Service")
+    if "[Unit]" not in text:
+        raise ValueError("missing Unit (Requires+After mount prereq required)")
+    # [Unit] Requires+After both escaped mounts (hard prereq, not Before-only).
+    # Line-exact, not substring: separate Requires=/After= lines required.
+    _unit_lines = []
+    _in_unit = False
+    for raw in text.splitlines():
+        s = raw.strip()
+        if s.startswith("[") and s.endswith("]"):
+            _in_unit = (s == "[Unit]")
+            continue
+        if _in_unit and s:
+            _unit_lines.append(s)
+    _req = [v for v in _unit_lines if v.startswith("Requires=")]
+    _aft = [v for v in _unit_lines if v.startswith("After=")]
+    if len(_req) != 1 or KNOWN_GOOD_MOUNT_UNIT not in _req[0] or CANDIDATE_MOUNT_UNIT not in _req[0]:
+        raise ValueError("dropin Requires both mounts required")
+    if len(_aft) != 1 or KNOWN_GOOD_MOUNT_UNIT not in _aft[0] or CANDIDATE_MOUNT_UNIT not in _aft[0]:
+        raise ValueError("dropin After both mounts required")
+    # Only-named-override contract: [Unit] may contain only Requires/After,
+    # [Service] only the named Exec/WD/EnvironmentFile keys. No broad scope,
+    # no Condition, no OnFailure in dropins (no loop), no Restart.
+    for ln in _unit_lines:
+        if not (ln.startswith("Requires=") or ln.startswith("After=")):
+            raise ValueError("dropin Unit only-named-override: " + ln[:60])
+    for raw in text.splitlines():
+        s = raw.strip()
+        if s.startswith("Condition"):
+            raise ValueError("dropin Condition forbidden: " + s)
+        if s.startswith("OnFailure="):
+            raise ValueError("dropin OnFailure forbidden")
+        if s.startswith("Restart="):
+            raise ValueError("dropin Restart forbidden")
     # Empty resets required.
     for needle in ("ExecStart=\n", "ExecStop=\n", "ExecStopPost=\n",
                    "EnvironmentFile=\n"):
