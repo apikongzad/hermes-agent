@@ -221,21 +221,31 @@ def _inactive(u):
 
 
 def _fence(host):
-    host.stop_units(BOTH)
-    a0 = host.show_unit(GATEWAY_UNIT)
-    b0 = host.show_unit(DASHBOARD_UNIT)
+    try:
+        host.stop_units(BOTH)
+        a0 = host.show_unit(GATEWAY_UNIT)
+        b0 = host.show_unit(DASHBOARD_UNIT)
+    except OSError:
+        return False
     ag0, ap0, an0 = _inactive(a0)
     bg0, bp0, bn0 = _inactive(b0)
     if ag0 != "inactive" or ap0 != 0:
         return False
     if bg0 != "inactive" or bp0 != 0:
         return False
-    t0 = host.now()
-    host.sleep_secs(5)
-    if host.now() - t0 < 5:
+    try:
+        t0 = host.now()
+        host.sleep_secs(5)
+        t1 = host.now()
+    except OSError:
         return False
-    a1 = host.show_unit(GATEWAY_UNIT)
-    b1 = host.show_unit(DASHBOARD_UNIT)
+    if t1 - t0 < 5:
+        return False
+    try:
+        a1 = host.show_unit(GATEWAY_UNIT)
+        b1 = host.show_unit(DASHBOARD_UNIT)
+    except OSError:
+        return False
     ag1, ap1, an1 = _inactive(a1)
     bg1, bp1, bn1 = _inactive(b1)
     if ag1 != "inactive" or ap1 != 0:
@@ -263,7 +273,10 @@ def _unit_field(u, *names):
 
 
 def _check_denial(host, path):
-    d = host.denial_probe(path)
+    try:
+        d = host.denial_probe(path)
+    except OSError:
+        return False
     if isinstance(d, dict):
         get = d.get
     else:
@@ -278,7 +291,10 @@ def _check_denial(host, path):
 
 
 def _check_python(host, py_path, snapshot):
-    p = host.python_probe(py_path)
+    try:
+        p = host.python_probe(py_path)
+    except OSError:
+        return False
     if isinstance(p, dict):
         def g(k, default=None):
             return p.get(k, default)
@@ -307,7 +323,10 @@ def _check_python(host, py_path, snapshot):
 
 
 def _check_digest(host):
-    r = host.digest_record()
+    try:
+        r = host.digest_record()
+    except OSError:
+        return False
     if isinstance(r, dict):
         def g(k, default=None):
             return r.get(k, default)
@@ -357,7 +376,10 @@ def _publish_snapshot(host, snapshot_str):
 
 def _identity_ok(host, snapshot_str, worktree_path):
     for unit in BOTH:
-        u = host.show_unit(unit)
+        try:
+            u = host.show_unit(unit)
+        except OSError:
+            raise _ProcIdentityUnknown
         pid = _unit_field(u, "MainPID", "main_pid", "MainPid", "pid")
         try:
             ident = host.proc_identity(pid)
@@ -392,7 +414,10 @@ def _forbidden_loader_present(host):
     except TypeError:
         return False
     for unit in BOTH:
-        u = host.show_unit(unit)
+        try:
+            u = host.show_unit(unit)
+        except OSError:
+            raise _ProcIdentityUnknown
         pid = _unit_field(u, "MainPID", "main_pid", "MainPid", "pid")
         try:
             ident = host.proc_identity(pid)
@@ -447,22 +472,34 @@ def gateway_ok(response, peer_pid, peer_uid, expected_pid):
 
 
 def _health_ok(host):
-    resp = host.dashboard_fetch(DASHBOARD_URL, {})
+    try:
+        resp = host.dashboard_fetch(DASHBOARD_URL, {})
+    except OSError:
+        return False
     if not isinstance(resp, dict):
         return False
     if not dashboard_ok(resp.get("status"), resp.get("content_type"), resp.get("body")):
         return False
-    gw = host.gateway_talk(GATEWAY_REQUEST_BYTES)
+    try:
+        gw = host.gateway_talk(GATEWAY_REQUEST_BYTES)
+    except OSError:
+        return False
     if not isinstance(gw, dict):
         return False
-    expected = _unit_field(host.show_unit(GATEWAY_UNIT), "MainPID", "main_pid", "MainPid")
+    try:
+        expected = _unit_field(host.show_unit(GATEWAY_UNIT), "MainPID", "main_pid", "MainPid")
+    except OSError:
+        return False
     return bool(gateway_ok(gw.get("response"), gw.get("peer_pid"), gw.get("peer_uid"), expected))
 
 
 def _do_reload_checks(host):
-    host.reload_manager()
-    gu = host.show_unit(GATEWAY_UNIT)
-    du = host.show_unit(DASHBOARD_UNIT)
+    try:
+        host.reload_manager()
+        gu = host.show_unit(GATEWAY_UNIT)
+        du = host.show_unit(DASHBOARD_UNIT)
+    except OSError:
+        return ("stopped-unresolved", "reload-unreadable")
     for u in (gu, du):
         ef = _unit_field(u, "EnvironmentFiles", "environment_files", "env_files")
         if ef:
@@ -518,8 +555,11 @@ def _rollback(host, candidate_snapshot, known_good_snapshot, worktree_path):
         _append(host, "rolling-back")
     except OSError:
         return "durable-state-unknown"
-    host.reload_manager()
-    host.start_units(BOTH)
+    try:
+        host.reload_manager()
+        host.start_units(BOTH)
+    except OSError:
+        return "stopped-unresolved"
     try:
         ident_ok = _identity_ok(host, known_good_snapshot, worktree_path)
         forbidden = _forbidden_loader_present(host)
@@ -726,7 +766,10 @@ def _orchestrate_impl(host, target_sha=None):
         cur = _journal_states(host)
         cur_bases = [c.split(":")[0].strip() for c in cur]
     if cur_bases and cur_bases[-1] == "reloaded":
-        host.start_units(BOTH)
+        try:
+            host.start_units(BOTH)
+        except OSError:
+            return "stopped-unresolved"
         _append(host, "restarted")
         cur = _journal_states(host)
         cur_bases = [c.split(":")[0].strip() for c in cur]

@@ -301,16 +301,16 @@ class RealCutoverHost(Host):
             return f.read().decode("utf-8").strip()
 
     def show_unit(self, unit):
-        raise RuntimeError("use _run_fixed show argv via parent supervisor")
+        raise OSError("use _run_fixed show argv via parent supervisor")
 
     def stop_units(self, units):
-        raise RuntimeError("use stop_argv via parent supervisor")
+        raise OSError("use stop_argv via parent supervisor")
 
     def start_units(self, units):
-        raise RuntimeError("use start_argv via parent supervisor")
+        raise OSError("use start_argv via parent supervisor")
 
     def reload_manager(self):
-        raise RuntimeError("use daemon_reload_argv via parent supervisor")
+        raise OSError("use daemon_reload_argv via parent supervisor")
 
     def read_bytes(self, path):
         _refuse_live_env(path)
@@ -421,16 +421,16 @@ class RealCutoverHost(Host):
         }
 
     def denial_probe(self, path):
-        raise RuntimeError("use sudo -u #1001 probe via parent supervisor")
+        raise OSError("use sudo -u #1001 probe via parent supervisor")
 
     def python_probe(self, python_exe):
-        raise RuntimeError("use snapshot python -I probe via parent supervisor")
+        raise OSError("use snapshot python -I probe via parent supervisor")
 
     def backup_ok(self):
-        raise RuntimeError("backup verified by parent out of band")
+        raise OSError("backup verified by parent out of band")
 
     def digest_record(self):
-        raise RuntimeError("digest verified by parent out of band")
+        raise OSError("digest verified by parent out of band")
 
     def dashboard_fetch(self, url, headers):
         if url != "http://127.0.0.1:9119/api/health":
@@ -454,14 +454,13 @@ class RealCutoverHost(Host):
 
     def gateway_talk(self, request_bytes):
         if request_bytes != b'{"verb":"identify","id":1,"protocol":1}\n':
-            raise RuntimeError("gateway bytes")
-        # AF_UNIX identify via gateway socket; path supplied by parent
-        # supervisor metadata, never guessed here. This method binds the
-        # socket path from the journaled unit WorkingDirectory.
-        raise RuntimeError("gateway socket bound by parent supervisor")
+            raise OSError("gateway bytes")
+        # AF_UNIX socket path is not named in accepted docs (precise gap).
+        # Parent binds the path from supervisor metadata; never guessed here.
+        raise OSError("gateway socket bound by parent supervisor")
 
     def dropin_names(self, service):
-        raise RuntimeError("use show DropInPaths via parent supervisor")
+        raise OSError("use show DropInPaths via parent supervisor")
 
     def file_uid(self, path):
         _refuse_live_env(path)
