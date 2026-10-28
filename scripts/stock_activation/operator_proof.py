@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import sys
 
 PROOF_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
@@ -281,6 +282,44 @@ def web_proof_argv(mount, port):
     ]
 
 
+def losetup_list_argv(loopdev):
+    return ["/usr/sbin/losetup", "--list", "--noheadings", "-O", "RO,BACK-FILE", "--", loopdev]
+
+
+def _dashboard_url(port):
+    try:
+        p = int(port)
+    except Exception:
+        raise ValueError("bad port")
+    if p in (9119, 4096):
+        raise ValueError("refused port")
+    return f"http://127.0.0.1:{p}/api/health"
+
+
+def _health_ok(status, content_type, body):
+    if status != 200:
+        return False
+    ctype = (content_type or "")
+    if not isinstance(ctype, str):
+        try:
+            ctype = str(ctype)
+        except Exception:
+            return False
+    if "application/json" not in ctype.lower():
+        return False
+    b = body
+    if isinstance(b, (bytes, str)):
+        try:
+            if isinstance(b, bytes):
+                b = b.decode("utf-8", "replace")
+            b = json.loads(b)
+        except Exception:
+            return False
+    if not isinstance(b, dict):
+        return False
+    return b.get("ok") is True
+
+
 def _sha256_file(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -314,8 +353,12 @@ def _gates_from_evidence(evidence):
     for k in required:
         if k not in evidence:
             return gates
-    for k in _GATES:
-        gates[k] = "EXECUTED"
+    # Caller-supplied evidence may only mark A1/C2, and only for EROFS + not writable.
+    # It must never mark CLI_PROOF, WEB_PROOF, MOUNT, PROVISION, or DIGEST.
+    if not _immutable_from_evidence(evidence):
+        return gates
+    gates["A1"] = "EXECUTED"
+    gates["C2"] = "EXECUTED"
     return gates
 
 
@@ -474,33 +517,22 @@ def build_portable_manifest(records, evidence=None):
             "signed": False,
             "activation": "UNEXECUTED",
         })
-    # global gates: use global evidence if it has executed+fields, else UNEXECUTED
+    # global gates: caller evidence may only mark A1/C2 via EROFS, never others.
     if isinstance(evidence, dict) and "executed" in evidence:
         gates = _gates_from_evidence(evidence)
     else:
-        # check per-record evidence: only if all images observed with full fields?
-        gates = gates_empty
-        # if every image has full evidence, mark executed
-        all_full = True
-        for img, rec in zip(images, records):
-            rec_ev = rec.get("evidence", rec.get("observations", rec.get("host_observation")))
-            ev = _evidence_for_kind(rec_ev, evidence, rec.get("kind"))
-            if not isinstance(ev, dict) or ev.get("executed") is not True:
-                all_full = False
-                break
-            for k in ("write_errno", "rename_errno", "link_errno", "backing_writable_by_1001"):
-                if k not in ev:
-                    all_full = False
+        gates = _gates_unexecuted()
+        if images:
+            all_imm = True
+            for img, rec in zip(images, records):
+                rec_ev = rec.get("evidence", rec.get("observations", rec.get("host_observation")))
+                ev = _evidence_for_kind(rec_ev, evidence, rec.get("kind"))
+                if not _immutable_from_evidence(ev):
+                    all_imm = False
                     break
-        if all_full and images:
-            tmp = {"executed": True, "write_errno": 30, "rename_errno": 30,
-                   "link_errno": 30, "backing_writable_by_1001": False}
-            # only mark gates executed if actual evidences are full EROFS? No,
-            # gates require executed+fields, not necessarily EROFS values.
-            # Recompute with first evidence merged.
-            gates = _gates_from_evidence({**tmp, **(evidence or {})}) if isinstance(evidence, dict) else _gates_from_evidence(tmp)
-            # Simpler: if all_full, gates EXECUTED
-            gates = {k: "EXECUTED" for k in _GATES}
+            if all_imm:
+                gates["A1"] = "EXECUTED"
+                gates["C2"] = "EXECUTED"
     global_imm = bool(images) and all(i.get("kernel_immutable") for i in images)
     return {
         "status": "manifest-ready",
@@ -746,6 +778,73 @@ def _lstat_mode_uid(host, path):
     return stat.S_IMODE(mode_full), uid, is_link, st
 
 
+def _lstat_full(host, path):
+    st = host.lstat(path)
+    if isinstance(st, dict):
+        mode = st.get("mode", st.get("st_mode"))
+        uid = st.get("uid", st.get("st_uid"))
+        gid = st.get("gid", st.get("st_gid", 0))
+        is_link = st.get("is_symlink", st.get("is_link", False))
+        if isinstance(mode, int):
+            # dict may hold full st_mode or already masked; normalize
+            try:
+                mode = stat.S_IMODE(mode)
+            except Exception:
+                pass
+        return mode, uid, gid, bool(is_link), st
+    mode_full = getattr(st, "st_mode", None)
+    uid = getattr(st, "st_uid", None)
+    gid = getattr(st, "st_gid", None)
+    if gid is None:
+        gid = 0
+    if mode_full is None:
+        return None, uid, gid, False, st
+    return stat.S_IMODE(mode_full), uid, gid, stat.S_ISLNK(mode_full), st
+
+
+def _backing_writable_by_1001_from_lstat(mode, uid, gid):
+    # False only when lstat proves uid 1001 cannot write; unknown -> True (writable)
+    try:
+        if mode is None:
+            return True
+        if mode & 0o002:
+            return True
+        if uid == 1001 and (mode & 0o200):
+            return True
+        if gid == 1001 and (mode & 0o020):
+            return True
+        return False
+    except Exception:
+        return True
+
+
+def _parse_losetup_list(out_s, dest):
+    try:
+        txt = out_s.strip()
+        if not txt:
+            return False
+        # --noheadings may still emit one line per device; require exactly one line
+        lines = [l for l in txt.splitlines() if l.strip()]
+        if len(lines) != 1:
+            return False
+        parts = lines[0].strip().split(None, 1)
+        if len(parts) != 2:
+            return False
+        ro, back = parts[0].strip(), parts[1].strip()
+        if ro != "1":
+            return False
+        if back != dest:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _digest_payload(kind, sha_hex):
+    return (json.dumps({"kind": kind, "sha256": sha_hex, "signed": False},
+                       sort_keys=True) + "\n").encode("utf-8")
+
+
 def _findmnt_ok(out_s, loop):
     if "squashfs" not in out_s:
         return False
@@ -823,11 +922,18 @@ def apply(host, records, ports, execute_commands=True):
                     "kernel_immutable": False, "gates": _gates_unexecuted(), "images": []}
     results = []
     overall_immutable = True
+    # Per-image observed flags for EXECUTED gates. Only this invocation counts.
+    prov_flags = []
+    mount_flags = []
+    a1c2_flags = []
+    cli_flags = []
+    web_flags = []
+    digest_flags = []
     for rec in records:
         kind = rec["kind"]
         src = rec["image_path"]
         expected = rec["expected_sha256"]
-        dest, mount, _digest = _dest_for_kind(kind)
+        dest, mount, digest_path = _dest_for_kind(kind)
         port = port_map.get(kind) if isinstance(port_map, dict) else None
         # destination present?
         dest_exists = True
@@ -846,7 +952,7 @@ def apply(host, records, ports, execute_commands=True):
         except Exception:
             dest_exists = False
         parent = os.path.dirname(dest)
-        # parent symlink check
+        # parent symlink check; parent lstat OSError is refusal, not "not a symlink"
         try:
             pst = host.lstat(parent)
             if isinstance(pst, dict):
@@ -861,16 +967,25 @@ def apply(host, records, ports, execute_commands=True):
         except FileNotFoundError:
             # parent missing -> need install
             parent_link = False
-        except OSError:
-            parent_link = False
-        # foreign owner refuses before mutation; never chmod to fix
+        except OSError as e:
+            # Any other parent lstat OSError is refusal (not "not a symlink").
+            if getattr(e, "errno", None) in (2,):
+                parent_link = False
+            else:
+                return {"status": "refused", "reason": "parent lstat",
+                        "signed": False, "activation": "UNEXECUTED",
+                        "service_cutover": "NOT_AUTHORIZED", "kernel_immutable": False,
+                        "gates": _gates_unexecuted(), "images": results}
+        # foreign owner / mode / symlink refuses before mutation; never chmod to fix
         if dest_exists:
             try:
-                _omode, _ouid, _olink, _ = _lstat_mode_uid(host, dest)
+                _omode, _ouid, _ogid, _olink, _ = _lstat_full(host, dest)
             except Exception:
-                _ouid = None
-                _olink = False
-            if _ouid is not None and _ouid != 0:
+                return {"status": "refused", "reason": "dest lstat",
+                        "signed": False, "activation": "UNEXECUTED",
+                        "service_cutover": "NOT_AUTHORIZED", "kernel_immutable": False,
+                        "gates": _gates_unexecuted(), "images": results}
+            if _olink or _ouid != 0 or _ogid != 0 or _omode != 0o400:
                 return {"status": "refused", "reason": "foreign owner",
                         "signed": False, "activation": "UNEXECUTED",
                         "service_cutover": "NOT_AUTHORIZED", "kernel_immutable": False,
@@ -878,11 +993,11 @@ def apply(host, records, ports, execute_commands=True):
         # idempotent check when dest exists
         if dest_exists:
             try:
-                dmode, duid, dlink, _ = _lstat_mode_uid(host, dest)
+                dmode, duid, dgid, dlink, _ = _lstat_full(host, dest)
                 dsha = host.sha256_file(dest)
             except (OSError, Exception):
-                dsha, dmode, duid = None, None, None
-            idem = (dsha == expected and dmode == 0o400 and duid == 0 and not dlink)
+                dsha, dmode, duid, dgid, dlink = None, None, None, None, None
+            idem = (dsha == expected and dmode == 0o400 and duid == 0 and dgid == 0 and not dlink)
             if idem:
                 # findmnt must show same RO loop
                 try:
@@ -897,6 +1012,25 @@ def apply(host, records, ports, execute_commands=True):
                         m = re.search(r"/dev/loop\d+", out_s)
                         loop_found = m.group(0) if m else ""
                         if loop_found and _findmnt_ok(out_s, loop_found):
+                            # Idempotent sha/mode/uid observed: PROVISION counts.
+                            # This invocation did not run losetup/mount/probes/cli/web/digest.
+                            prov_flags.append(True)
+                            mount_flags.append(False)
+                            a1c2_flags.append(False)
+                            cli_flags.append(False)
+                            web_flags.append(False)
+                            # Digest: check existing digest file matches without rewrite.
+                            try:
+                                _dmode, _duid, _dgid, _dlink, _ = _lstat_full(host, digest_path)
+                                _ddata = host.read_bytes(digest_path)
+                                _exp = _digest_payload(kind, expected)
+                                if (_ddata == _exp and _dmode == 0o400 and _duid == 0
+                                        and _dgid == 0 and not _dlink):
+                                    digest_flags.append(True)
+                                else:
+                                    digest_flags.append(False)
+                            except Exception:
+                                digest_flags.append(False)
                             results.append({"kind": kind, "status": "idempotent",
                                             "destination": dest, "mount": mount,
                                             "kernel_immutable": False, "observed": False})
@@ -912,12 +1046,23 @@ def apply(host, records, ports, execute_commands=True):
                         continue
                 except Exception:
                     pass
-        # install dirs when dest absent
+        # install dirs when dest absent; nonzero status is failure, not ignored
         if not dest_exists:
+            provision_this = False
             for d, mode in ((LIB_DIR, "0700"), (BACKING_DIR, "0700"),
                             (RUN_DIR, "0755"), (mount, "0755")):
                 if execute_commands:
-                    host.run(install_dir_argv(d, mode), PROOF_ENV)
+                    try:
+                        ires = host.run(install_dir_argv(d, mode), PROOF_ENV)
+                    except Exception:
+                        return {"status": "failed", "signed": False, "activation": "UNEXECUTED",
+                                "service_cutover": "NOT_AUTHORIZED", "kernel_immutable": False,
+                                "gates": _gates_unexecuted(), "images": results}
+                    irc, _, _ = _coerce_run_result(ires)
+                    if irc != 0:
+                        return {"status": "failed", "signed": False, "activation": "UNEXECUTED",
+                                "service_cutover": "NOT_AUTHORIZED", "kernel_immutable": False,
+                                "gates": _gates_unexecuted(), "images": results}
                 else:
                     # argv recording only: still record? For False mode tests expect
                     # commands recorded without run? Our contract: when False, do not call run.
@@ -935,6 +1080,7 @@ def apply(host, records, ports, execute_commands=True):
                 host.file_fsync(tmp)
                 host.rename_path(tmp, dest)
                 host.dir_fsync(parent)
+                provision_this = True
             except OSError:
                 return {"status": "durable-state-unknown", "signed": False,
                         "activation": "UNEXECUTED", "service_cutover": "NOT_AUTHORIZED",
@@ -943,6 +1089,10 @@ def apply(host, records, ports, execute_commands=True):
                 return {"status": "durable-state-unknown", "signed": False,
                         "activation": "UNEXECUTED", "service_cutover": "NOT_AUTHORIZED",
                         "kernel_immutable": False, "gates": _gates_unexecuted(), "images": results}
+        else:
+            # dest already matched sha but mount not idempotent: PROVISION counts
+            # via idempotent sha/mode/uid match (no copy needed in this invocation).
+            provision_this = True
         # losetup
         if not execute_commands:
             # argv recording mode: return commands without spawn
@@ -961,7 +1111,7 @@ def apply(host, records, ports, execute_commands=True):
                     "gates": _gates_unexecuted(), "images": results}
         lrc, lout, _le = _coerce_run_result(lres)
         loop = lout.strip().splitlines()
-        # must be one device
+        # must be one device and nonzero status is failure
         if lrc != 0 or len(loop) != 1:
             return {"status": "failed", "signed": False, "activation": "UNEXECUTED",
                     "service_cutover": "NOT_AUTHORIZED", "kernel_immutable": False,
@@ -971,9 +1121,28 @@ def apply(host, records, ports, execute_commands=True):
             return {"status": "failed", "signed": False, "activation": "UNEXECUTED",
                     "service_cutover": "NOT_AUTHORIZED", "kernel_immutable": False,
                     "gates": _gates_unexecuted(), "images": results}
-        # read-only back-file match: require loop output to be device only and
-        # backing sha still matches (we already checked). If host provides
-        # back-file info via extra attribute, check? Minimal: device format ok.
+        # Before mount: verify RO and BACK-FILE via losetup --list.
+        # Ignore of back-file is not allowed.
+        try:
+            llist = host.run(losetup_list_argv(loopdev), PROOF_ENV)
+        except Exception:
+            try:
+                host.run(losetup_detach_argv(loopdev), PROOF_ENV)
+            except Exception:
+                pass
+            return {"status": "failed", "signed": False, "activation": "UNEXECUTED",
+                    "service_cutover": "NOT_AUTHORIZED", "kernel_immutable": False,
+                    "gates": _gates_unexecuted(), "images": results}
+        llrc, llout, _lle = _coerce_run_result(llist)
+        if llrc != 0 or not _parse_losetup_list(llout, dest):
+            try:
+                host.run(losetup_detach_argv(loopdev), PROOF_ENV)
+            except Exception:
+                pass
+            return {"status": "failed", "signed": False, "activation": "UNEXECUTED",
+                    "service_cutover": "NOT_AUTHORIZED", "kernel_immutable": False,
+                    "gates": _gates_unexecuted(), "images": results}
+        mount_this = False
         try:
             mres = host.run(mount_argv(loopdev, mount), PROOF_ENV)
         except Exception:
@@ -1020,7 +1189,9 @@ def apply(host, records, ports, execute_commands=True):
             return {"status": "failed", "signed": False, "activation": "UNEXECUTED",
                     "service_cutover": "NOT_AUTHORIZED", "kernel_immutable": False,
                     "gates": _gates_unexecuted(), "images": results}
-        # denial probes
+        mount_this = True
+        # denial probes: A1/C2 only when errnos are EROFS and backing not writable
+        # by 1001 from lstat, not from caller flag.
         try:
             w = host.denial_probe(mount, "write")
             r = host.denial_probe(mount, "rename")
@@ -1052,15 +1223,19 @@ def apply(host, records, ports, execute_commands=True):
             return None
         w_e, r_e, l_e = _to_errno(w), _to_errno(r), _to_errno(li)
         imm = (w_e == errno.EROFS and r_e == errno.EROFS and l_e == errno.EROFS)
-        # backing not writable by 1001: dest uid 0 and no group/other write
+        # backing_writable_by_1001 from lstat, not caller flag.
         try:
-            bmode, buid, _bl, _bs = _lstat_mode_uid(host, dest)
-            if buid != 0 or (bmode is not None and (bmode & 0o022) != 0):
+            bmode, buid, bgid, _bl, _bs = _lstat_full(host, dest)
+            if _backing_writable_by_1001_from_lstat(bmode, buid, bgid):
+                imm = False
+            # also require dest still uid 0/gid 0 (already refused otherwise)
+            if buid != 0 or bgid != 0:
                 imm = False
         except Exception:
             imm = False
         if not imm:
             overall_immutable = False
+        a1c2_this = bool(imm)
         # CLI + web proof
         cli_ok = True
         for flag in ("--help", "--version"):
@@ -1073,23 +1248,57 @@ def apply(host, records, ports, execute_commands=True):
             if crc != 0:
                 cli_ok = False
                 break
-        web_ok = True
+        cli_this = bool(cli_ok)
+        web_this = False
+        dashboard_ok = True
         if cli_ok and port is not None:
             try:
                 wargv = web_proof_argv(mount, port)
             except ValueError:
-                web_ok = False
+                dashboard_ok = False
                 wargv = None
             if wargv is not None:
                 try:
                     wres = host.run(wargv, PROOF_ENV)
                 except Exception:
-                    web_ok = False
+                    dashboard_ok = False
                 else:
                     wrc, _wout, _we = _coerce_run_result(wres)
                     if wrc != 0:
-                        web_ok = False
-        if not (cli_ok and web_ok):
+                        dashboard_ok = False
+                    else:
+                        # Dashboard argv exit alone is not web proof.
+                        # Require health fetch 200 + json + ok true for WEB_PROOF.
+                        # Health failure leaves WEB_PROOF UNEXECUTED but does not
+                        # fail the overall apply (only dashboard argv failure does).
+                        try:
+                            hfn = getattr(host, "health_fetch", None)
+                            if not callable(hfn):
+                                web_this = False
+                            else:
+                                hres = hfn(_dashboard_url(port))
+                                if isinstance(hres, dict):
+                                    hs = hres.get("status")
+                                    hc = hres.get("content_type", hres.get("content-type", ""))
+                                    hb = hres.get("body")
+                                else:
+                                    hs = getattr(hres, "status", None)
+                                    hc = getattr(hres, "content_type", "")
+                                    hb = getattr(hres, "body", None)
+                                if _health_ok(hs, hc, hb):
+                                    web_this = True
+                                else:
+                                    web_this = False
+                        except Exception:
+                            web_this = False
+            # port None means no web proof attempted in this invocation
+            if port is None:
+                dashboard_ok = True
+                web_this = False
+        elif cli_ok and port is None:
+            dashboard_ok = True
+            web_this = False
+        if not (cli_ok and dashboard_ok):
             try:
                 host.run(umount_argv(mount), PROOF_ENV)
             except Exception:
@@ -1101,14 +1310,71 @@ def apply(host, records, ports, execute_commands=True):
             return {"status": "failed", "signed": False, "activation": "UNEXECUTED",
                     "service_cutover": "NOT_AUTHORIZED", "kernel_immutable": False,
                     "gates": _gates_unexecuted(), "images": results}
+        # DIGEST: unsigned digest file with signed false, fsync, rename, dir fsync,
+        # readback match, mode 0400. Write to reviewed digest path for kind.
+        digest_this = False
+        try:
+            exp_payload = _digest_payload(kind, expected)
+            # If existing digest already matches with 0400/uid0, count as observed.
+            try:
+                emode, euid, egid, elink, _ = _lstat_full(host, digest_path)
+                edata = host.read_bytes(digest_path)
+                if (edata == exp_payload and emode == 0o400 and euid == 0
+                        and egid == 0 and not elink):
+                    digest_this = True
+                else:
+                    raise OSError("digest mismatch")
+            except Exception:
+                # Need to write digest file.
+                dtmp = digest_path + ".tmp.operator-proof"
+                dparent = os.path.dirname(digest_path)
+                try:
+                    host.write_temp(dtmp, exp_payload)
+                    host.file_fsync(dtmp)
+                    host.rename_path(dtmp, digest_path)
+                    host.dir_fsync(dparent)
+                    rdata = host.read_bytes(digest_path)
+                    rmode, ruid, rgid, rlink, _ = _lstat_full(host, digest_path)
+                    if (rdata == exp_payload and rmode == 0o400 and ruid == 0
+                            and rgid == 0 and not rlink):
+                        digest_this = True
+                    else:
+                        digest_this = False
+                except Exception:
+                    digest_this = False
+        except Exception:
+            digest_this = False
+        prov_flags.append(bool(provision_this))
+        mount_flags.append(bool(mount_this))
+        a1c2_flags.append(bool(a1c2_this))
+        cli_flags.append(bool(cli_this))
+        web_flags.append(bool(web_this))
+        digest_flags.append(bool(digest_this))
         results.append({"kind": kind, "status": "applied", "destination": dest,
                         "mount": mount, "loop": loopdev,
                         "kernel_immutable": bool(imm), "observed": True})
     # never unlink journal: we never call unlink/remove
+    # Gates EXECUTED only when this invocation observed them for every applied image.
+    def _all(flags):
+        return bool(flags) and all(bool(x) for x in flags)
+    gates = _gates_unexecuted()
+    if _all(prov_flags):
+        gates["PROVISION"] = "EXECUTED"
+    if _all(mount_flags):
+        gates["MOUNT"] = "EXECUTED"
+    if _all(a1c2_flags):
+        gates["A1"] = "EXECUTED"
+        gates["C2"] = "EXECUTED"
+    if _all(cli_flags):
+        gates["CLI_PROOF"] = "EXECUTED"
+    if _all(web_flags):
+        gates["WEB_PROOF"] = "EXECUTED"
+    if _all(digest_flags):
+        gates["DIGEST"] = "EXECUTED"
     return {"status": "applied", "signed": False, "activation": "UNEXECUTED",
             "service_cutover": "NOT_AUTHORIZED",
             "kernel_immutable": bool(overall_immutable) if results else False,
-            "gates": _gates_unexecuted(), "images": results}
+            "gates": gates, "images": results}
 
 
 def recover(host, mounts):
@@ -1148,12 +1414,24 @@ def recover(host, mounts):
             out.append({"mount": mp, "status": "not-mounted"})
             continue
         try:
-            run(umount_argv(mp), PROOF_ENV)
+            ures = run(umount_argv(mp), PROOF_ENV)
         except Exception:
             return {"status": "stopped-unresolved", "images": out}
         try:
-            run(losetup_detach_argv(loopdev), PROOF_ENV)
+            urc, _, _ = _coerce_run_result(ures)
         except Exception:
+            return {"status": "stopped-unresolved", "images": out}
+        if urc != 0:
+            return {"status": "stopped-unresolved", "images": out}
+        try:
+            dres = run(losetup_detach_argv(loopdev), PROOF_ENV)
+        except Exception:
+            return {"status": "stopped-unresolved", "images": out}
+        try:
+            drc, _, _ = _coerce_run_result(dres)
+        except Exception:
+            return {"status": "stopped-unresolved", "images": out}
+        if drc != 0:
             return {"status": "stopped-unresolved", "images": out}
         out.append({"mount": mp, "status": "stopped", "loop": loopdev})
     # does not delete journal, no daemon
@@ -1189,6 +1467,347 @@ def _live_file_ok():
     if norm != RECOVERY_PREFIX and not norm.startswith(RECOVERY_PREFIX + "/"):
         return False, "path"
     return True, ""
+
+
+_DENIAL_PROBE_CODE = (
+    "import os,sys,errno\n"
+    "mount=sys.argv[1]\n"
+    "op=sys.argv[2]\n"
+    "wp=os.path.join(mount,'.proof-write-1001')\n"
+    "rs=os.path.join(mount,'.proof-rename-src-1001')\n"
+    "rd=os.path.join(mount,'.proof-rename-dst-1001')\n"
+    "ls=os.path.join(mount,'.proof-link-src-1001')\n"
+    "ld=os.path.join(mount,'.proof-link-dst-1001')\n"
+    "def _emit(n):\n"
+    "    print(n)\n"
+    "try:\n"
+    "    assert isinstance(mount,str) and isinstance(op,str)\n"
+    "    if op=='write':\n"
+    "        try:\n"
+    "            fd=os.open(wp,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)\n"
+    "        except OSError as e:\n"
+    "            _emit(e.errno or 1)\n"
+    "        else:\n"
+    "            try:\n"
+    "                os.close(fd)\n"
+    "            except Exception:\n"
+    "                pass\n"
+    "            try:\n"
+    "                os.unlink(wp)\n"
+    "            except Exception:\n"
+    "                pass\n"
+    "            _emit(0)\n"
+    "    elif op=='rename':\n"
+    "        try:\n"
+    "            os.rename(rs,rd)\n"
+    "            try:\n"
+    "                os.unlink(rd)\n"
+    "            except Exception:\n"
+    "                pass\n"
+    "            _emit(0)\n"
+    "        except OSError as e:\n"
+    "            if e.errno==errno.ENOENT:\n"
+    "                try:\n"
+    "                    fd=os.open(rs,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)\n"
+    "                except OSError as e2:\n"
+    "                    _emit(e2.errno or 1)\n"
+    "                else:\n"
+    "                    try:\n"
+    "                        os.close(fd)\n"
+    "                    except Exception:\n"
+    "                        pass\n"
+    "                    try:\n"
+    "                        os.rename(rs,rd)\n"
+    "                        _emit(0)\n"
+    "                        try:\n"
+    "                            os.unlink(rd)\n"
+    "                        except Exception:\n"
+    "                            pass\n"
+    "                    except OSError as e3:\n"
+    "                        _emit(e3.errno or 1)\n"
+    "                        try:\n"
+    "                            os.unlink(rs)\n"
+    "                        except Exception:\n"
+    "                            pass\n"
+    "            else:\n"
+    "                _emit(e.errno or 1)\n"
+    "    elif op=='link':\n"
+    "        try:\n"
+    "            fd=os.open(ls,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)\n"
+    "        except OSError as e2:\n"
+    "            if e2.errno!=errno.EEXIST:\n"
+    "                _emit(e2.errno or 1)\n"
+    "            else:\n"
+    "                pass\n"
+    "        else:\n"
+    "            try:\n"
+    "                os.close(fd)\n"
+    "            except Exception:\n"
+    "                pass\n"
+    "        try:\n"
+    "            try:\n"
+    "                os.unlink(ld)\n"
+    "            except FileNotFoundError:\n"
+    "                pass\n"
+    "            os.link(ls,ld)\n"
+    "            _emit(0)\n"
+    "            try:\n"
+    "                os.unlink(ls)\n"
+    "            except Exception:\n"
+    "                pass\n"
+    "            try:\n"
+    "                os.unlink(ld)\n"
+    "            except Exception:\n"
+    "                pass\n"
+    "        except OSError as e:\n"
+    "            _emit(e.errno or 1)\n"
+    "            try:\n"
+    "                os.unlink(ls)\n"
+    "            except Exception:\n"
+    "                pass\n"
+    "            try:\n"
+    "                os.unlink(ld)\n"
+    "            except Exception:\n"
+    "                pass\n"
+    "    else:\n"
+    "        _emit(1)\n"
+    "except Exception:\n"
+    "    print(1)\n"
+)
+
+
+class LiveProofHost:
+    """Stdlib live host. Uses os and subprocess only. Never imports scripts.stock_activation."""
+
+    def lstat(self, path):
+        if isinstance(path, bool):
+            raise TypeError("bool path refused")
+        return os.lstat(path)
+
+    def read_bytes(self, path):
+        if isinstance(path, bool):
+            raise TypeError("bool path refused")
+        with open(path, "rb") as f:
+            return f.read()
+
+    def sha256_file(self, path):
+        if isinstance(path, bool):
+            raise TypeError("bool path refused")
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while True:
+                b = f.read(65536)
+                if not b:
+                    break
+                h.update(b)
+        return h.hexdigest()
+
+    def write_temp(self, path, data):
+        if isinstance(path, bool):
+            raise TypeError("bool path refused")
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("data type")
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags, 0o400)
+        try:
+            view = bytes(data)
+            off = 0
+            while off < len(view):
+                n = os.write(fd, view[off:])
+                if n == 0:
+                    raise OSError("short write")
+                off += n
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        else:
+            os.close(fd)
+
+    def file_fsync(self, path):
+        if isinstance(path, bool):
+            raise TypeError("bool path refused")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def rename_path(self, src, dst):
+        if isinstance(src, bool) or isinstance(dst, bool):
+            raise TypeError("bool path refused")
+        os.rename(src, dst)
+
+    def dir_fsync(self, path):
+        if isinstance(path, bool):
+            raise TypeError("bool path refused")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def file_uid(self, path):
+        if isinstance(path, bool):
+            raise TypeError("bool path refused")
+        return os.lstat(path).st_uid
+
+    def run(self, argv, env):
+        if not isinstance(argv, list) or not argv or not all(isinstance(x, str) for x in argv):
+            raise RuntimeError("argv refused")
+        # Reject blocked basenames and forbidden path fragments in any element.
+        for el in argv:
+            base = os.path.basename(el)
+            if base in ("systemctl", "git", "sudo", "hermes"):
+                raise RuntimeError("blocked basename")
+            if "/opt" in el or "cutover_" in el:
+                raise RuntimeError("blocked path")
+        prog = argv[0]
+        if not os.path.isabs(prog):
+            raise RuntimeError("absolute required")
+        allowed_exact = {
+            "/usr/bin/install",
+            "/usr/sbin/losetup",
+            "/usr/bin/mount",
+            "/usr/bin/umount",
+            "/usr/bin/findmnt",
+        }
+        is_python = (
+            prog.startswith(RUN_DIR + "/")
+            and os.path.basename(prog) == "python3"
+            and len(argv) > 1
+            and argv[1] == "-I"
+        )
+        if prog not in allowed_exact and not is_python:
+            raise RuntimeError("not allowed")
+        if env != PROOF_ENV:
+            raise RuntimeError("env refused")
+        return subprocess.run(argv, shell=False, env=PROOF_ENV, capture_output=True, check=False)
+
+    def denial_probe(self, path, op):
+        if isinstance(path, bool):
+            raise TypeError("bool path refused")
+        if op not in ("write", "rename", "link"):
+            raise ValueError("op")
+        if not isinstance(path, str) or not path:
+            raise ValueError("path")
+        argv = [
+            "/usr/bin/sudo",
+            "-n",
+            "-u",
+            "#1001",
+            "/usr/bin/python3.12",
+            "-I",
+            "-c",
+            _DENIAL_PROBE_CODE,
+            path,
+            op,
+        ]
+        # Must not use systemctl; uses sudo + absolute python3.12 only.
+        for el in argv:
+            if "systemctl" in el:
+                raise RuntimeError("systemctl forbidden")
+        try:
+            cp = subprocess.run(argv, shell=False, env=PROOF_ENV,
+                                capture_output=True, check=False, timeout=15)
+        except Exception:
+            # If sudo/probe cannot run, return a non-EROFS errno so gates stay UNEXECUTED.
+            return 1
+        try:
+            out = cp.stdout.decode("utf-8", "replace").strip().split()
+            if not out:
+                return 1
+            return int(out[-1])
+        except Exception:
+            return 1
+
+    def health_fetch(self, url):
+        # Stdlib HTTP fetch for dashboard health. No systemctl, no sudo.
+        try:
+            import urllib.parse as _up
+            import http.client as _hc
+            p = _up.urlparse(url)
+            if p.scheme != "http" or p.hostname != "127.0.0.1":
+                return {"status": 0, "content_type": "", "body": None}
+            try:
+                port = p.port
+            except Exception:
+                return {"status": 0, "content_type": "", "body": None}
+            if port in (9119, 4096):
+                return {"status": 0, "content_type": "", "body": None}
+            path = p.path or "/"
+            if p.query:
+                path += "?" + p.query
+            conn = _hc.HTTPConnection("127.0.0.1", port, timeout=5)
+            try:
+                conn.request("GET", path, headers={"Accept": "application/json"})
+                resp = conn.getresponse()
+                status = resp.status
+                ctype = resp.getheader("Content-Type") or ""
+                raw = resp.read(1048576)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            try:
+                body = json.loads(raw.decode("utf-8", "replace"))
+            except Exception:
+                body = raw.decode("utf-8", "replace")
+            return {"status": status, "content_type": ctype, "body": body}
+        except Exception:
+            return {"status": 0, "content_type": "", "body": None}
+
+
+def _make_live_host():
+    return LiveProofHost()
+
+
+def _parse_live_records_ports(args):
+    records = []
+    ports = {}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--prep" and i + 1 < len(args):
+            cur = {"prep_path": args[i + 1]}
+            records.append(cur)
+            i += 2
+        elif a == "--image" and i + 1 < len(args):
+            if not records:
+                cur = {}
+                records.append(cur)
+            records[-1]["image_path"] = args[i + 1]
+            i += 2
+        elif a == "--expected-sha" and i + 1 < len(args):
+            if not records:
+                cur = {}
+                records.append(cur)
+            records[-1]["expected_sha256"] = args[i + 1]
+            i += 2
+        elif a == "--kind" and i + 1 < len(args):
+            if not records:
+                cur = {}
+                records.append(cur)
+            records[-1]["kind"] = args[i + 1]
+            i += 2
+        elif a == "--port" and i + 1 < len(args):
+            try:
+                pval = int(args[i + 1])
+            except Exception:
+                pval = args[i + 1]
+            if records and "kind" in records[-1]:
+                ports[records[-1]["kind"]] = pval
+            else:
+                ports[f"port{len(ports)}"] = pval
+            i += 2
+        elif a == "--execute-live":
+            i += 1
+        else:
+            i += 1
+    return records, ports
 
 
 def main(argv=None):
@@ -1276,10 +1895,32 @@ def main(argv=None):
         ok, _why = _live_file_ok()
         if not ok:
             return 4
-        # Live path would mutate; refuse by default via LiveRootHost semantics.
-        # To avoid accidental live effects in this runnerless entrypoint,
-        # do not proceed to real mutation here.
-        return 4
+        host = _make_live_host()
+        if cmd == "apply":
+            records, ports = _parse_live_records_ports(argv[1:])
+            res = apply(host, records, ports)
+            print(json.dumps(res, sort_keys=True, indent=2))
+            return 0 if res.get("status") == "applied" else 1
+        else:
+            mounts = []
+            i = 1
+            while i < len(argv):
+                a = argv[i]
+                if a == "--execute-live":
+                    i += 1
+                    continue
+                if a == "--mount" and i + 1 < len(argv):
+                    mounts.append(argv[i + 1])
+                    i += 2
+                    continue
+                if a.startswith("-"):
+                    i += 1
+                    continue
+                mounts.append(a)
+                i += 1
+            res = recover(host, mounts)
+            print(json.dumps(res, sort_keys=True, indent=2))
+            return 0 if res.get("status") in ("stopped", "not-mounted") else 1
     print("usage: operator_proof plan|apply|recover", file=sys.stderr)
     return 2
 

@@ -65,6 +65,7 @@ class FakeHost:
         self.cli_rc = 0
         self.web_rc = 0
         self.write_temp_calls = []
+        self.loop_to_image = {}
 
     def lstat(self, path):
         if path in self.live:
@@ -126,7 +127,24 @@ class FakeHost:
             return FakeResult(0, b"", b"")
         if argv[0] == "/usr/sbin/losetup" and "-d" in argv:
             return FakeResult(0, b"", b"")
+        if argv[0] == "/usr/sbin/losetup" and "--list" in argv:
+            loopdev = argv[-1]
+            img = self.loop_to_image.get(loopdev)
+            if img is None:
+                # derive from previous --find call if available
+                for logged in reversed(self.run_log):
+                    if logged[0] == "/usr/sbin/losetup" and "--find" in logged:
+                        img = logged[-1]
+                        break
+                if img is None:
+                    from scripts.stock_activation import operator_proof as _op
+                    img = _op.KNOWN_GOOD_DEST
+            return FakeResult(0, f"1 {img}\n".encode(), b"")
         if argv[0] == "/usr/sbin/losetup":
+            # --find --show --read-only --nooverlap -- <image>
+            img = argv[-1] if argv[-1].startswith("/") else None
+            if img is not None:
+                self.loop_to_image[self.losetup_device] = img
             return FakeResult(0, (self.losetup_device + "\n").encode(), b"")
         if argv[0] == "/usr/bin/mount":
             return FakeResult(0, b"", b"")
@@ -516,6 +534,137 @@ class OperatorProofTests(unittest.TestCase):
             recs = [{"kind": "known-good", "image_path": src, "prep_path": "p", "expected_sha256": _sha(b"x")}]
             res = m.apply(Bare(), recs, {})
             self.assertEqual(res["status"], "refused")
+
+
+class LiveEntrypointTests(unittest.TestCase):
+    def test_apply_execute_live_calls_apply_not_4(self):
+        m = _load_op()
+        # live factory must exist in this file (stdlib only, no scripts.stock_activation import)
+        self.assertTrue(hasattr(m, "LiveProofHost"), "LiveProofHost missing")
+        self.assertTrue(hasattr(m, "_make_live_host"), "host factory missing")
+        import os as _os
+        orig_geteuid = _os.geteuid
+        orig_ok = m._live_file_ok
+        orig_factory = m._make_live_host
+        orig_apply = m.apply
+        called = {}
+        fake_host = FakeHost(tempfile.gettempdir())
+        # health fetch stub so WEB gate could be evaluated without live net
+        fake_host.health_fetch = lambda url: {"status": 200, "content_type": "application/json", "body": {"ok": True}}
+        def fake_apply(host, records, ports, execute_commands=True):
+            called["yes"] = True
+            self.assertIs(host, fake_host)
+            return {"status": "applied", "signed": False, "activation": "UNEXECUTED",
+                    "service_cutover": "NOT_AUTHORIZED", "kernel_immutable": False,
+                    "gates": m._gates_unexecuted(), "images": []}
+        try:
+            _os.geteuid = lambda: 0
+            m._live_file_ok = lambda: (True, "")
+            m._make_live_host = lambda: fake_host
+            m.apply = fake_apply
+            with tempfile.TemporaryDirectory() as td:
+                src = os.path.join(td, "k.squashfs")
+                with open(src, "wb") as f:
+                    f.write(b"x")
+                h = _sha(b"x")
+                rc = m.main(["apply", "--execute-live",
+                             "--prep", os.path.join(td, "p.json"),
+                             "--image", src,
+                             "--expected-sha", h,
+                             "--kind", "known-good",
+                             "--port", "9120"])
+                self.assertTrue(called.get("yes"), "apply not called")
+                self.assertNotEqual(rc, 4)
+        finally:
+            _os.geteuid = orig_geteuid
+            m._live_file_ok = orig_ok
+            m._make_live_host = orig_factory
+            m.apply = orig_apply
+
+    def test_missing_execute_live_returns_3_no_host(self):
+        m = _load_op()
+        self.assertTrue(hasattr(m, "_make_live_host"), "host factory missing")
+        orig_factory = m._make_live_host
+        constructed = []
+        def boom():
+            constructed.append(1)
+            raise AssertionError("live host must not be constructed without --execute-live")
+        try:
+            m._make_live_host = boom
+            self.assertEqual(m.main(["apply"]), 3)
+            self.assertEqual(constructed, [])
+            self.assertEqual(m.main(["recover", "/x"]), 3)
+            self.assertEqual(constructed, [])
+        finally:
+            m._make_live_host = orig_factory
+
+
+class ExecutedGatesTests(unittest.TestCase):
+    def test_successful_fixture_apply_marks_only_performed(self):
+        m = _load_op()
+        with tempfile.TemporaryDirectory() as td:
+            data = b"gate-performed"
+            src = os.path.join(td, "k.squashfs")
+            with open(src, "wb") as f:
+                f.write(data)
+            h = _sha(data)
+            recs = [{"kind": "known-good", "image_path": src,
+                     "prep_path": os.path.join(td, "p.json"), "expected_sha256": h}]
+            host = FakeHost(td)
+            # fixture performs EROFS denials, cli ok, web argv ok, but no health_fetch
+            # and digest mode will be 0600 (not 0400) so those gates stay UNEXECUTED
+            res = m.apply(host, recs, {"known-good": 9120})
+            self.assertEqual(res["status"], "applied")
+            g = res["gates"]
+            # actually performed in this invocation
+            self.assertEqual(g["PROVISION"], "EXECUTED")
+            self.assertEqual(g["MOUNT"], "EXECUTED")
+            self.assertEqual(g["A1"], "EXECUTED")
+            self.assertEqual(g["C2"], "EXECUTED")
+            self.assertEqual(g["CLI_PROOF"], "EXECUTED")
+            # not performed: no health_fetch success, no 0400 digest
+            self.assertEqual(g["WEB_PROOF"], "UNEXECUTED")
+            self.assertEqual(g["DIGEST"], "UNEXECUTED")
+            self.assertEqual(res["activation"], "UNEXECUTED")
+            self.assertEqual(res["service_cutover"], "NOT_AUTHORIZED")
+
+    def test_caller_evidence_errno13_does_not_mark_A1(self):
+        m = _load_op()
+        ev = {"executed": True, "write_errno": 13, "rename_errno": 13,
+              "link_errno": 13, "backing_writable_by_1001": False}
+        self.assertFalse(m._immutable_from_evidence(ev))
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "k.squashfs")
+            with open(src, "wb") as f:
+                f.write(b"z13")
+            h = _sha(b"z13")
+            recs = [{"kind": "known-good", "image_path": src,
+                     "prep_path": os.path.join(td, "p.json"), "expected_sha256": h,
+                     "evidence": dict(ev)}]
+            man = m.build_portable_manifest(recs)
+            self.assertFalse(man["images"][0]["kernel_immutable"])
+            self.assertFalse(man["kernel_immutable"])
+            self.assertEqual(man["gates"]["A1"], "UNEXECUTED")
+            self.assertEqual(man["gates"]["C2"], "UNEXECUTED")
+            # caller evidence must never mark these
+            for k in ("CLI_PROOF", "WEB_PROOF", "MOUNT", "PROVISION", "DIGEST"):
+                self.assertEqual(man["gates"][k], "UNEXECUTED")
+        # live apply with EACCES denials must not mark A1/C2 either
+        with tempfile.TemporaryDirectory() as td:
+            data = b"img-eacces-gate"
+            src = os.path.join(td, "k.squashfs")
+            with open(src, "wb") as f:
+                f.write(data)
+            h = _sha(data)
+            recs = [{"kind": "known-good", "image_path": src,
+                     "prep_path": os.path.join(td, "p.json"), "expected_sha256": h}]
+            host = FakeHost(td)
+            host.denial = {"write": 13, "rename": 13, "link": 13}
+            res = m.apply(host, recs, {"known-good": 9120})
+            self.assertEqual(res["status"], "applied")
+            self.assertFalse(res["kernel_immutable"])
+            self.assertEqual(res["gates"]["A1"], "UNEXECUTED")
+            self.assertEqual(res["gates"]["C2"], "UNEXECUTED")
 
 
 def tearDownModule():
