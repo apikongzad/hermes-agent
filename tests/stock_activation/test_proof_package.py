@@ -43,6 +43,51 @@ def _load_exporter():
     return e
 
 
+def _snapshot_live_path(path):
+    """Read-only snapshot without opening private content.
+
+    Only lstat(target) + listdir(parent). Permission-denied is recorded
+    explicitly as unknown-permission, not as absent.
+    """
+    import errno as _errno
+
+    norm = os.path.normpath(path)
+    snap = {"path": norm}
+    try:
+        st = os.lstat(norm)
+        snap["lstat"] = {
+            "mode": stat.S_IMODE(st.st_mode),
+            "uid": st.st_uid,
+            "gid": st.st_gid,
+            "size": st.st_size,
+            "mtime_ns": st.st_mtime_ns,
+            "ino": st.st_ino,
+            "dev": st.st_dev,
+            "nlink": st.st_nlink,
+            "islink": bool(stat.S_ISLNK(st.st_mode)),
+            "isdir": bool(stat.S_ISDIR(st.st_mode)),
+        }
+        snap["lexists"] = True
+        snap["lstat_error"] = None
+    except OSError as e:
+        snap["lstat"] = None
+        snap["lstat_error"] = e.errno
+        if e.errno in (_errno.EACCES, _errno.EPERM):
+            snap["lexists"] = "unknown-permission"
+        elif e.errno == _errno.ENOENT:
+            snap["lexists"] = False
+        else:
+            snap["lexists"] = f"unknown-errno-{e.errno}"
+    try:
+        parent = os.path.dirname(norm)
+        snap["parent_entries"] = sorted(os.listdir(parent))
+        snap["parent_error"] = None
+    except OSError as e:
+        snap["parent_entries"] = None
+        snap["parent_error"] = e.errno
+    return snap
+
+
 class ProofPackageTests(unittest.TestCase):
     def test_export_creates_no_git_manifest_modes(self):
         e = _load_exporter()
@@ -175,8 +220,19 @@ class ProofPackageTests(unittest.TestCase):
 
     def test_exported_cli_refuses_live_deterministic(self):
         e = _load_exporter()
+        # Live may pre-exist from prior reviewed proof. Never delete live;
+        # snapshot metadata/state and prove unchanged. Fresh (absence) is
+        # covered by isolated home-scratch export, not by asserting absence
+        # of real authority paths. No private content opened.
+        live_paths = (
+            "/var/lib/hermes-stock-activation",
+            "/run/hermes-stock-activation",
+        )
+        before = {p: _snapshot_live_path(p) for p in live_paths}
         scratch = _home_scratch("refuse-")
         dest = os.path.join(scratch, "pkg")
+        # Isolated fresh fixture: dest must not pre-exist in home scratch.
+        self.assertFalse(os.path.lexists(dest))
         res = e.export_proof_package(dest)
         entry = res["entry"]
         for use_i in (True, False):
@@ -194,8 +250,10 @@ class ProofPackageTests(unittest.TestCase):
             cp2 = subprocess.run(argv2, capture_output=True, text=True, check=False,
                                  cwd=scratch, env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"})
             self.assertEqual(cp2.returncode, 3, (use_i, cp2.stdout, cp2.stderr))
-        # Must not have created live paths.
-        self.assertFalse(os.path.exists("/var/lib/hermes-stock-activation"))
+        # Must not have mutated live paths (refusal leaves state identical).
+        after = {p: _snapshot_live_path(p) for p in live_paths}
+        for p in live_paths:
+            self.assertEqual(before[p], after[p], msg=f"live mutated: {p}")
 
     def test_imports_bind_package_dir_pythonpath_isolation(self):
         e = _load_exporter()

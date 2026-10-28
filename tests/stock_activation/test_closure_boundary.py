@@ -552,8 +552,64 @@ class TestReadonly(unittest.TestCase):
         self.assertEqual(before.stdout, after.stdout)
 
 
+def _snapshot_live_path(path):
+    """Read-only snapshot of a live path without opening private content.
+
+    Only lstat(target) + listdir(parent) are used; never open/read files
+    inside the mount. Permission-denied is recorded explicitly as
+    unknown-permission, not as absent, so pre-existing provisioned state
+    from prior reviewed proof is preserved and proven unchanged.
+    """
+    import errno as _errno
+
+    norm = os.path.normpath(path)
+    snap = {"path": norm}
+    try:
+        st = os.lstat(norm)
+        snap["lstat"] = {
+            "mode": stat.S_IMODE(st.st_mode),
+            "uid": st.st_uid,
+            "gid": st.st_gid,
+            "size": st.st_size,
+            "mtime_ns": st.st_mtime_ns,
+            "ino": st.st_ino,
+            "dev": st.st_dev,
+            "nlink": st.st_nlink,
+            "islink": bool(stat.S_ISLNK(st.st_mode)),
+            "isdir": bool(stat.S_ISDIR(st.st_mode)),
+        }
+        snap["lexists"] = True
+        snap["lstat_error"] = None
+    except OSError as e:
+        snap["lstat"] = None
+        snap["lstat_error"] = e.errno
+        if e.errno in (_errno.EACCES, _errno.EPERM):
+            snap["lexists"] = "unknown-permission"
+        elif e.errno == _errno.ENOENT:
+            snap["lexists"] = False
+        else:
+            snap["lexists"] = f"unknown-errno-{e.errno}"
+    try:
+        parent = os.path.dirname(norm)
+        snap["parent_entries"] = sorted(os.listdir(parent))
+        snap["parent_error"] = None
+    except OSError as e:
+        snap["parent_entries"] = None
+        snap["parent_error"] = e.errno
+    return snap
+
+
 class TestSquashfs(unittest.TestCase):
     def test_mksquashfs_unsquashfs(self):
+        # Live may pre-exist from prior reviewed proof (loop20/21).
+        # Never delete live to make fixture green; snapshot and prove
+        # unchanged. Fresh (absence) is covered by isolated temp img
+        # below, not by asserting absence of real authority paths.
+        live_paths = (
+            "/var/lib/hermes-stock-activation/backing/staging",
+            "/run/hermes-stock-activation/known-good-snap",
+        )
+        before = {p: _snapshot_live_path(p) for p in live_paths}
         with tempfile.TemporaryDirectory() as td:
             staged = os.path.join(td, "staged")
             os.makedirs(os.path.join(staged, "source", "hermes_cli"))
@@ -589,8 +645,13 @@ class TestSquashfs(unittest.TestCase):
                             out.append((rel, "dir", ""))
                 return sorted(out)
             self.assertEqual(manifest(staged), manifest(dest))
-            self.assertFalse(os.path.exists("/var/lib/hermes-stock-activation/backing/staging"))
-            self.assertFalse(os.path.exists("/run/hermes-stock-activation/known-good-snap"))
+            # No host mutation: isolated mksquashfs/unsquashfs must leave
+            # pre-existing live state byte-identical (metadata/state).
+            # Do not open root-private content; parent metadata readback
+            # above is sufficient, unknown-permission stays explicit.
+            after = {p: _snapshot_live_path(p) for p in live_paths}
+            for p in live_paths:
+                self.assertEqual(before[p], after[p], msg=f"live mutated: {p}")
 
 
 if __name__ == "__main__":

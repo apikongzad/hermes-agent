@@ -143,26 +143,106 @@ def list_images(stage):
     return out
 
 
+def _snapshot_live_path(path):
+    """Read-only snapshot without opening private content.
+
+    Only lstat(target) + listdir(parent). Permission-denied is recorded
+    explicitly as unknown-permission, not as absent.
+    """
+    import errno as _errno
+
+    norm = os.path.normpath(path)
+    snap = {"path": norm}
+    try:
+        st = os.lstat(norm)
+        snap["lstat"] = {
+            "mode": stat.S_IMODE(st.st_mode),
+            "uid": st.st_uid,
+            "gid": st.st_gid,
+            "size": st.st_size,
+            "mtime_ns": st.st_mtime_ns,
+            "ino": st.st_ino,
+            "dev": st.st_dev,
+            "nlink": st.st_nlink,
+            "islink": bool(stat.S_ISLNK(st.st_mode)),
+            "isdir": bool(stat.S_ISDIR(st.st_mode)),
+        }
+        snap["lexists"] = True
+        snap["lstat_error"] = None
+    except OSError as e:
+        snap["lstat"] = None
+        snap["lstat_error"] = e.errno
+        if e.errno in (_errno.EACCES, _errno.EPERM):
+            snap["lexists"] = "unknown-permission"
+        elif e.errno == _errno.ENOENT:
+            snap["lexists"] = False
+        else:
+            snap["lexists"] = f"unknown-errno-{e.errno}"
+    try:
+        parent = os.path.dirname(norm)
+        snap["parent_entries"] = sorted(os.listdir(parent))
+        snap["parent_error"] = None
+    except OSError as e:
+        snap["parent_entries"] = None
+        snap["parent_error"] = e.errno
+    return snap
+
+
+class _RefuseRunner:
+    """Injected backend that must never be called for refused stages."""
+
+    def __init__(self):
+        self.calls = []
+
+    def run(self, argv, env=None):
+        self.calls.append(list(argv))
+        raise AssertionError("backend must not run for refused stage")
+
+
 class TestRefusals(unittest.TestCase):
     def test_live_protected_refused_zero_images(self):
         from scripts.stock_activation.prep_export import export_prep_closure
         with tempfile.TemporaryDirectory() as td:
             repo, sha, venv_src, interp_src, deps_src = build_basic(os.path.join(td, "fix"))
-            # Non-existent protected paths must refuse and not be created.
+            # Live may pre-exist from prior reviewed proof. Never delete live;
+            # snapshot metadata/state and prove unchanged before/after.
+            # Fresh (absence) is covered by isolated missing-stage fixture
+            # below, not by asserting absence of real authority paths.
+            # Injected backend must stay unused for refused stages.
             for protected in (
                 "/var/lib/hermes-stock-activation",
                 "/run/hermes-stock-activation",
                 "/var/lib/hermes-stock-activation/backing/staging/nope-c040",
             ):
-                self.assertFalse(os.path.lexists(protected))
+                before = _snapshot_live_path(protected)
+                runner = _RefuseRunner()
                 res = export_prep_closure(
                     protected, kind="known-good", source_repo=repo, source_sha=sha,
                     venv_src=venv_src, interpreter_src=interp_src, deps_src=deps_src,
                     finder_prefixes=[FINDER_ORIG], mount_prefix=MOUNT_KNOWN,
+                    runner=runner,
                 )
                 self.assertEqual(res["status"], "prep-refused")
                 self.assertFalse(res["success"])
-                self.assertFalse(os.path.lexists(protected))
+                self.assertIsNone(res["image_path"])
+                self.assertIsNone(res["image_sha256"])
+                self.assertEqual(runner.calls, [])
+                after = _snapshot_live_path(protected)
+                self.assertEqual(before, after, msg=f"live mutated: {protected}")
+            # Isolated absence fixture: non-existent temp stage must refuse
+            # and not be created (fresh case without real authority).
+            missing = os.path.join(td, "missing-stage-c040")
+            self.assertFalse(os.path.lexists(missing))
+            runner2 = _RefuseRunner()
+            res_missing = export_prep_closure(
+                missing, kind="known-good", source_repo=repo, source_sha=sha,
+                venv_src=venv_src, interpreter_src=interp_src, deps_src=deps_src,
+                finder_prefixes=[FINDER_ORIG], mount_prefix=MOUNT_KNOWN,
+                runner=runner2,
+            )
+            self.assertEqual(res_missing["status"], "prep-refused")
+            self.assertFalse(res_missing["success"])
+            self.assertFalse(os.path.lexists(missing))
             # Existing stage under source_repo is protected (extra_forbidden).
             stage_inside = os.path.join(repo, "stage-inside")
             os.makedirs(stage_inside, exist_ok=True)
