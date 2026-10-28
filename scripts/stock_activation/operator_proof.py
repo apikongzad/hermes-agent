@@ -10,8 +10,99 @@ import os
 import stat
 import subprocess
 import sys
+import time
 
 PROOF_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
+
+PROOF_HOME_LIVE_DEFAULT = "/var/lib/hermes-stock-activation/proof-home"
+_WEB_PROOF_TIMEOUT_SECS = 20.0
+_WEB_POLL_INTERVAL_SECS = 0.2
+_STOP_WAIT_SECS = 5.0
+
+
+def _proof_home_refused(path):
+    if isinstance(path, bool):
+        return True
+    if not isinstance(path, str) or not path:
+        return True
+    if not os.path.isabs(path):
+        return True
+    norm = os.path.normpath(path)
+    if norm in ("/home/ubuntu", "/home/ubuntu/.hermes"):
+        return True
+    if ".env" in norm:
+        return True
+    return False
+
+
+def _proof_env_for(proof_home):
+    env = dict(PROOF_ENV)
+    env["HOME"] = proof_home
+    env["HERMES_HOME"] = proof_home
+    return env
+
+
+def _env_is_proof_env(env):
+    if not isinstance(env, dict):
+        return False
+    if env.get("PATH") != PROOF_ENV["PATH"]:
+        return False
+    if env.get("LANG") != PROOF_ENV["LANG"]:
+        return False
+    if env.get("LC_ALL") != PROOF_ENV["LC_ALL"]:
+        return False
+    home = env.get("HOME")
+    hh = env.get("HERMES_HOME")
+    if not isinstance(home, str) or not isinstance(hh, str):
+        return False
+    if home != hh:
+        return False
+    if _proof_home_refused(home):
+        return False
+    if set(env.keys()) != {"PATH", "LANG", "LC_ALL", "HOME", "HERMES_HOME"}:
+        return False
+    return True
+
+
+def _ensure_live_proof_home(path=PROOF_HOME_LIVE_DEFAULT):
+    if _proof_home_refused(path):
+        raise RuntimeError("proof home refused")
+    if isinstance(path, bool):
+        raise TypeError("bool path refused")
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        pass
+    else:
+        if stat.S_ISLNK(st.st_mode):
+            raise RuntimeError("proof home symlink")
+        if not stat.S_ISDIR(st.st_mode):
+            raise RuntimeError("proof home not dir")
+        if st.st_uid != 0:
+            raise RuntimeError("proof home uid")
+        if stat.S_IMODE(st.st_mode) != 0o700:
+            os.chmod(path, 0o700)
+            st = os.lstat(path)
+            if stat.S_IMODE(st.st_mode) != 0o700:
+                raise RuntimeError("proof home mode")
+            if st.st_uid != 0:
+                raise RuntimeError("proof home uid")
+        return path
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except Exception:
+        pass
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode):
+        raise RuntimeError("proof home symlink")
+    if not stat.S_ISDIR(st.st_mode):
+        raise RuntimeError("proof home not dir")
+    if st.st_uid != 0:
+        raise RuntimeError("proof home uid")
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        raise RuntimeError("proof home mode")
+    return path
 
 LIB_DIR = "/var/lib/hermes-stock-activation"
 BACKING_DIR = "/var/lib/hermes-stock-activation/backing"
@@ -869,13 +960,21 @@ def _findmnt_ok(out_s, loop):
     return True
 
 
-def apply(host, records, ports, execute_commands=True):
+def apply(host, records, ports, execute_commands=True, proof_home=None):
     missing = _host_missing(host)
     if missing:
         return {"status": "refused", "reason": f"missing host methods: {','.join(missing)}",
                 "signed": False, "activation": "UNEXECUTED",
                 "service_cutover": "NOT_AUTHORIZED", "kernel_immutable": False,
                 "gates": _gates_unexecuted(), "images": []}
+    if proof_home is None:
+        proof_home = PROOF_HOME_LIVE_DEFAULT
+    if _proof_home_refused(proof_home):
+        return {"status": "refused", "reason": "proof home",
+                "signed": False, "activation": "UNEXECUTED",
+                "service_cutover": "NOT_AUTHORIZED", "kernel_immutable": False,
+                "gates": _gates_unexecuted(), "images": []}
+    proof_env = _proof_env_for(proof_home)
     if not isinstance(records, (list, tuple)) or not records:
         return {"status": "refused", "reason": "records",
                 "signed": False, "activation": "UNEXECUTED",
@@ -1236,11 +1335,14 @@ def apply(host, records, ports, execute_commands=True):
         if not imm:
             overall_immutable = False
         a1c2_this = bool(imm)
-        # CLI + web proof
+        # CLI + web proof. CLI stays on run() with 30s timeout; dashboard
+        # never uses run() (it would block) and instead uses the owned
+        # start_web/health_fetch/stop_web lifecycle. Both use proof_env with
+        # caller-supplied HOME/HERMES_HOME. No .env is read.
         cli_ok = True
         for flag in ("--help", "--version"):
             try:
-                cres = host.run(cli_proof_argv(mount, flag), PROOF_ENV)
+                cres = host.run(cli_proof_argv(mount, flag), proof_env)
             except Exception:
                 cli_ok = False
                 break
@@ -1258,24 +1360,46 @@ def apply(host, records, ports, execute_commands=True):
                 dashboard_ok = False
                 wargv = None
             if wargv is not None:
-                try:
-                    wres = host.run(wargv, PROOF_ENV)
-                except Exception:
-                    dashboard_ok = False
+                start_fn = getattr(host, "start_web", None)
+                stop_fn = getattr(host, "stop_web", None)
+                hfn = getattr(host, "health_fetch", None)
+                if not (callable(start_fn) and callable(stop_fn) and callable(hfn)):
+                    # No owned proof capability: never use run() for the
+                    # dashboard argv (a blocking run would hang). Leave
+                    # WEB_PROOF UNEXECUTED without failing the apply.
+                    web_this = False
+                    dashboard_ok = True
                 else:
-                    wrc, _wout, _we = _coerce_run_result(wres)
-                    if wrc != 0:
+                    try:
+                        handle = start_fn(wargv, proof_env)
+                    except Exception:
                         dashboard_ok = False
-                    else:
-                        # Dashboard argv exit alone is not web proof.
-                        # Require health fetch 200 + json + ok true for WEB_PROOF.
-                        # Health failure leaves WEB_PROOF UNEXECUTED but does not
-                        # fail the overall apply (only dashboard argv failure does).
+                        handle = None
+                    if handle is not None:
+                        health_passed = False
+                        exited_early = False
                         try:
-                            hfn = getattr(host, "health_fetch", None)
-                            if not callable(hfn):
-                                web_this = False
-                            else:
+                            deadline = time.monotonic() + _WEB_PROOF_TIMEOUT_SECS
+                        except Exception:
+                            deadline = None
+                        # Bounded poll of health_fetch until 200/json/ok true or 20s.
+                        while True:
+                            try:
+                                poll_fn = getattr(handle, "poll", None)
+                                if callable(poll_fn):
+                                    try:
+                                        _pv = poll_fn()
+                                    except Exception:
+                                        _pv = None
+                                    if _pv is not None:
+                                        exited_early = True
+                                        break
+                                elif getattr(handle, "exited", False):
+                                    exited_early = True
+                                    break
+                            except Exception:
+                                pass
+                            try:
                                 hres = hfn(_dashboard_url(port))
                                 if isinstance(hres, dict):
                                     hs = hres.get("status")
@@ -1286,11 +1410,44 @@ def apply(host, records, ports, execute_commands=True):
                                     hc = getattr(hres, "content_type", "")
                                     hb = getattr(hres, "body", None)
                                 if _health_ok(hs, hc, hb):
-                                    web_this = True
-                                else:
-                                    web_this = False
+                                    health_passed = True
+                                    break
+                            except Exception:
+                                pass
+                            try:
+                                now = time.monotonic()
+                            except Exception:
+                                break
+                            if deadline is None or now >= deadline:
+                                break
+                            try:
+                                time.sleep(_WEB_POLL_INTERVAL_SECS)
+                            except Exception:
+                                break
+                        try:
+                            stopped = stop_fn(handle)
                         except Exception:
+                            stopped = False
+                        reaped = bool(stopped)
+                        if health_passed and reaped and not exited_early:
+                            web_this = True
+                            dashboard_ok = True
+                        elif exited_early and not health_passed:
+                            # Dashboard exit-before-fetch is not proof, but not
+                            # an overall failure (fixture parity).
                             web_this = False
+                            dashboard_ok = True
+                        elif not health_passed:
+                            # Hang past 20s is failure; caller cleans up below.
+                            web_this = False
+                            dashboard_ok = False
+                        else:
+                            # Health passed but owned child was not reaped
+                            # (stop unresolved): do not claim WEB_PROOF.
+                            web_this = False
+                            dashboard_ok = False
+                    else:
+                        web_this = False
             # port None means no web proof attempted in this invocation
             if port is None:
                 dashboard_ok = True
@@ -1682,9 +1839,106 @@ class LiveProofHost:
         )
         if prog not in allowed_exact and not is_python:
             raise RuntimeError("not allowed")
+        if is_python:
+            # Dashboard must use owned start_web/stop_web lifecycle; run() would
+            # block on the non-exiting server. Refuse to avoid the hang.
+            if "dashboard" in argv:
+                raise RuntimeError("dashboard must use start_web")
+            if not _env_is_proof_env(env):
+                raise RuntimeError("env refused")
+            return subprocess.run(argv, shell=False, env=env,
+                                  capture_output=True, check=False, timeout=30)
         if env != PROOF_ENV:
             raise RuntimeError("env refused")
-        return subprocess.run(argv, shell=False, env=PROOF_ENV, capture_output=True, check=False)
+        return subprocess.run(argv, shell=False, env=PROOF_ENV,
+                              capture_output=True, check=False, timeout=30)
+
+    def start_web(self, argv, env):
+        # Owned dashboard child. No systemctl. No PID scan. Caller must
+        # stop_web() the returned handle; only that session is ever signalled.
+        if not isinstance(argv, list) or not argv or not all(isinstance(x, str) for x in argv):
+            raise RuntimeError("argv refused")
+        for el in argv:
+            base = os.path.basename(el)
+            if base in ("systemctl", "git", "sudo", "hermes"):
+                raise RuntimeError("blocked basename")
+            if "/opt" in el or "cutover_" in el:
+                raise RuntimeError("blocked path")
+            if "systemctl" in el:
+                raise RuntimeError("systemctl forbidden")
+        prog = argv[0]
+        if not os.path.isabs(prog):
+            raise RuntimeError("absolute required")
+        is_python = (
+            prog.startswith(RUN_DIR + "/")
+            and os.path.basename(prog) == "python3"
+            and len(argv) > 1
+            and argv[1] == "-I"
+        )
+        if not is_python:
+            raise RuntimeError("not allowed")
+        if "dashboard" not in argv:
+            raise RuntimeError("dashboard required")
+        if not _env_is_proof_env(env):
+            raise RuntimeError("env refused")
+        return subprocess.Popen(argv, shell=False, env=env,
+                                stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+
+    def stop_web(self, handle):
+        # Terminate only the owned child session, then reap bounded.
+        # Returns True when reaped, False (unresolved) otherwise.
+        # No systemctl. No PID scan: only handle.pid's session is signalled.
+        try:
+            if handle is None:
+                return False
+            poll_fn = getattr(handle, "poll", None)
+            wait_fn = getattr(handle, "wait", None)
+            if not callable(poll_fn) or not callable(wait_fn):
+                return False
+            try:
+                _p = poll_fn()
+            except Exception:
+                return False
+            if _p is not None:
+                try:
+                    wait_fn(timeout=_STOP_WAIT_SECS)
+                    return True
+                except Exception:
+                    return False
+            try:
+                pid = getattr(handle, "pid", None)
+            except Exception:
+                return False
+            if not isinstance(pid, int) or pid <= 0:
+                return False
+            try:
+                pgid = os.getpgid(pid)
+            except Exception:
+                return False
+            try:
+                os.killpg(pgid, 15)
+            except Exception:
+                return False
+            try:
+                wait_fn(timeout=_STOP_WAIT_SECS)
+                return True
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(pgid, 9)
+                except Exception:
+                    pass
+                try:
+                    wait_fn(timeout=_STOP_WAIT_SECS)
+                    return True
+                except Exception:
+                    return False
+            except Exception:
+                return False
+        except Exception:
+            return False
 
     def denial_probe(self, path, op):
         if isinstance(path, bool):
@@ -1768,6 +2022,7 @@ def _make_live_host():
 def _parse_live_records_ports(args):
     records = []
     ports = {}
+    proof_home = PROOF_HOME_LIVE_DEFAULT
     i = 0
     while i < len(args):
         a = args[i]
@@ -1803,11 +2058,14 @@ def _parse_live_records_ports(args):
             else:
                 ports[f"port{len(ports)}"] = pval
             i += 2
+        elif a == "--proof-home" and i + 1 < len(args):
+            proof_home = args[i + 1]
+            i += 2
         elif a == "--execute-live":
             i += 1
         else:
             i += 1
-    return records, ports
+    return records, ports, proof_home
 
 
 def main(argv=None):
@@ -1897,8 +2155,14 @@ def main(argv=None):
             return 4
         host = _make_live_host()
         if cmd == "apply":
-            records, ports = _parse_live_records_ports(argv[1:])
-            res = apply(host, records, ports)
+            records, ports, proof_home = _parse_live_records_ports(argv[1:])
+            # Live default is created 0700 uid 0 only here, after
+            # --execute-live and _live_file_ok already passed.
+            try:
+                _ensure_live_proof_home(proof_home)
+            except Exception:
+                return 4
+            res = apply(host, records, ports, proof_home=proof_home)
             print(json.dumps(res, sort_keys=True, indent=2))
             return 0 if res.get("status") == "applied" else 1
         else:

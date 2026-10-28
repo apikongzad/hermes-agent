@@ -547,11 +547,12 @@ class LiveEntrypointTests(unittest.TestCase):
         orig_ok = m._live_file_ok
         orig_factory = m._make_live_host
         orig_apply = m.apply
+        orig_ensure = getattr(m, "_ensure_live_proof_home", None)
         called = {}
         fake_host = FakeHost(tempfile.gettempdir())
         # health fetch stub so WEB gate could be evaluated without live net
         fake_host.health_fetch = lambda url: {"status": 200, "content_type": "application/json", "body": {"ok": True}}
-        def fake_apply(host, records, ports, execute_commands=True):
+        def fake_apply(host, records, ports, execute_commands=True, proof_home=None):
             called["yes"] = True
             self.assertIs(host, fake_host)
             return {"status": "applied", "signed": False, "activation": "UNEXECUTED",
@@ -562,6 +563,8 @@ class LiveEntrypointTests(unittest.TestCase):
             m._live_file_ok = lambda: (True, "")
             m._make_live_host = lambda: fake_host
             m.apply = fake_apply
+            if orig_ensure is not None:
+                m._ensure_live_proof_home = lambda path=None: path
             with tempfile.TemporaryDirectory() as td:
                 src = os.path.join(td, "k.squashfs")
                 with open(src, "wb") as f:
@@ -580,6 +583,8 @@ class LiveEntrypointTests(unittest.TestCase):
             m._live_file_ok = orig_ok
             m._make_live_host = orig_factory
             m.apply = orig_apply
+            if orig_ensure is not None:
+                m._ensure_live_proof_home = orig_ensure
 
     def test_missing_execute_live_returns_3_no_host(self):
         m = _load_op()
@@ -665,6 +670,92 @@ class ExecutedGatesTests(unittest.TestCase):
             self.assertFalse(res["kernel_immutable"])
             self.assertEqual(res["gates"]["A1"], "UNEXECUTED")
             self.assertEqual(res["gates"]["C2"], "UNEXECUTED")
+
+
+class OwnedWebProofTests(unittest.TestCase):
+    def test_start_web_before_health_before_stop_and_no_blocking_run(self):
+        m = _load_op()
+        self.assertTrue(hasattr(m, "LiveProofHost"))
+        self.assertTrue(hasattr(m.LiveProofHost, "start_web"))
+        self.assertTrue(hasattr(m.LiveProofHost, "stop_web"))
+        with tempfile.TemporaryDirectory() as td:
+            data = b"owned-web-proof"
+            src = os.path.join(td, "k.squashfs")
+            with open(src, "wb") as f:
+                f.write(data)
+            h = _sha(data)
+            recs = [{"kind": "known-good", "image_path": src,
+                     "prep_path": os.path.join(td, "p.json"), "expected_sha256": h}]
+            proof_home = os.path.join(td, "proof-home")
+            os.makedirs(proof_home, mode=0o700, exist_ok=True)
+            order = []
+            blocking_calls = []
+
+            class OwnedFake(FakeHost):
+                def run(self, argv, env):
+                    if any("dashboard" in str(x) for x in argv):
+                        blocking_calls.append(list(argv))
+                        raise AssertionError("blocking run() must not be used for dashboard argv")
+                    return super().run(argv, env)
+
+                def start_web(self, argv, env):
+                    order.append("start_web")
+                    assert env.get("HOME") == proof_home, env
+                    assert env.get("HERMES_HOME") == proof_home, env
+                    assert any("dashboard" in str(x) for x in argv)
+                    order_env = dict(env)
+
+                    class Handle:
+                        def poll(self):
+                            return None
+
+                        def wait(self, timeout=None):
+                            return 0
+
+                    self._handle = Handle()
+                    self._start_env = order_env
+                    return self._handle
+
+                def health_fetch(self, url):
+                    order.append("health_fetch")
+                    return {"status": 200, "content_type": "application/json",
+                            "body": {"ok": True}}
+
+                def stop_web(self, handle):
+                    order.append("stop_web")
+                    assert handle is self._handle
+                    return True
+
+            host = OwnedFake(td)
+            res = m.apply(host, recs, {"known-good": 9120}, proof_home=proof_home)
+            self.assertEqual(res["status"], "applied")
+            self.assertEqual(order, ["start_web", "health_fetch", "stop_web"])
+            self.assertEqual(blocking_calls, [])
+            run_cmds = [" ".join(c) for c in host.run_log]
+            self.assertTrue(any("--help" in c for c in run_cmds))
+            self.assertFalse(any("dashboard" in c for c in run_cmds))
+            self.assertEqual(res["gates"]["WEB_PROOF"], "EXECUTED")
+            self.assertEqual(host._start_env.get("HOME"), proof_home)
+            self.assertEqual(host._start_env.get("HERMES_HOME"), proof_home)
+
+    def test_proof_home_refused(self):
+        m = _load_op()
+        with tempfile.TemporaryDirectory() as td:
+            data = b"refuse-home"
+            src = os.path.join(td, "k.squashfs")
+            with open(src, "wb") as f:
+                f.write(data)
+            h = _sha(data)
+            recs = [{"kind": "known-good", "image_path": src,
+                     "prep_path": os.path.join(td, "p.json"), "expected_sha256": h}]
+            for bad in ("/home/ubuntu", "/home/ubuntu/.hermes",
+                        "/tmp/x/.env", "/tmp/.env/y"):
+                host = FakeHost(td)
+                res = m.apply(host, recs, {"known-good": 9120}, proof_home=bad)
+                self.assertEqual(res["status"], "refused")
+                self.assertEqual(host.run_log, [])
+                for g in res["gates"].values():
+                    self.assertEqual(g, "UNEXECUTED")
 
 
 def tearDownModule():
