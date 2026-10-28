@@ -5,10 +5,26 @@ plan: deterministic, no root, exit 0. preflight: read-only
 BEFORE importing siblings, exit 0 with JSON, no mutation. apply/recover
 without --execute-live exit 3 (refusal, no live effects). With
 --execute-live requires euid 0 and installed path under
-/var/lib/hermes-stock-activation/recovery with mode 0500, else exit 4;
-even then mutation stays refused-live-not-authorized-here (exit 1) until
-wiring is reviewed. Live execution never imports user trees, never reads
-.env.
+/var/lib/hermes-stock-activation/recovery with mode 0500, else exit 4.
+
+External REVIEWED pin gate (fail-closed, no self-authorization):
+apply/recover (and root-live preflight) must compare the root-protected
+external pin at REVIEWED_PIN_PATH (outside the package, root 0400 parent
+0700 same owner) BEFORE any sibling import. The pin is minted by the parent
+operator AFTER exact manual review via independent digest readback
+(sha256sum on installed files + rendered units, computed OUTSIDE the
+package, never hardcoded in module constants, no hardcoded self hash).
+Code never equates its own MANIFEST self-consistency to review: a
+self-consistent root package WITHOUT an independent pin REFUSES (exit 4,
+marker absent, zero sibling exec). Bootstrap cli.py own bytes are also
+bound to the pin before imports. Pin is UNSIGNED honest (not a crypto
+signature); parent manual review is the authority, a new pin is permitted
+only after a new exact review. Malicious root can overwrite both code and
+pins (same authority trust scope, disclosed in README). No caller boolean,
+no arbitrary pin path via CLI (fixed path only), O_NOFOLLOW regular-file
+single-link ownership/mode checks plus FD reads with closed-field format
+validation before any sibling exec. Live execution never imports user
+trees, never reads .env.
 """
 
 import hashlib
@@ -19,6 +35,33 @@ import sys
 
 INSTALL_PREFIX = "/var/lib/hermes-stock-activation/recovery"
 MANIFEST_REL = "MANIFEST.json"
+README_REL = "README.parent.md"
+
+# Fixed external REVIEWED pin (outside the package, never a CLI arg).
+REVIEWED_PIN_PATH = "/var/lib/hermes-stock-activation/reviewed-package.json"
+REVIEWED_PIN_PARENT = "/var/lib/hermes-stock-activation"
+REVIEWED_PIN_GRANDPARENT = "/var/lib"
+
+# Exact module set bound by the pin (filenames only, never hashes here).
+# Hashes live ONLY in the external pin minted outside the package.
+PIN_EXPECTED_FILES = (
+    "__init__.py",
+    "cli.py",
+    "cutover_host.py",
+    "cutover_orchestrate.py",
+    "cutover_recovery.py",
+    "cutover_units.py",
+)
+
+PIN_ALLOWED_TOP_KEYS = frozenset({
+    "format",
+    "files",
+    "manifest_sha256",
+    "template_sha256",
+    "unit_template_sha256",
+    "signed",
+    "reviewed_by",
+})
 
 
 def _live_file_ok():
@@ -79,6 +122,265 @@ def _sha256_file(path):
     finally:
         os.close(fd)
     return h.hexdigest()
+
+
+def _is_hex64(s):
+    if not isinstance(s, str) or len(s) != 64:
+        return False
+    for c in s:
+        if c not in "0123456789abcdef":
+            return False
+    return True
+
+
+def _read_reviewed_pin(pin_path=None, expected_uid=None):
+    """Read and validate the external REVIEWED pin BEFORE any sibling import.
+
+    Fixed production path REVIEWED_PIN_PATH only in main(); pin_path param
+    exists ONLY for bounded fixture tests (never a CLI arg, never a caller
+    boolean). Enforces O_NOFOLLOW regular single-link ownership/modes plus
+    FD reads with closed-field format validation. Never opens .env.
+
+    Production (pin_path == REVIEWED_PIN_PATH): file 0400 uid 0, parent
+    0700 uid 0 same owner, grandparent /var/lib 0755 uid 0. Fixture (temp
+    path under HOME for tests): file 0400 euid, parent 0700 euid same
+    owner. expected_uid override (tests only) simulates production
+    ownership requirement on a temp file (e.g., temp file uid 1001 vs
+    expected 0 must refuse, proving non-root-owner refusal without root).
+
+    Returns (ok, reason, pin_dict). pin_dict is None on failure. Caller
+    must NOT import siblings unless ok.
+    """
+    if pin_path is None:
+        pin_path = REVIEWED_PIN_PATH
+    if not isinstance(pin_path, str) or not pin_path:
+        return False, "pin path type", None
+    if not os.path.isabs(pin_path):
+        return False, "pin path relative", None
+    if ".." in pin_path.split("/"):
+        return False, "pin path dotdot", None
+    # No .env in pin path, no caller-controlled outside authority except
+    # the single fixed production path and temp HOME fixtures for tests.
+    if ".hermes/.env" in pin_path or pin_path.endswith("/.env"):
+        return False, "pin env path", None
+    is_prod = (os.path.normpath(pin_path) == os.path.normpath(REVIEWED_PIN_PATH))
+    try:
+        euid = os.geteuid()
+    except AttributeError:
+        euid = 0
+    if expected_uid is None:
+        expected_uid = 0 if is_prod else euid
+    # lstat, no follow, single link: regular file, no symlink.
+    try:
+        st = os.lstat(pin_path)
+    except OSError as e:
+        return False, f"pin missing: {e}", None
+    if stat.S_ISLNK(st.st_mode):
+        return False, "pin symlink", None
+    if not stat.S_ISREG(st.st_mode):
+        return False, "pin not regular", None
+    if stat.S_IMODE(st.st_mode) != 0o400:
+        return False, f"pin mode {oct(stat.S_IMODE(st.st_mode))}", None
+    if st.st_uid != expected_uid:
+        return False, f"pin owner {st.st_uid} want {expected_uid}", None
+    # Parent: lstat, no symlink, dir 0700 same owner.
+    parent = os.path.dirname(os.path.normpath(pin_path)) or "/"
+    try:
+        pst = os.lstat(parent)
+    except OSError as e:
+        return False, f"pin parent missing: {e}", None
+    if stat.S_ISLNK(pst.st_mode):
+        return False, "pin parent symlink", None
+    if not stat.S_ISDIR(pst.st_mode):
+        return False, "pin parent not dir", None
+    if stat.S_IMODE(pst.st_mode) != 0o700:
+        return False, f"pin parent mode {oct(stat.S_IMODE(pst.st_mode))}", None
+    if pst.st_uid != expected_uid:
+        return False, "pin parent owner", None
+    if pst.st_uid != st.st_uid:
+        return False, "pin owner mismatch parent", None
+    if is_prod:
+        # Grandparent /var/lib 0755 uid 0, not symlink, not writable by 1001.
+        try:
+            gst = os.lstat(REVIEWED_PIN_GRANDPARENT)
+        except OSError as e:
+            return False, f"pin grandparent missing: {e}", None
+        if stat.S_ISLNK(gst.st_mode):
+            return False, "pin grandparent symlink", None
+        if gst.st_uid != 0 or stat.S_IMODE(gst.st_mode) != 0o755:
+            return False, "pin grandparent ownership", None
+        # Production parent must be the fixed REVIEWED_PIN_PARENT.
+        if os.path.normpath(parent) != os.path.normpath(REVIEWED_PIN_PARENT):
+            return False, "pin parent fixed", None
+    # FD read via O_NOFOLLOW, bounded (64 KiB cap is plenty for pin JSON).
+    try:
+        fd = os.open(pin_path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as e:
+        return False, f"pin open: {e}", None
+    try:
+        chunks = []
+        total = 0
+        while True:
+            b = os.read(fd, 8192)
+            if not b:
+                break
+            chunks.append(b)
+            total += len(b)
+            if total > 65536:
+                return False, "pin too large", None
+        raw = b"".join(chunks)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    try:
+        pin = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        return False, f"pin parse: {e}", None
+    if not isinstance(pin, dict):
+        return False, "pin type", None
+    # Closed fields: exactly the allowed top keys, no unknown, no missing.
+    try:
+        keys = set(pin.keys())
+    except Exception:
+        return False, "pin keys", None
+    if keys != set(PIN_ALLOWED_TOP_KEYS):
+        # Distinguish unknown vs missing for diagnostics, both refuse.
+        extra = keys - set(PIN_ALLOWED_TOP_KEYS)
+        if extra:
+            return False, f"pin unknown key: {sorted(extra)[0]}", None
+        return False, "pin missing keys", None
+    if not isinstance(pin.get("format"), int) or isinstance(pin.get("format"), bool):
+        return False, "pin format type", None
+    if pin.get("format") != 1:
+        return False, "pin format value", None
+    if pin.get("signed") is not False:
+        return False, "pin signed must be false", None
+    rb = pin.get("reviewed_by")
+    if not isinstance(rb, str) or not (1 <= len(rb) <= 256):
+        return False, "pin reviewed_by", None
+    if ".hermes/.env" in rb or "\n" in rb and len(rb) > 256:
+        return False, "pin reviewed_by env", None
+    files = pin.get("files")
+    if not isinstance(files, dict):
+        return False, "pin files type", None
+    if set(files.keys()) != set(PIN_EXPECTED_FILES):
+        extra = set(files.keys()) - set(PIN_EXPECTED_FILES)
+        if extra:
+            return False, f"pin unknown file: {sorted(extra)[0]}", None
+        return False, "pin files missing", None
+    for rel, sha in files.items():
+        if not isinstance(rel, str) or not isinstance(sha, str):
+            return False, "pin file fields", None
+        if "/" in rel or rel in (".", "..") or not rel.endswith(".py"):
+            return False, f"pin rel: {rel}", None
+        if ".hermes/.env" in rel or rel == ".env":
+            return False, "pin env file", None
+        if not _is_hex64(sha):
+            return False, f"pin sha: {rel}", None
+    for k in ("manifest_sha256", "template_sha256", "unit_template_sha256"):
+        if not _is_hex64(pin.get(k)):
+            return False, f"pin {k}", None
+    return True, "", pin
+
+
+def _verify_against_pin(entry_dir, entry_shas, pin):
+    """Compare actual export hashes to the external pin BEFORE import.
+
+    entry_shas comes from _verify_export_dir (actual O_NOFOLLOW hashes of
+    each .py). Also hashes MANIFEST.json and README.parent.md file bytes
+    via O_NOFOLLOW FDs and compares to pin manifest/template. Verifies
+    bootstrap cli.py own bytes (hash of __file__ via O_NOFOLLOW) equal
+    pin files[cli.py]. Returns (ok, reason). No import, no .env, no exec.
+    """
+    if not isinstance(pin, dict):
+        return False, "pin type"
+    files = pin.get("files")
+    if not isinstance(files, dict):
+        return False, "pin files"
+    # Each actual .py hash must equal the REVIEWED pin (not just MANIFEST
+    # self-consistency). Code cannot self-authorize via its own MANIFEST.
+    for rel in PIN_EXPECTED_FILES:
+        want = files.get(rel)
+        got = entry_shas.get(rel) if isinstance(entry_shas, dict) else None
+        if not isinstance(want, str) or not isinstance(got, str):
+            return False, f"pin compare missing: {rel}"
+        if got != want:
+            return False, f"pin mismatch: {rel}"
+    # Bootstrap own bytes: running cli.py must be the pinned cli.py.
+    try:
+        self_path = __file__
+    except NameError:
+        return False, "no self file"
+    try:
+        self_sha = _sha256_file(self_path)
+    except OSError as e:
+        return False, f"self unreadable: {e}"
+    if self_sha != files.get("cli.py"):
+        return False, "pin mismatch: cli.py self"
+    # MANIFEST.json file bytes vs pin manifest.
+    man_path = os.path.join(entry_dir, MANIFEST_REL)
+    try:
+        man_sha = _sha256_file(man_path)
+    except OSError as e:
+        return False, f"manifest unreadable: {e}"
+    if man_sha != pin.get("manifest_sha256"):
+        return False, "pin mismatch: manifest"
+    # README.parent.md file bytes vs pin template (operator recipe binding).
+    readme_path = os.path.join(entry_dir, README_REL)
+    try:
+        rst = os.lstat(readme_path)
+    except OSError as e:
+        return False, f"readme missing: {e}"
+    if stat.S_ISLNK(rst.st_mode):
+        return False, "readme symlink"
+    if not stat.S_ISREG(rst.st_mode):
+        return False, "readme not file"
+    try:
+        readme_sha = _sha256_file(readme_path)
+    except OSError as e:
+        return False, f"readme unreadable: {e}"
+    if readme_sha != pin.get("template_sha256"):
+        return False, "pin mismatch: template"
+    return True, ""
+
+
+def _verify_unit_template(recovery_mod, pin):
+    """Verify rendered unit templates match the pin AFTER import.
+
+    Called after files+manifest+readme already verified and siblings
+    imported, but BEFORE any transaction (no journal, no fence, no start).
+    Renders via recovery_mod.unit_template_sha() (or fallback
+    concatenation) and compares to pin unit_template_sha256. Returns
+    (ok, reason). No .env, no exec beyond rendering.
+    """
+    if not isinstance(pin, dict):
+        return False, "pin type"
+    want = pin.get("unit_template_sha256")
+    if not _is_hex64(want):
+        return False, "pin unit hash"
+    try:
+        fn = getattr(recovery_mod, "unit_template_sha", None)
+        if callable(fn):
+            got = fn()
+        else:
+            # Fallback: hash concatenated unit texts directly.
+            parts = [
+                recovery_mod.cutover_service_unit(),
+                recovery_mod.recover_service_unit(),
+                recovery_mod.recover_timer_unit(),
+                recovery_mod.known_good_mount_unit(),
+                recovery_mod.candidate_mount_unit(),
+            ]
+            got = hashlib.sha256(
+                ("\n---\n".join(parts)).encode("utf-8")
+            ).hexdigest()
+    except Exception as e:
+        return False, f"unit render: {e}"
+    if not isinstance(got, str) or got != want:
+        return False, "pin mismatch: unit-template"
+    return True, ""
 
 
 def _is_root_live_dir(entry_dir):
@@ -249,6 +551,17 @@ def _load_verified_orchestrate(entry_dir):
     return mod
 
 
+def _load_verified_recovery(entry_dir):
+    import importlib.util as _ilu
+    mod_path = os.path.join(entry_dir, "cutover_recovery.py")
+    spec = _ilu.spec_from_file_location("cutover_recovery_verified", mod_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("spec")
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _plan_result():
     return {
         "status": "manifest-ready",
@@ -295,6 +608,37 @@ def main(argv=None):
                                "service_cutover": "NOT-AUTHORIZED"},
                              sort_keys=True, indent=2))
             return 4
+        # Root-live preflight ALSO requires the external REVIEWED pin before
+        # any sibling import (self-consistent without independent pin must
+        # refuse, marker zero exec). Worker (non-root temp HOME) stays
+        # self-consistent-only so existing read-only checks keep working
+        # without root; production root-live never executes siblings on
+        # pin absence/mismatch.
+        _root_live = False
+        try:
+            _root_live = bool(_is_root_live_dir(entry_dir))
+        except Exception:
+            _root_live = False
+        _pin = None
+        if _root_live:
+            pok, preason, _pin = _read_reviewed_pin()
+            if not pok:
+                print(json.dumps({"status": "preflight-refused",
+                                   "reason": f"reviewed-pin: {preason}",
+                                   "signed": False,
+                                   "activation": "UNEXECUTED",
+                                   "service_cutover": "NOT-AUTHORIZED"},
+                                 sort_keys=True, indent=2))
+                return 4
+            vok, vreason = _verify_against_pin(entry_dir, _shas, _pin)
+            if not vok:
+                print(json.dumps({"status": "preflight-refused",
+                                   "reason": f"reviewed-pin: {vreason}",
+                                   "signed": False,
+                                   "activation": "UNEXECUTED",
+                                   "service_cutover": "NOT-AUTHORIZED"},
+                                 sort_keys=True, indent=2))
+                return 4
         try:
             host_mod = _load_verified_host(entry_dir)
         except Exception as e:
@@ -318,13 +662,17 @@ def main(argv=None):
             return 4
         # MANIFEST self-consistency is NOT trust. Parent must verify
         # REVIEWED digests after root-owned install. Root-live additionally
-        # enforces uid/mode/path via _verify_export_dir.
+        # enforces uid/mode/path via _verify_export_dir plus external pin.
         if isinstance(res, dict):
             res["manifest_trust"] = "self-consistent-only-not-trusted"
             try:
                 res["root_live_enforced"] = bool(_is_root_live_dir(entry_dir))
             except Exception:
                 res["root_live_enforced"] = False
+            try:
+                res["reviewed_pin"] = "verified" if _root_live else "absent-not-required-worker"
+            except Exception:
+                res["reviewed_pin"] = "unknown"
         print(json.dumps(res, sort_keys=True, indent=2))
         return 0
     if cmd in ("apply", "recover"):
@@ -365,12 +713,48 @@ def main(argv=None):
                                "service_cutover": "NOT-AUTHORIZED"},
                              sort_keys=True, indent=2))
             return 4
+        # External REVIEWED pin gate BEFORE any sibling import. Fixed path
+        # only (no CLI flag, no caller boolean). Self-consistent without
+        # independent pin REFUSES here with marker zero exec. Bootstrap
+        # cli.py own bytes are bound to the pin inside _verify_against_pin.
+        # O_NOFOLLOW + ownership/modes + FD reads + closed fields, no .env.
+        pok, preason, _pin = _read_reviewed_pin()
+        if not pok:
+            print(json.dumps({"status": "live-refused",
+                               "reason": f"reviewed-pin: {preason}",
+                               "signed": False,
+                               "activation": "UNEXECUTED",
+                               "service_cutover": "NOT-AUTHORIZED"},
+                             sort_keys=True, indent=2))
+            return 4
+        vok, vreason = _verify_against_pin(entry_dir, _shas, _pin)
+        if not vok:
+            print(json.dumps({"status": "live-refused",
+                               "reason": f"reviewed-pin: {vreason}",
+                               "signed": False,
+                               "activation": "UNEXECUTED",
+                               "service_cutover": "NOT-AUTHORIZED"},
+                             sort_keys=True, indent=2))
+            return 4
         try:
             host_mod = _load_verified_host(entry_dir)
             orch_mod = _load_verified_orchestrate(entry_dir)
+            rec_mod = _load_verified_recovery(entry_dir)
         except Exception as e:
             print(json.dumps({"status": "live-refused",
                                "reason": f"load: {e}",
+                               "signed": False,
+                               "activation": "UNEXECUTED",
+                               "service_cutover": "NOT-AUTHORIZED"},
+                             sort_keys=True, indent=2))
+            return 4
+        # Unit-template binding AFTER import but BEFORE any transaction:
+        # rendered units must equal the REVIEWED unit hash, else refuse
+        # with no journal, no fence, no start.
+        uok, ureason = _verify_unit_template(rec_mod, _pin)
+        if not uok:
+            print(json.dumps({"status": "live-refused",
+                               "reason": f"reviewed-pin: {ureason}",
                                "signed": False,
                                "activation": "UNEXECUTED",
                                "service_cutover": "NOT-AUTHORIZED"},

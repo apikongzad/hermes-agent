@@ -493,3 +493,87 @@ AccuracySec=15s`; mounts `squashfs ro,nosuid,nodev` (flag word 7);
 images `known-good.squashfs`/`candidate.squashfs` 0400 uid 0 with pins
 `1d3f026c…`/`8e50b775…`. Code unchanged: `lock_acquire` fail-closed,
 units uninstalled, `cli` exits 3/4/1. Independent review is the next gate.
+
+## 11. Narrow fail-closed addendum — unit dependency contract (reviewer-requested, base otherwise unchanged)
+
+Base accepted bytes (§10 in §10 above, base `70fc9deb…`, addendum `ba9791ac…`,
+gap `246567b9…`, gap-addendum `ce3e7440…`) remain UNCHANGED and immutable.
+This section records ONE narrow conflict where implementation follows
+reviewer-requested correct semantics instead of the base text, explicitly
+(not a generic redesign).
+
+Conflict (explicit):
+- Base §10(6) text says cutover AND recover carry "same mount deps/conditions"
+  (After+Requires both mounts, ConditionPathIsMountPoint both snaps +
+  ConditionPathExists both images). That contract is skip-with-success:
+  a missing mount/image makes systemd SKIP the unit with exit 0 (inactive,
+  success, no OnFailure, no receipt) — a false success that hides broken
+  physical state and never fires recovery. Mount units likewise used
+  ConditionPathExists (skip, not fail). Mount filenames
+  `hermes-stock-*.mount` do not match their Where (`/run/...`) so
+  systemd-analyze verify REFUSES them (Where mismatch).
+- Reviewer requires fail-closed Assert semantics + recover independence:
+  missing prereq must FAIL (failed + OnFailure), never skip with success;
+  recover must be able to ExecStart when mounts/images are broken so the
+  program can read journal + physical state (show/file_info/digest) and emit
+  a stopped-unresolved receipt (never false success, never second start while
+  ambiguous); boot ordering must still prevent services from starting invalid
+  images while recover stays independent; generated units must pass
+  systemd-analyze verify offline with no install/service effects.
+
+Accepted narrow change (this slice only, no other base sentence touched):
+- `cutover_service_unit`: After+Requires both systemd-escaped mounts,
+  AssertPathIsMountPoint both snaps + AssertPathExists both images (NOT
+  Condition), OnFailure recover. Missing prereq FAILS cutover, OnFailure fires.
+- `recover_service_unit`: After network.target ONLY, NO Requires, NO Assert,
+  NO Condition, NO mount/image references. Mount Before=recover still orders
+  recover after mount attempts, but recover never blocks on mounts and never
+  carries an Assert that would prevent its own receipt. Same hardening/timeouts.
+- Mount units: AssertPathExists (NOT Condition), Before
+  cutover/recover/gateway/dashboard, Type squashfs ro,nosuid,nodev, correct
+  systemd-escaped filenames (`run-hermes\x2dstock...mount` via
+  `systemd-escape -p --suffix=mount <Where>`) so verify passes.
+- Validators enforce the above (Condition* forbidden in supervision/mounts,
+  cutover Requires both mounts, recover has none). Program (orchestrate)
+  already reconciles physical state and returns stopped-unresolved/durable
+  (never committed) on broken mounts; recover independence lets it run to do so.
+- Tests: `test_cutover_units_failclosed` (9 tests: parser contracts for
+  cutover Assert, recover independence, mounts Assert, escape names via real
+  systemd-escape, validator rejects on missing prereq, offline verify rc 0
+  with no /etc writes, program unresolved on broken readback/fence). Existing
+  `TestExactUnitsRenderingOnly` updated to the new contract (same test count).
+- No live systemctl/mount/restart/env reads by worker; rendering/testing only.
+
+## 12. Narrow external REVIEWED pin addendum (reviewer-requested, base otherwise unchanged)
+
+Base §1+§6 (`ACTIVATION: not authorized`, `HERMETIC_IMPLEMENTATION: not
+authorized`) + §10 wiring review gate remain. This section adds the concrete
+independent-review record the base requires but never defined as bytes.
+
+- Fixed external pin OUTSIDE the package:
+  `/var/lib/hermes-stock-activation/reviewed-package.json` 0400 uid 0,
+  parent 0700 uid 0 same owner, grandparent /var/lib 0755 uid 0. O_NOFOLLOW
+  regular single-link checks + FD reads + closed-field JSON validation BEFORE
+  any sibling import. No CLI flag, no caller boolean, no arbitrary pin path.
+- Contents (minted by parent operator AFTER exact manual review via independent
+  digest readback OUTSIDE the package, never hardcoded in module constants):
+  files{6 .py hashes} + manifest_sha256 (MANIFEST.json bytes) +
+  template_sha256 (README.parent.md bytes) + unit_template_sha256 (rendered
+  5 units via cutover_recovery.unit_template_sha) + format 1 + signed false +
+  reviewed_by. Unknown key/symlink/non-root owner/stale hash all refuse.
+- Gate: root-live preflight + apply/recover compare installed files + MANIFEST
+  + README + bootstrap cli.py own bytes to the pin BEFORE imports; rendered
+  units compared AFTER import but BEFORE any transaction. Self-consistent
+  without independent pin REFUSES (exit 4, marker absent, zero exec). New pin
+  permitted ONLY after a new exact review (any code change without new review
+  refuses). UNSIGNED honest (not crypto); parent manual review is authority.
+- Trust scope disclosed in README.parent.md §4: malicious root (same authority)
+  CAN overwrite both code and pins; pin does not stop same-authority overwrite.
+- Tests: `test_cutover_reviewed_pin` (11 tests: no pin, tamper, unknown key,
+  symlink, non-root owner via expected_uid=0, parent/file mode, file/manifest/
+  template/unit mismatch, valid bootstrap+unit, no .env). Existing 98 cutover +
+  147 activation preserved (plus 9+11 new). Owner fsync EIO test now patches
+  interior os.fsync (not whole lock_acquire) with clean restore, lock retained,
+  journal preserved.
+- No .env reads, no broad globs (explicit file lists), stdlib only, all code
+  via OpenCode same pinned toolchain, no new framework.

@@ -529,18 +529,46 @@ class TestTwoContendersRealFlock(unittest.TestCase):
 
 class TestOwnerAndPublicationFsyncFault(unittest.TestCase):
     def test_owner_fsync_fault_durable_no_start(self):
+        # Narrow interior fault: patch os.fsync (owner-record fsync inside
+        # the REAL lock_acquire), not the whole method. Proves actual
+        # owner-record EIO maps to durable-state-unknown with zero start,
+        # lock file retained (no unlink), journal preserved, and clean
+        # restore of os.fsync afterwards.
         root = _fixture_root("ownerfault-")
         host, runner = _make_real_host(root)
-        # Inject owner-fsync fault: make lock_acquire raise durable fault.
-        _orig_acquire = host.lock_acquire
+        jd = os.path.join(root, "journal")
+        lp = os.path.join(jd, "journal.lock")
+        jp = os.path.join(jd, "journal")
+        import os as _os
+        _orig_fsync = _os.fsync
+        _calls = []
 
-        def _fault_acquire(target_sha=None):
-            raise OSError("owner-fsync-failed: injected")
+        def _fault_fsync(fd):
+            # Targeted: fail the owner-record fsync inside lock_acquire.
+            # First fsync during acquire is the owner write (SAME locked FD);
+            # raising here must yield owner-fsync-failed -> durable, no start.
+            _calls.append(int(fd) if isinstance(fd, int) else fd)
+            raise OSError("injected owner EIO")
 
-        host.lock_acquire = _fault_acquire
-        r = C.orchestrate(host, C.Request(target_sha=C.TARGET_SHA))
+        _os.fsync = _fault_fsync
+        try:
+            r = C.orchestrate(host, C.Request(target_sha=C.TARGET_SHA))
+        finally:
+            # Clean state: restore real fsync even on failure.
+            _os.fsync = _orig_fsync
         self.assertEqual(r.state, "durable-state-unknown")
         self.assertEqual([c for c in runner.calls if "start" in " ".join(c)], [])
+        # Interior patch actually ran (owner fsync attempted, not stubbed away).
+        self.assertGreaterEqual(len(_calls), 1)
+        # Lock file retained (no unlink in any path), journal preserved
+        # (empty, never deleted), fsync restored.
+        self.assertTrue(os.path.lexists(lp), "lock retained, no unlink on fsync fault")
+        self.assertTrue(_os.fsync is _orig_fsync, "fsync restored clean")
+        if os.path.lexists(jp):
+            # Prior legal tail preserved (empty here), never bare fence-failed.
+            with open(jp, "rb") as f:
+                raw = f.read().decode("utf-8", "replace")
+            self.assertNotIn("fence-failed", raw)
 
     def test_publication_fsync_fault_durable_no_start(self):
         root = _fixture_root("pubfault-")
@@ -946,7 +974,7 @@ class TestExactUnitsRenderingOnly(unittest.TestCase):
         cdm = R.candidate_mount_unit()
         self.assertTrue(R.validate_supervision(cut, rec, tim))
         self.assertTrue(R.validate_mount_units(kgm, cdm))
-        # Fixed interpreter, -I, root package, no restart, timeouts, deps.
+        # Fixed interpreter, -I, root package, no restart, timeouts.
         for t in (cut, rec):
             self.assertIn("/usr/bin/python3.12 -I /var/lib/hermes-stock-activation/recovery/cli.py", t)
             self.assertIn("Restart=no", t)
@@ -956,8 +984,22 @@ class TestExactUnitsRenderingOnly(unittest.TestCase):
             self.assertIn("PrivateTmp=yes", t)
             self.assertIn("TimeoutStartSec=300", t)
             self.assertIn("TimeoutStopSec=30", t)
-            self.assertIn(R.KNOWN_GOOD_MOUNT_UNIT, t)
-            self.assertIn(R.CANDIDATE_MOUNT_UNIT, t)
+        # Fail-closed narrow addendum: cutover Requires+Assert mounts (cannot
+        # start invalid), recover independent (no Requires/Assert/Condition
+        # so it can emit the receipt when mounts are broken). Condition*
+        # is forbidden everywhere here (skip-with-success would hide failure).
+        self.assertIn(R.KNOWN_GOOD_MOUNT_UNIT, cut)
+        self.assertIn(R.CANDIDATE_MOUNT_UNIT, cut)
+        self.assertIn("Requires=", cut)
+        self.assertIn("AssertPathIsMountPoint=", cut)
+        self.assertIn("AssertPathExists=", cut)
+        self.assertNotIn("Condition", cut)
+        self.assertNotIn(R.KNOWN_GOOD_MOUNT_UNIT, rec)
+        self.assertNotIn(R.CANDIDATE_MOUNT_UNIT, rec)
+        self.assertNotIn("Requires=", rec)
+        self.assertNotIn("Assert", rec)
+        self.assertNotIn("Condition", rec)
+        self.assertIn("After=network.target", rec)
         self.assertIn("OnFailure=hermes-stock-cutover-recover.service", cut)
         self.assertNotIn("OnFailure=", rec)
         self.assertIn("Persistent=false", tim)
@@ -970,10 +1012,13 @@ class TestExactUnitsRenderingOnly(unittest.TestCase):
             self.assertIn("Before=", m)
             self.assertIn("hermes-stock-cutover.service", m)
             self.assertIn("hermes-gateway.service", m)
+            self.assertIn("AssertPathExists=", m)
+            self.assertNotIn("Condition", m)
         # Rendering only: no active writes/install/stop/start/mount in worker.
         # Verify no install side effects (no /etc writes, no live units).
         self.assertFalse(os.path.exists("/etc/systemd/system/hermes-stock-cutover.service"))
-        self.assertFalse(os.path.exists("/etc/systemd/system/hermes-stock-known-good-snap.mount"))
+        self.assertFalse(os.path.exists("/etc/systemd/system/" + R.KNOWN_GOOD_MOUNT_UNIT))
+        self.assertFalse(os.path.exists("/etc/systemd/system/" + R.CANDIDATE_MOUNT_UNIT))
 
 
 if __name__ == "__main__":
