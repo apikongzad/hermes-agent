@@ -9,7 +9,7 @@ This file does not embed its own hash.
 Bindings:
 
 - BASE_SHA256 70fc9debac3bdf25b2a52d6413a8bc42e03d00fd38a925faf33b98e7a39c18c9
-- ADDENDUM_SHA256 ba9791ac89a15b2820f8d9cd8686ef67ef903833bab2eaf62c592d75bbab9fd
+- ADDENDUM_SHA256 ba9791ac89a15b2820f8d9cd8686ef67ef903833bab2eaf62c592da75bbab9fd
 - CODE_BASE e0726065eb5d810d87dbea262319c9cd365bbdd1
 
 ## G1 CLOSURE_OBJECTS owner placeholder
