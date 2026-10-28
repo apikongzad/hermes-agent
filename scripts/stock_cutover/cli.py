@@ -238,6 +238,17 @@ def _load_verified_host(entry_dir):
     return mod
 
 
+def _load_verified_orchestrate(entry_dir):
+    import importlib.util as _ilu
+    mod_path = os.path.join(entry_dir, "cutover_orchestrate.py")
+    spec = _ilu.spec_from_file_location("cutover_orchestrate_verified", mod_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("spec")
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _plan_result():
     return {
         "status": "manifest-ready",
@@ -328,15 +339,76 @@ def main(argv=None):
         ok, _why = _live_file_ok()
         if not ok:
             return 4
-        # Live path would wire RealCutoverHost + cutover_orchestrate here.
-        # Parent runs this only after digest verification. Worker tests never
-        # reach this branch live (they assert exit 3/4 without live effects).
-        print(json.dumps({
-            "status": "refused-live-not-authorized-here",
-            "signed": False,
-            "activation": "UNEXECUTED",
-            "service_cutover": "NOT-AUTHORIZED",
-        }, sort_keys=True, indent=2))
+        # §10 live wiring: AFTER verified root-installed package (ALL
+        # siblings hash-verified BEFORE import) and explicit
+        # --execute-live, execute the actual production transaction
+        # (RealCutoverHost + cutover_orchestrate, same lock for apply and
+        # recover). Worker never reaches here (non-root, not installed):
+        # no live systemctl/mount/service effects in worker.
+        entry_dir = _entry_dir()
+        if entry_dir is None:
+            print(json.dumps({"status": "live-refused",
+                               "reason": "no entry dir",
+                               "signed": False,
+                               "activation": "UNEXECUTED",
+                               "service_cutover": "NOT-AUTHORIZED"},
+                             sort_keys=True, indent=2))
+            return 4
+        ok, reason, _shas = _verify_export_dir(entry_dir)
+        if not ok:
+            # Verification-before-import: adversarial sibling must NOT
+            # execute; marker absent. No live effects.
+            print(json.dumps({"status": "live-refused",
+                               "reason": reason,
+                               "signed": False,
+                               "activation": "UNEXECUTED",
+                               "service_cutover": "NOT-AUTHORIZED"},
+                             sort_keys=True, indent=2))
+            return 4
+        try:
+            host_mod = _load_verified_host(entry_dir)
+            orch_mod = _load_verified_orchestrate(entry_dir)
+        except Exception as e:
+            print(json.dumps({"status": "live-refused",
+                               "reason": f"load: {e}",
+                               "signed": False,
+                               "activation": "UNEXECUTED",
+                               "service_cutover": "NOT-AUTHORIZED"},
+                             sort_keys=True, indent=2))
+            return 4
+        try:
+            host = host_mod.RealCutoverHost()
+            receipt = orch_mod.orchestrate(host)
+            state = getattr(receipt, "state", "stopped-unresolved")
+            reason_r = getattr(receipt, "reason", None)
+            try:
+                journal = list(getattr(receipt, "journal", []))
+            except Exception:
+                journal = []
+        except Exception as e:
+            print(json.dumps({"status": "stopped-unresolved",
+                               "reason": f"{type(e).__name__}: {e}",
+                               "signed": False,
+                               "activation": "UNEXECUTED",
+                               "service_cutover": "NOT-AUTHORIZED",
+                               "journal": []},
+                             sort_keys=True, indent=2))
+            return 1
+        # Readiness, NOT activation claim: parent must verify REVIEWED
+        # digests after root install and authorize separately. Exit codes
+        # drive systemd OnFailure (0 success, 1 stopped/blocked, 2 durable).
+        print(json.dumps({"status": state,
+                           "reason": reason_r,
+                           "journal": journal,
+                           "signed": False,
+                           "activation": "UNEXECUTED",
+                           "service_cutover": "NOT-AUTHORIZED"},
+                         sort_keys=True, indent=2))
+        base = str(state).split(":")[0].strip() if isinstance(state, str) else str(state)
+        if base in ("committed", "rolled-back"):
+            return 0
+        if base == "durable-state-unknown":
+            return 2
         return 1
     if cmd == "--self-check":
         print("daec3cd4c6d34f5befbc8f25a8af3e3b84b94f06")

@@ -247,24 +247,35 @@ def _append(host, state, detail=None):
         raise
 
 
-def _acquire_authority_lock(host):
-    """Authority lock before any journal/fence/publication.
+def _acquire_authority_lock(host, target_sha=None):
+    """Authority lock before any journal/fence/publication (§10).
 
-    Uses host.lock_acquire() when present (O_EXCL+flock authority with
-    epoch/boot semantics inside the host). Hosts without lock support
-    raise OSError -> caller maps to durable/stopped. Returns True on
-    authority held by this invocation. Raises OSError('lock-held') if a
-    live holder owns it. Raises OSError('lock-stale-unverified') if the
-    holder is stale: the stale file is preserved, there is no automatic
-    takeover (exact stale->new handoff is not designed in accepted bytes,
-    no delete-then-create race invented here). Caller maps to stopped-unresolved
-    with the same reason. Never pretends release after kill.
+    Single kernel-flock coordinator on the retained FD, held for the whole
+    transaction. Uses host.lock_acquire(target_sha) when present (flock
+    LOCK_EX|LOCK_NB authority, owner JSON audit via ftruncate+write+fsync
+    on the SAME FD). Hosts without lock support raise OSError -> caller
+    maps to durable/stopped. Returns True on authority held. Raises
+    OSError('lock-held') for live holder (EWOULDBLOCK, zero mutation).
+    Raises OSError('owner-fsync-failed: ...') for owner write fsync fault
+    (caller maps to durable-state-unknown, no start). Retained file only,
+    no deletion path, no boolean takeover flag, never pretends release
+    after kill.
     """
     acquire = getattr(host, "lock_acquire", None)
     if acquire is None:
         # No lock primitive: fail-closed, no second-writer protection.
         raise OSError("no lock authority")
-    return acquire()
+    if target_sha is None:
+        try:
+            return acquire()
+        except TypeError:
+            # Old fake without param (backward compat in worker tests).
+            raise OSError("no lock authority")
+    try:
+        return acquire(target_sha)
+    except TypeError:
+        # Host with zero-arg lock_acquire (legacy Fake): call without.
+        return acquire()
 
 
 def _release_authority_lock(host):
@@ -1049,6 +1060,18 @@ def _rollback(host, candidate_snapshot, known_good_snapshot, worktree_path):
             return "stopped-unresolved"
     except OSError:
         return "stopped-unresolved"
+    # §10: rollback restores only if known-good I4 + both probes pass.
+    # Denial above plus python (isolated -I, snapshot import, 3.14.9) and
+    # digest (exact image pins, signed false, outside). Else stopped with
+    # services left stopped (fence already stopped them), no further start.
+    try:
+        _kg_py = known_good_snapshot + "/venv/bin/python3"
+        if not _check_python(host, _kg_py, known_good_snapshot):
+            return "stopped-unresolved"
+        if not _check_digest(host):
+            return "stopped-unresolved"
+    except OSError:
+        return "stopped-unresolved"
     try:
         _publish_snapshot(host, known_good_snapshot)
     except OSError:
@@ -1099,12 +1122,16 @@ def _recover_durable(host, states):
     if base != "durable-state-unknown":
         return None
     # Readback must re-establish durability: journal + physical state.
+    # §10 full readback: journal tail + boot_id + show both + file_info
+    # candidate paths + digest_record, then this-invocation 5s fence.
     try:
         host.journal_load()
+        host.boot_id()
         host.show_unit(GATEWAY_UNIT)
         host.show_unit(DASHBOARD_UNIT)
         host.file_info(GATEWAY_CANDIDATE_PATH)
         host.file_info(DASHBOARD_CANDIDATE_PATH)
+        host.digest_record()
     except OSError:
         return "stopped-unresolved:durable-readback-failed"
     if not _fence(host):
@@ -1113,18 +1140,67 @@ def _recover_durable(host, states):
     return "stop-fenced"
 
 
+_TERMINAL_STATES = ("committed", "rolled-back",
+                      "stopped-unresolved", "blocked-unread")
+
+
+def _verify_terminal_readonly(host, tail_state):
+    """Verify terminal tail read-only, no mutation (§10).
+
+    Loads journal tail + boot_id + show both units + file_info candidate
+    paths + digest_record. If tail is terminal, verify read-only and exit:
+    recovery MUST NOT roll back or restart a terminal committed healthy
+    fleet. Returns tail_state when verified, else
+    stopped-unresolved:terminal-readback-failed with prior journal
+    preserved, no append, no fence, no start.
+    """
+    try:
+        host.boot_id()
+        host.show_unit(GATEWAY_UNIT)
+        host.show_unit(DASHBOARD_UNIT)
+        host.file_info(GATEWAY_CANDIDATE_PATH)
+        host.file_info(DASHBOARD_CANDIDATE_PATH)
+        host.digest_record()
+    except OSError:
+        return "stopped-unresolved:terminal-readback-failed"
+    return tail_state
+
+
 def _orchestrate_impl(host, target_sha=None):
     # Authority lock before any journal/fence/publication. No second writer.
-    # Stale lock is preserved fail-closed (no delete-then-create race, no
-    # automatic takeover: exact stale->new authority handoff is not
-    # designed in accepted bytes). Receipts distinguish lock-held vs
-    # lock-stale-unverified (stale preserved). Atomic external recovery
-    # lock design is a later narrow-exact slice, not a broad generic.
+    # Single kernel-flock coordinator, retained FD whole transaction,
+    # retained file only, death releases via FD close. Apply and recover
+    # acquire the SAME lock file first; loser reports lock-held with prior
+    # journal preserved, no append, no fence, no start.
+    # Boot epoch: read previous owner (audit only, no authority) before
+    # acquire; after acquire compare to force full readback + fence.
     try:
-        _acquire_authority_lock(host)
+        _prev = host.lock_info() if hasattr(host, "lock_info") else None
+    except OSError:
+        _prev = None
+    _prev_boot = _prev.get("boot_id") if isinstance(_prev, dict) else None
+    try:
+        _acquire_authority_lock(host, target_sha)
     except OSError as e:
         msg = str(e)
-        reason = "lock-stale-unverified" if "lock-stale-unverified" in msg else "lock-held"
+        if ("owner-fsync-failed" in msg or "boot-unreadable" in msg
+                or "no lock authority" in msg):
+            # Durability indeterminate at acquire (owner write fsync fault,
+            # boot unreadable): no start, no false success, no append
+            # without authority (preserve prior journal).
+            if "no lock authority" in msg:
+                return "durable-state-unknown: no lock authority"
+            if "boot-unreadable" in msg:
+                return "durable-state-unknown: boot unreadable"
+            return "durable-state-unknown: owner indeterminate"
+        if "lock-ownership" in msg:
+            return "stopped-unresolved:lock-ownership"
+        # Live holder (EWOULDBLOCK) or legacy stale: zero mutation.
+        # Stale handoff now succeeds via flock (no stale exception in §10);
+        # keep legacy mapping for old fakes during transition.
+        reason = "lock-held"
+        if "lock-stale-unverified" in msg:
+            reason = "lock-stale-unverified"
         # Preserve prior legal state, no mutation, no takeover.
         try:
             cur = _journal_states(host)
@@ -1139,12 +1215,20 @@ def _orchestrate_impl(host, target_sha=None):
                 return f"stopped-unresolved:{reason}"
         return f"stopped-unresolved:{reason}"
     try:
-        return _orchestrate_locked(host, target_sha)
+        try:
+            _cur_boot = host.boot_id()
+        except OSError:
+            return "durable-state-unknown: boot unreadable"
+        _boot_changed = (isinstance(_prev_boot, str)
+                         and isinstance(_cur_boot, str)
+                         and _prev_boot != _cur_boot)
+        return _orchestrate_locked(host, target_sha,
+                                   _boot_changed=_boot_changed)
     finally:
         _release_authority_lock(host)
 
 
-def _orchestrate_locked(host, target_sha=None):
+def _orchestrate_locked(host, target_sha=None, _boot_changed=False):
     if target_sha is None:
         target_sha = TARGET_SHA
     try:
@@ -1173,8 +1257,14 @@ def _orchestrate_locked(host, target_sha=None):
                 return "durable-state-unknown: journal unreadable"
         if tailb == "rolling-back":
             return "stopped-unresolved"
-    if states and states[-1] == "committed":
-        return "committed"
+        # §10 terminal readonly: committed/rolled-back/stopped/blocked
+        # verify read-only and exit, never rollback/restart a terminal
+        # committed healthy fleet. No append, no fence, no start.
+        # Boot epoch change still forces full readback (inside verify),
+        # never resume.
+        if tailb in _TERMINAL_STATES:
+            tail_full = states[-1] if isinstance(states[-1], str) else str(states[-1])
+            return _verify_terminal_readonly(host, tail_full)
     for i, s in enumerate(states):
         base = s.split(":")[0].strip() if isinstance(s, str) else s
         if base in ("refused", "blocked-unread", "rolled-back", "stopped-unresolved"):
@@ -1463,6 +1553,14 @@ def _orchestrate_locked(host, target_sha=None):
             return "durable-state-unknown: journal unreadable"
         cur_bases = [c.split(":")[0].strip() for c in cur]
     if cur_bases and cur_bases[-1] == "reloaded":
+        # §10: re-fence in THIS invocation before any start on recovery.
+        # Initial run already fenced before publish in the same invocation
+        # (holding the lock, no interleaving), so only recovery with tail
+        # reloaded (crash after reload before start, or boot epoch change)
+        # re-enters the 5s fence here. No second start while ambiguous.
+        if last == "reloaded" or _boot_changed:
+            if not _fence(host):
+                return "stopped-unresolved:fence-failed"
         try:
             host.start_units(BOTH)
         except OSError:

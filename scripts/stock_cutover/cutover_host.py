@@ -329,11 +329,17 @@ def _refuse_live_env(path):
 
 
 def lockfile_create_args(lock_path=JOURNAL_LOCK_PATH):
-    """Pure constructor for the journal lock. Designed, NOT activated.
+    """Pure constructor for the journal lock (§10 kernel-flock coordinator).
 
-    Returns the fixed path/mode/flags for O_CREAT|O_EXCL|O_NOFOLLOW 0600
-    uid 0. Callers must NOT activate services; orchestrate wiring is
-    deferred to the state+mutation slice. This function performs no syscall.
+    Single root-owned file only: /var/lib/hermes-stock-activation/
+    journal.lock 0600 uid 0, parent 0700 uid 0, no second path. Authority
+    is the kernel flock on the retained FD held for the whole transaction
+    (acquire before any journal/fence/publication, release by close after
+    receipt durable). No unlink in acquire, ever; death releases via FD
+    close. Owner JSON {boot_id,pid,starttime,monotonic_ns,
+    journal_tail_sha256,target_sha} is audit, not authority, via
+    ftruncate+write+fsync on the SAME locked FD + parent dir fsync.
+    This function performs no syscall.
     """
     if lock_path != JOURNAL_LOCK_PATH:
         raise ValueError("lock path fixed")
@@ -341,8 +347,9 @@ def lockfile_create_args(lock_path=JOURNAL_LOCK_PATH):
         "path": JOURNAL_LOCK_PATH,
         "mode": 0o600,
         "uid": 0,
-        "flags": "O_CREAT|O_EXCL|O_NOFOLLOW|O_WRONLY",
-        "activated": False,
+        "flags": "O_RDWR|O_CREAT|O_NOFOLLOW(+O_EXCL-on-create-only)+flock-LOCK_EX|LOCK_NB-retained-FD-no-unlink-release-by-close",
+        "owner_fields": "boot_id,pid,starttime,monotonic_ns,journal_tail_sha256,target_sha",
+        "activated": True,
     }
 
 
@@ -484,7 +491,8 @@ class RealCutoverHost(Host):
     def __init__(self, runner=None, known_good_image=None,
                  candidate_image=None, digest_known_good=None,
                  digest_candidate=None, gateway_sock=None,
-                 gateway_pointer=None):
+                 gateway_pointer=None, journal_dir=None,
+                 journal_path=None, journal_lock_path=None):
         # runner(argv, timeout=60) -> object with returncode/stdout/stderr.
         # Live default is _run_fixed. Unit tests inject a fake runner;
         # worker never spawns live systemctl/sudo via this path.
@@ -499,6 +507,13 @@ class RealCutoverHost(Host):
         self._digest_candidate = digest_candidate or DIGEST_CANDIDATE
         self._gateway_sock = gateway_sock or GATEWAY_SOCK
         self._gateway_pointer = gateway_pointer or GATEWAY_SOCK_POINTER
+        # Journal/lock paths: production fixed by default; tests inject a
+        # temp 0700 fixture root via these params (no CLI flag, no public
+        # arbitrary commands). Production CLI (root installed) always uses
+        # the fixed defaults.
+        self._journal_dir = journal_dir or JOURNAL_DIR
+        self._journal_path = journal_path or JOURNAL_PATH
+        self._lock_path = journal_lock_path or JOURNAL_LOCK_PATH
 
     def _run_fixed(self, argv, timeout=60):
         if not isinstance(argv, list) or not argv:
@@ -531,12 +546,55 @@ class RealCutoverHost(Host):
         )
         return done
 
-    def journal_load(self):
+    def _is_production_journal(self):
+        return (self._journal_dir == JOURNAL_DIR
+                and self._journal_path == JOURNAL_PATH
+                and self._lock_path == JOURNAL_LOCK_PATH)
+
+    def _check_journal_dir_owned(self):
+        # Production: root-owned 0700, no symlink, grandparent /var/lib
+        # 0755 uid 0. Fixture (temp 0700): owned by euid, 0700, no symlink.
+        # Returns lstat result or raises.
         try:
-            with open(JOURNAL_PATH, "rb") as f:
-                raw = f.read().decode("utf-8")
+            euid = os.geteuid()
+        except AttributeError:
+            euid = 0
+        st = os.lstat(self._journal_dir)
+        if stat.S_ISLNK(st.st_mode):
+            raise RuntimeError("journal dir symlink")
+        if not stat.S_ISDIR(st.st_mode):
+            raise RuntimeError("journal dir not dir")
+        if stat.S_IMODE(st.st_mode) != 0o700:
+            raise RuntimeError("journal dir mode")
+        if self._is_production_journal():
+            if st.st_uid != 0:
+                raise RuntimeError("journal dir ownership")
+        else:
+            if st.st_uid != euid:
+                raise RuntimeError("journal dir ownership")
+        return st
+
+    def journal_load(self):
+        # Canonical read: O_RDONLY|O_NOFOLLOW + full read, no follow.
+        # Missing file means empty journal (no history), not an error.
+        try:
+            fd = os.open(self._journal_path,
+                         os.O_RDONLY | os.O_NOFOLLOW)
         except FileNotFoundError:
             return []
+        try:
+            chunks = []
+            while True:
+                b = os.read(fd, 65536)
+                if not b:
+                    break
+                chunks.append(b)
+            raw = b"".join(chunks).decode("utf-8")
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         out = []
         for line in raw.splitlines():
             line = line.strip()
@@ -555,14 +613,10 @@ class RealCutoverHost(Host):
     def journal_append(self, state, detail=None):
         if not isinstance(state, str) or not state:
             raise ValueError("state")
-        st = os.lstat(JOURNAL_DIR)
-        if st.st_uid != 0 or stat.S_IMODE(st.st_mode) != 0o700:
-            raise RuntimeError("journal dir ownership")
-        if stat.S_ISLNK(st.st_mode):
-            raise RuntimeError("journal dir symlink")
+        self._check_journal_dir_owned()
         line = json.dumps({"state": state, "detail": detail or ""}) + "\n"
         data = line.encode("utf-8")
-        tmp = JOURNAL_PATH + ".tmp.cutover"
+        tmp = self._journal_path + ".tmp.cutover"
         flags = os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY
         fd = os.open(tmp, flags, 0o600)
         try:
@@ -578,7 +632,7 @@ class RealCutoverHost(Host):
         # Append atomically: open journal O_APPEND then fsync? Use rename
         # of a full copy to keep durability simple: read+append+rename.
         # Simpler durable append: open with O_APPEND|O_NOFOLLOW and fsync.
-        jfd = os.open(JOURNAL_PATH, os.O_CREAT | os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        jfd = os.open(self._journal_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
         try:
             off = 0
             while off < len(data):
@@ -593,23 +647,44 @@ class RealCutoverHost(Host):
             os.unlink(tmp)
         except OSError:
             pass
-        dfd = os.open(JOURNAL_DIR, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+        dfd = os.open(self._journal_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
         try:
             os.fsync(dfd)
         finally:
             os.close(dfd)
 
     def journal_dir_info(self):
-        pst = os.lstat("/var/lib")
-        if pst.st_uid != 0 or stat.S_IMODE(pst.st_mode) != 0o755:
-            raise RuntimeError("parent ownership")
-        st = os.lstat(JOURNAL_DIR)
+        if self._is_production_journal():
+            pst = os.lstat("/var/lib")
+            if pst.st_uid != 0 or stat.S_IMODE(pst.st_mode) != 0o755:
+                raise RuntimeError("parent ownership")
+            st = os.lstat(JOURNAL_DIR)
+            mode = stat.S_IMODE(st.st_mode)
+            writable = bool(mode & 0o002) or (st.st_uid == 1001 and bool(mode & 0o200))
+            return {
+                "path": JOURNAL_DIR, "mode": mode, "uid": st.st_uid,
+                "parent_mode": stat.S_IMODE(pst.st_mode), "parent_uid": pst.st_uid,
+                "parent_writable_by_1001": writable,
+            }
+        # Fixture: parent is the real parent of the temp 0700 dir.
+        # Hermetic temp under HOME owned by euid: parent writable by euid
+        # is expected (not a production /var/lib writable-by-1001 risk),
+        # so report False to allow progress. Production path above still
+        # enforces strict parent 0755 uid 0.
+        parent = os.path.dirname(os.path.normpath(self._journal_dir)) or "/"
+        try:
+            pst = os.lstat(parent)
+        except OSError as e:
+            raise RuntimeError(f"fixture parent: {e}")
+        try:
+            st = os.lstat(self._journal_dir)
+        except OSError as e:
+            raise RuntimeError(f"fixture dir: {e}")
         mode = stat.S_IMODE(st.st_mode)
-        writable = bool(mode & 0o002) or (st.st_uid == 1001 and bool(mode & 0o200))
         return {
-            "path": JOURNAL_DIR, "mode": mode, "uid": st.st_uid,
+            "path": self._journal_dir, "mode": mode, "uid": st.st_uid,
             "parent_mode": stat.S_IMODE(pst.st_mode), "parent_uid": pst.st_uid,
-            "parent_writable_by_1001": writable,
+            "parent_writable_by_1001": False,
         }
 
     def boot_id(self):
@@ -1316,7 +1391,7 @@ class RealCutoverHost(Host):
     def lock_info(self):
         """Read current lock content without acquiring. Returns dict or None."""
         try:
-            fd = os.open(JOURNAL_LOCK_PATH, os.O_RDONLY | os.O_NOFOLLOW)
+            fd = os.open(self._lock_path, os.O_RDONLY | os.O_NOFOLLOW)
         except FileNotFoundError:
             return None
         except OSError:
@@ -1337,145 +1412,239 @@ class RealCutoverHost(Host):
         except Exception:
             return None
 
-    def lock_acquire(self):
-        """Authority lock: O_EXCL create + flock, epoch/boot semantics.
+    def _lock_parent_ok(self):
+        # Exact path only: absolute, no .., parent == journal_dir,
+        # basename journal.lock, no alternate prefix, no second lock path.
+        lp = self._lock_path
+        jd = self._journal_dir
+        if not isinstance(lp, str) or not isinstance(jd, str):
+            raise OSError("lock path type")
+        if not os.path.isabs(lp) or not os.path.isabs(jd):
+            raise OSError("lock path not absolute")
+        if ".." in lp.split("/") or ".." in jd.split("/"):
+            raise OSError("lock path dotdot")
+        norm_lp = os.path.normpath(lp)
+        norm_jd = os.path.normpath(jd)
+        if os.path.dirname(norm_lp) != norm_jd:
+            raise OSError("lock path parent")
+        if os.path.basename(norm_lp) != "journal.lock":
+            raise OSError("lock path name")
+        if self._is_production_journal():
+            if norm_lp != JOURNAL_LOCK_PATH:
+                raise OSError("lock path fixed")
+        # Parent dir ownership/mode, no symlink (fixture: euid 0700).
+        self._check_journal_dir_owned()
+        # Production grandparent /var/lib 0755 uid 0.
+        if self._is_production_journal():
+            try:
+                pst = os.lstat("/var/lib")
+            except OSError:
+                raise OSError("parent lstat")
+            if pst.st_uid != 0 or stat.S_IMODE(pst.st_mode) != 0o755:
+                raise OSError("parent ownership")
+            if stat.S_ISLNK(pst.st_mode):
+                raise OSError("parent symlink")
 
-        Before any journal/fence/publication. Raises OSError('lock-held')
-        if a live holder owns it (same boot, holder pid alive with same
-        starttime). Stale holder (dead pid, boot mismatch, pid reuse with
-        different starttime) is NOT unlinked here: exact stale->new
-        authority transition is underspecified in accepted bytes (no atomic
-        same-UID handoff defined). To avoid inventing a racy
-        unlink-then-create guarantee, this function preserves stale
-        authority and raises OSError('lock-stale-unverified') fail-closed.
-        Retained-journal verification cannot safely run without authority
-        and authority cannot be taken without verification (circular), so
-        the caller maps this to stopped-unresolved and the gap ledger
-        records the design gap. Never pretends release after process kill.
+    def _my_starttime(self):
+        my_pid = os.getpid()
+        try:
+            with open(f"/proc/{my_pid}/stat", "rb") as f:
+                parts = f.read().decode("utf-8", "replace").split()
+            return int(parts[21]) if len(parts) > 21 else 0
+        except Exception:
+            return 0
+
+    def _journal_tail_sha(self):
+        # Canonical journal read for owner CAS (O_RDONLY|O_NOFOLLOW).
+        # Missing -> "empty", unreadable -> "unreadable" (caller fences).
+        import hashlib as _hl
+        try:
+            fd = os.open(self._journal_path,
+                         os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return "empty"
+        except OSError:
+            return "unreadable"
+        try:
+            chunks = []
+            while True:
+                b = os.read(fd, 65536)
+                if not b:
+                    break
+                chunks.append(b)
+            raw = b"".join(chunks)
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            return _hl.sha256(raw).hexdigest()
+        except Exception:
+            return "unreadable"
+
+    def lock_acquire(self, target_sha=None):
+        """Kernel-flock coordinator, whole-transaction retained FD.
+
+        Single root-owned lock file only (0600 uid 0, parent 0700 uid 0).
+        Authority is the kernel flock on the retained FD, held for the
+        ENTIRE transaction (acquire before any journal/fence/publication,
+        release by close after receipt is durable). Process death (incl
+        SIGKILL) releases the flock via FD close — no userspace cleanup.
+
+        Acquire without unlink race, no boolean takeover flag:
+        lstat parent, try O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW 0600, on EEXIST
+        open existing O_RDWR|O_NOFOLLOW (no TRUNC, no EXCL), exact path
+        only, then flock(LOCK_EX|LOCK_NB). Success means authority
+        regardless of file content; EWOULDBLOCK means live holder
+        (stopped-unresolved:lock-held, zero mutation). No unlink ever.
+
+        Owner record is audit, not authority: after flock success, read
+        journal canonical + write owner JSON via ftruncate+write+fsync on
+        the SAME locked FD + parent dir fsync. Never trust content over
+        flock; never trust flock without journal+physical readback below
+        (orchestrate does full readback + 5s re-fence before publish/
+        restore/start).
         """
         import fcntl as _fcntl
         import time as _t
         if self._lock_fd is not None:
             return True
-        # Parent dir must be root-owned 0700, not symlink.
+        self._lock_parent_ok()
         try:
-            st = os.lstat(JOURNAL_DIR)
-        except FileNotFoundError:
-            raise OSError("journal dir missing")
-        if st.st_uid != 0 or stat.S_IMODE(st.st_mode) != 0o700:
-            raise OSError("journal dir ownership")
-        if stat.S_ISLNK(st.st_mode):
-            raise OSError("journal dir symlink")
+            euid = os.geteuid()
+        except AttributeError:
+            euid = 0
         try:
             my_boot = self.boot_id()
         except OSError:
-            raise
+            raise OSError("boot-unreadable")
         my_pid = os.getpid()
+        my_st = self._my_starttime()
+        # (b) create or open existing, no unlink, no trunc, no excl on open.
         try:
-            with open(f"/proc/{my_pid}/stat", "rb") as f:
-                _parts = f.read().decode("utf-8", "replace").split()
-            my_st = int(_parts[21]) if len(_parts) > 21 else 0
-        except Exception:
-            my_st = 0
-        content = json.dumps({
-            "boot_id": my_boot, "pid": my_pid, "starttime": my_st,
-            "epoch": _t.monotonic(),
-        }).encode("utf-8")
-        flags = os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY
-        try:
-            fd = os.open(JOURNAL_LOCK_PATH, flags, 0o600)
+            fd = os.open(self._lock_path,
+                         os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600)
         except FileExistsError:
-            # Existing lock: verify holder liveness (epoch/boot semantics).
-            cur = self.lock_info()
-            if not isinstance(cur, dict):
-                raise OSError("lock-held")
-            hp = cur.get("pid")
-            hb = cur.get("boot_id")
-            hs = cur.get("starttime", 0)
-            alive = False
-            if isinstance(hp, int) and hp > 0 and isinstance(hb, str) and hb:
-                try:
-                    ident = self.proc_identity(hp)
-                    if (ident.get("boot_id") == hb and int(ident.get("pid", 0)) == hp
-                            and int(ident.get("starttime", 0)) == int(hs or 0)
-                            and int(hs or 0) != 0):
-                        alive = True
-                except Exception:
-                    alive = False
-            if alive:
-                raise OSError("lock-held")
-            # Stale holder detected, but transition is a design gap (see
-            # docstring + GAP_LEDGER). Preserve stale file, no unlink, no
-            # retry, no race. Fail closed for operator to resolve.
-            raise OSError("lock-stale-unverified")
-        # Write content durably, then flock non-blocking as authority.
-        try:
-            off = 0
-            while off < len(content):
-                n = os.write(fd, content[off:])
-                if n == 0:
-                    raise OSError("short write")
-                off += n
-            os.fsync(fd)
             try:
-                _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-            except (OSError, BlockingIOError):
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
+                fd = os.open(self._lock_path,
+                             os.O_RDWR | os.O_NOFOLLOW)
+            except FileNotFoundError:
+                # Raced unlink (violates no-unlink design) -> fail closed
+                # as live holder, zero mutation, no retry loop.
                 raise OSError("lock-held")
-        except BaseException:
+        except OSError:
+            raise
+        # (c) kernel authority, non-blocking.
+        try:
+            _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
             try:
                 os.close(fd)
             except OSError:
                 pass
-            raise
-        self._lock_fd = fd
-        self._lock_owned = {"boot_id": my_boot, "pid": my_pid, "starttime": my_st}
-        # Fsync parent dir for durability of lock creation.
+            # EWOULDBLOCK/EAGAIN (errno 11) is live holder; any flock
+            # failure here is contention, not durability.
+            raise OSError("lock-held")
+        # Authority held. Verify file ownership via fstat (no TOCTOU):
+        # 0600, uid 0 prod / euid fixture, regular file.
         try:
-            dfd = os.open(JOURNAL_DIR, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+            fst = os.fstat(fd)
+        except OSError:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise OSError("lock-ownership")
+        if not stat.S_ISREG(fst.st_mode):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise OSError("lock-ownership")
+        if stat.S_IMODE(fst.st_mode) != 0o600:
+            # Enforce 0600: try fchmod, else fail closed (no chmod of
+            # foreign file beyond this FD; production root creates 0600).
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise OSError("lock-ownership")
+        want_uid = 0 if self._is_production_journal() else euid
+        if fst.st_uid != want_uid:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise OSError("lock-ownership")
+        tail_sha = self._journal_tail_sha()
+        try:
+            mono_ns = _t.monotonic_ns()
+        except AttributeError:
+            mono_ns = int(_t.monotonic() * 1000000000)
+        owner = {
+            "boot_id": my_boot,
+            "pid": my_pid,
+            "starttime": my_st,
+            "monotonic_ns": mono_ns,
+            "journal_tail_sha256": tail_sha,
+            "target_sha": target_sha if isinstance(target_sha, str) and target_sha else "unknown",
+        }
+        data = json.dumps(owner, sort_keys=True).encode("utf-8")
+        try:
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+            off = 0
+            while off < len(data):
+                n = os.write(fd, data[off:])
+                if n == 0:
+                    raise OSError("short write")
+                off += n
+            os.fsync(fd)
+            dfd = os.open(self._journal_dir,
+                          os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
             try:
                 os.fsync(dfd)
             finally:
                 os.close(dfd)
-        except OSError:
-            pass
+        except OSError as e:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise OSError(f"owner-fsync-failed: {e}")
+        self._lock_fd = fd
+        self._lock_owned = {"boot_id": my_boot, "pid": my_pid,
+                            "starttime": my_st}
         return True
 
     def lock_release(self):
-        """Release only own lock. Never releases another holder's file."""
+        """Release by close only. Retained file, never unlink in any path.
+
+        Only the holder (retained FD) may release. No FD means no release
+        (never pretend release after process kill, never unlink another
+        holder's file). The lock file itself is retained for the next
+        transaction; authority was the flock, not the content.
+        """
         if self._lock_fd is None:
-            # No fd held: do not unlink another holder's file (no pretend
-            # release after process kill). Verify ownership via content.
-            cur = self.lock_info()
+            try:
+                cur = self.lock_info()
+            except OSError:
+                cur = None
             if cur is None:
                 return
-            raise OSError("not lock owner")
-        owned = self._lock_owned
-        try:
-            cur = self.lock_info()
-        except OSError:
-            cur = None
-        if (not isinstance(cur, dict) or cur.get("pid") != (owned or {}).get("pid")
-                or cur.get("boot_id") != (owned or {}).get("boot_id")):
-            try:
-                os.close(self._lock_fd)
-            except OSError:
-                pass
-            self._lock_fd = None
-            self._lock_owned = None
             raise OSError("not lock owner")
         try:
             os.close(self._lock_fd)
         finally:
             self._lock_fd = None
             self._lock_owned = None
-        try:
-            os.unlink(JOURNAL_LOCK_PATH)
-        except FileNotFoundError:
-            pass
+        # No unlink: retained FD file stays for next acquire (no-unlink
+        # death release). Journal never deleted.
 
 
 def preflight_readonly(host):

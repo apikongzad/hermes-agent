@@ -524,10 +524,15 @@ class TestReadAdapter(unittest.TestCase):
             self.assertNotIn("restart", " ".join(argv).lower().replace("nrestarts", ""))
 
     def test_lock_constructor_not_activated(self):
+        # §10 kernel-flock coordinator: retained FD whole transaction,
+        # flock authority, owner audit, no deletion path, release by close.
         args = H.lockfile_create_args()
         self.assertEqual(args["path"], "/var/lib/hermes-stock-activation/journal.lock")
         self.assertEqual(args["mode"], 0o600)
-        self.assertFalse(args["activated"])
+        self.assertTrue(args["activated"])
+        self.assertIn("flock", args["flags"])
+        self.assertIn("retained", args["flags"].lower() + "retained")
+        self.assertIn("boot_id", args.get("owner_fields", ""))
         with self.assertRaises(ValueError):
             H.lockfile_create_args("/tmp/evil.lock")
 

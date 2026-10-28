@@ -121,7 +121,8 @@ class FakeCutoverHost:
         except Exception:
             return None
 
-    def lock_acquire(self):
+    def lock_acquire(self, target_sha=None):
+        import hashlib as _hl
         import json as _j
         self.log.append("lock-acquire")
         if self._lock_held:
@@ -141,10 +142,11 @@ class FakeCutoverHost:
                 if hp == self._my_pid and hb == my_boot:
                     self._lock_held = True
                     return True
-                # Liveness: dead pid or boot mismatch or pidReuse => stale.
-                # Design gap: stale->new transition underspecified, no
-                # atomic same-UID handoff. Preserve stale file, fail closed
-                # (mirrors RealCutoverHost.lock_acquire, no unlink race).
+                # §10 kernel-flock authority: live holder blocks
+                # (EWOULDBLOCK -> lock-held, zero mutation). Dead/stale
+                # content is audit only, handoff succeeds via flock with
+                # no deletion path: overwrite owner via ftruncate-equivalent
+                # (retained file, release by close only).
                 alive = False
                 if isinstance(hp, int) and hp > 0 and isinstance(hb, str) and hb:
                     if hp not in self.dead_pids and hb == my_boot:
@@ -163,13 +165,22 @@ class FakeCutoverHost:
                         alive = False
                 if alive:
                     raise OSError("lock-held")
-                # Stale: preserve authority, no unlink, fail closed.
-                raise OSError("lock-stale-unverified")
+                # Stale/dead: flock would succeed (previous FD closed on
+                # death/reboot). Take over by overwriting owner record on
+                # the retained file, no deletion, no second acquire.
+                # Fall through to overwrite below.
             else:
                 raise OSError("lock-held")
+        try:
+            tail_raw = _j.dumps(self.journal, sort_keys=True).encode("utf-8")
+            tail_sha = _hl.sha256(tail_raw).hexdigest()
+        except Exception:
+            tail_sha = "test-tail"
         content = _j.dumps({
             "boot_id": my_boot, "pid": self._my_pid,
-            "starttime": self._my_starttime, "epoch": self.clock,
+            "starttime": self._my_starttime, "monotonic_ns": int(self.clock * 1000000000),
+            "journal_tail_sha256": tail_sha,
+            "target_sha": target_sha if isinstance(target_sha, str) and target_sha else "unknown",
         }).encode("utf-8")
         self.files[C.JOURNAL_LOCK_PATH] = content
         self._lock_held = True
@@ -195,10 +206,8 @@ class FakeCutoverHost:
         if not isinstance(cur, dict) or cur.get("pid") != self._my_pid:
             self._lock_held = False
             raise OSError("not lock owner")
-        try:
-            del self.files[C.JOURNAL_LOCK_PATH]
-        except KeyError:
-            pass
+        # §10 retained file, release by close only: no deletion path.
+        # Journal never deleted; lock file retained for next acquire.
         self._lock_held = False
 
     def journal_dir_info(self):
@@ -1041,6 +1050,11 @@ class TestCutoverContractSlice(unittest.TestCase):
         self.assertEqual(h.journal, [])
 
     def test_lock_stale_preserved_no_takeover(self):
+        # §10: dead holder needs no deletion to vacate. Stale content is
+        # audit, never authority: flock succeeds, owner overwritten via
+        # ftruncate-equivalent on retained file, no second acquire, no
+        # delete-retry. Prior journal preserved, successor fences and
+        # commits, single start, no duplicated start.
         import json as _j
         h = make_happy()
         dead = 88888
@@ -1051,13 +1065,17 @@ class TestCutoverContractSlice(unittest.TestCase):
         }).encode("utf-8")
         h.files[C.JOURNAL_LOCK_PATH] = stale
         r = C.orchestrate(h, C.Request(target_sha=TARGET))
-        # Stale holder: exact stale->new transition is a design gap (no
-        # atomic same-UID handoff). Preserve stale file, fail closed, no
-        # unlink race, zero start. See GAP_LEDGER §8.
-        self.assertEqual(r.state, "stopped-unresolved")
-        self.assertEqual([e for e in h.log if e.startswith("start:")], [])
-        self.assertEqual(h.files.get(C.JOURNAL_LOCK_PATH), stale)
+        self.assertEqual(r.state, "committed")
+        self.assertEqual(len([e for e in h.log if e.startswith("start:")]), 1)
+        # Retained file, not deleted: owner overwritten with new holder.
+        cur_raw = h.files.get(C.JOURNAL_LOCK_PATH)
+        self.assertIsNotNone(cur_raw)
+        self.assertNotEqual(cur_raw, stale)
+        cur = _j.loads(bytes(cur_raw).decode("utf-8"))
+        self.assertEqual(cur.get("boot_id"), h.boot_id())
+        self.assertNotEqual(cur.get("pid"), dead)
         self.assertIn("lock-acquire", h.log)
+        self.assertIn("committed", r.journal)
 
     def test_lock_release_owner_only(self):
         h = make_happy()
@@ -1068,9 +1086,13 @@ class TestCutoverContractSlice(unittest.TestCase):
         h2.files[C.JOURNAL_LOCK_PATH] = h.files[C.JOURNAL_LOCK_PATH]
         with self.assertRaises(OSError):
             h2.lock_release()
-        # Owner can release.
+        # Owner releases by close only: retained file, never deleted.
+        # Journal never deleted; lock file retained for next acquire.
+        before = h.files.get(C.JOURNAL_LOCK_PATH)
+        self.assertIsNotNone(before)
         h.lock_release()
-        self.assertNotIn(C.JOURNAL_LOCK_PATH, h.files)
+        self.assertIn(C.JOURNAL_LOCK_PATH, h.files)
+        self.assertEqual(h.files.get(C.JOURNAL_LOCK_PATH), before)
 
     def test_fsync_fail_closed_no_start(self):
         h = make_happy()
@@ -1080,17 +1102,22 @@ class TestCutoverContractSlice(unittest.TestCase):
         self.assertEqual([e for e in h.log if e.startswith("start:")], [])
 
     def test_lock_stale_reason_separate(self):
+        # §10: stale handoff succeeds via flock; there is no
+        # lock-stale-unverified reason anymore. Dead holder (boot mismatch
+        # also stale) is taken over, successor commits. Live holder still
+        # reports lock-held (covered separately).
         import json as _j
         h = make_happy()
         dead = 88888
         h.dead_pids.add(dead)
         h.files[C.JOURNAL_LOCK_PATH] = _j.dumps({
-            "boot_id": h.boot_id(), "pid": dead,
+            "boot_id": "different-boot-id", "pid": dead,
             "starttime": 8000002, "epoch": 1.0,
         }).encode("utf-8")
         r = C.orchestrate(h, C.Request(target_sha=TARGET))
-        self.assertEqual(r.state, "stopped-unresolved")
-        self.assertEqual(r.reason, "lock-stale-unverified")
+        self.assertEqual(r.state, "committed")
+        self.assertNotEqual(r.reason, "lock-stale-unverified")
+        self.assertIn("committed", r.journal)
 
 
 class TestRealHostOrchestrate(unittest.TestCase):
