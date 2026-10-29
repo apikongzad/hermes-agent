@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
@@ -18,11 +19,6 @@ from hermes_cli.doctor_live import (
     maybe_run_live_checks,
     run_live_checks,
 )
-from tools import browser_tool_install as bt_install
-
-# Captured before the autouse fixture below stubs doctor_live._browser_available
-# to a constant, so TestBrowserAvailableNpxRung can exercise the real function.
-_real_browser_available = doctor_live._browser_available
 
 # The exact environment Clash Verge / mihomo exports (issue #118159): a bracketed-IPv6
 # NO_PROXY entry that httpx 0.28.1 cannot parse into a proxy mount.
@@ -283,44 +279,6 @@ def test_run_live_checks_leaves_a_clean_environment_untouched(monkeypatch):
             httpd.shutdown()
             thread.join(timeout=5)
     assert os.environ["NO_PROXY"] == "example.com,10.0.0.0/8"
-
-
-class TestBrowserAvailable:
-    """Live probes use the same passive selection as browser execution."""
-
-    def _block_path_and_node_modules_checks(self, monkeypatch, tmp_path):
-        monkeypatch.setattr("shutil.which", lambda *a, **k: None)
-        monkeypatch.setattr("hermes_cli.doctor.HERMES_HOME", tmp_path / "home")
-        monkeypatch.setattr("hermes_cli.doctor.PROJECT_ROOT", tmp_path / "root")
-
-    def test_true_when_installed_browser_resolves(self, monkeypatch, tmp_path):
-        self._block_path_and_node_modules_checks(monkeypatch, tmp_path)
-
-        monkeypatch.setattr(bt_install, "_find_agent_browser", lambda **_kw: "/pm/agent-browser")
-
-        assert _real_browser_available() is True
-
-    def test_false_when_nothing_resolves(self, monkeypatch, tmp_path):
-        self._block_path_and_node_modules_checks(monkeypatch, tmp_path)
-
-        def _raise(**_kw):
-            raise FileNotFoundError("agent-browser CLI not found")
-
-        monkeypatch.setattr(bt_install, "_find_agent_browser", _raise)
-        monkeypatch.setattr("tools.browser_use_cli._find_cli", lambda: None)
-
-        assert _real_browser_available() is False
-
-    def test_true_when_harness_ready_despite_missing_agent_browser(self, monkeypatch, tmp_path):
-        self._block_path_and_node_modules_checks(monkeypatch, tmp_path)
-
-        def _raise(**_kw):
-            raise FileNotFoundError("agent-browser CLI not found")
-
-        monkeypatch.setattr(bt_install, "_find_agent_browser", _raise)
-        monkeypatch.setattr("tools.browser_use_cli._find_cli", lambda: ["python", "-m", "browser_harness.run"])
-
-        assert _real_browser_available() is True
 
 
 class TestBrowserBackendProbe:

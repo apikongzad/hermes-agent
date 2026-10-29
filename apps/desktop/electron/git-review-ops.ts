@@ -8,6 +8,7 @@ import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
+import { isGitEnvKey } from '@simple-git/argv-parser'
 import { simpleGit } from 'simple-git'
 
 import { resolveRequestedPathForIpc } from './hardening'
@@ -19,16 +20,52 @@ const REVIEW_FILE_CAP = 2_000
 const UNTRACKED_LINE_COUNT_CONCURRENCY = 16
 const UNTRACKED_LINE_COUNT_MAX_BYTES = 1024 * 1024
 
-// simple-git (3.x through 4.x) validates a custom binary path against an ASCII
-// whitelist — `/^([a-z]:)?([a-z0-9/.\_~-]+)$/i`. Everything outside it is
-// "restricted": a space in the default `C:\Program Files\Git\...`, the
-// parentheses in `Program Files (x86)`, the accented user name in
-// `C:\Users\João\...`. Without the escape hatch simple-git THROWS on such a
-// path; with it, it console.warns this exact message — the flag only
-// downgrades the throw. Exported so gitFor and its tests share one source of
-// truth.
-export const SIMPLE_GIT_UNSAFE_BINARY_WARN =
-  'Invalid value supplied for custom binary, restricted characters must be removed or supply the unsafe.allowUnsafeCustomBinary option'
+// simple-git validates a custom binary path against an ASCII whitelist
+// (`/^([a-z]:)?([a-z0-9/.\_~-]+)$/i`). Everything outside it is "restricted": a
+// space in the default `C:\Program Files\Git\...`, the parentheses in
+// `Program Files (x86)`, the accented user name in `C:\Users\João\...`. Without
+// `unsafe.allowUnsafeCustomBinary` simple-git THROWS on such a path.
+
+// simple-git 4 strips every guarded variable (any `GIT_*`, plus EDITOR, VISUAL,
+// PAGER, PREFIX, SSH_ASKPASS) from the environment git runs with, and rejects
+// the task when one is passed explicitly through `.env()`. These are the ones
+// the Review pane keeps forwarding from the user's own environment: the SSH
+// transport and askpass helpers `git push` authenticates with, and
+// GIT_TERMINAL_PROMPT, which stops a credential prompt from blocking a git
+// process that has no terminal.
+export const SIMPLE_GIT_ALLOWED_ENV = ['GIT_SSH_COMMAND', 'GIT_SSH', 'GIT_ASKPASS', 'SSH_ASKPASS', 'GIT_TERMINAL_PROMPT']
+
+// simple-git's vulnerability check additionally rejects GIT_SSH/GIT_SSH_COMMAND
+// and GIT_ASKPASS/SSH_ASKPASS in an explicit `.env()` (the Windows host path
+// below) unless these categories are enabled. The values come from the user's
+// environment, never from the renderer.
+const SIMPLE_GIT_ALLOWED_ENV_UNSAFE = { allowUnsafeAskPass: true, allowUnsafeSshCommand: true }
+
+const ALLOWED_ENV_KEYS = new Set(SIMPLE_GIT_ALLOWED_ENV.map(key => key.toLowerCase()))
+
+// Same test simple-git's environment guard applies, so the explicit env never
+// carries a key the guard would reject.
+function isGuardedGitEnvKey(key: string): boolean {
+  const lower = key.toLowerCase().trim()
+
+  return lower.startsWith('git_') || isGitEnvKey(lower)
+}
+
+// Explicit env for the Windows no-console host tuple: the host script needs
+// HERMES_GIT_ARGV0, and simple-git replaces the inherited env with whatever
+// `.env()` receives, so the rest of the environment is forwarded minus the
+// guarded keys that are not allow-listed.
+export function simpleGitHostEnv(base: NodeJS.ProcessEnv | undefined, gitBin: string): NodeJS.ProcessEnv {
+  const env = noConsoleGitEnv(base, gitBin)
+
+  for (const key of Object.keys(env)) {
+    if (isGuardedGitEnvKey(key) && !ALLOWED_ENV_KEYS.has(key.toLowerCase().trim())) {
+      delete env[key]
+    }
+  }
+
+  return env
+}
 
 // GUI-launched Electron apps on macOS inherit only a minimal PATH (no
 // /opt/homebrew/bin or /usr/local/bin), so `gh` — and the `git` gh shells out
@@ -56,71 +93,6 @@ function runGh(args, cwd, ghBin): Promise<{ ok: boolean; stdout: string; stderr:
   })
 }
 
-// Guarded env keys simple-git v4 strips or rejects unless allowlisted. Mirrors
-// `@simple-git/argv-parser` GitEnvKeys plus the `GIT_` prefix rule: every
-// `GIT_*` key (exact `GIT_` prefix, not a bare `git` prefix) plus
-// known-vulnerable non-prefixed keys such as EDITOR / VISUAL / PAGER. A bare
-// `startsWith('git')` wrongly strips `GITHUB_TOKEN`/`GH_TOKEN` (`github_*`
-// starts with `git`), which are not git config keys and must be forwarded.
-// Host values for guarded keys are never renderer input; the Windows
-// no-console path forwards only the additions it needs (HERMES_GIT_ARGV0 is
-// unguarded, GIT_TERMINAL_PROMPT is allowlisted) so arbitrary host
-// GIT_*/EDITOR values cannot turn an explicit `.env()` into an
-// allowEnvironment throw.
-const SIMPLE_GIT_GUARDED_ENV = new Set([
-  'editor',
-  'git_askpass',
-  'git_config_global',
-  'git_config_system',
-  'git_config_count',
-  'git_config_parameters',
-  'git_config',
-  'git_editor',
-  'git_exec_path',
-  'git_external_diff',
-  'git_pager',
-  'git_proxy_command',
-  'git_template_dir',
-  'git_sequence_editor',
-  'git_ssh',
-  'git_ssh_command',
-  'pager',
-  'prefix',
-  'ssh_askpass',
-  'visual'
-])
-
-export function isSimpleGitGuardedEnv(key: string): boolean {
-  const normalized = key.toLowerCase().trim()
-
-  return normalized.startsWith('git_') || SIMPLE_GIT_GUARDED_ENV.has(normalized)
-}
-
-// simple-git v4: an explicit `.env()` replaces the ambient environment for the
-// child, so forward the ambient copy minus guarded keys plus our own additions.
-// Only GIT_TERMINAL_PROMPT among our additions is guarded and needs the
-// allowEnvironment opt-in; HERMES_GIT_ARGV0 is unguarded.
-const SIMPLE_GIT_WINDOWS_ENV_ALLOWLIST = ['GIT_TERMINAL_PROMPT'] as const
-
-function simpleGitWindowsEnv(base: NodeJS.ProcessEnv, gitBin: string): NodeJS.ProcessEnv {
-  const full = noConsoleGitEnv(base, gitBin)
-  const env: NodeJS.ProcessEnv = {}
-
-  for (const [key, value] of Object.entries(full)) {
-    if (value === undefined) {
-      continue
-    }
-
-    if (isSimpleGitGuardedEnv(key) && !SIMPLE_GIT_WINDOWS_ENV_ALLOWLIST.includes(key as never)) {
-      continue
-    }
-
-    env[key] = value
-  }
-
-  return env
-}
-
 function gitFor(cwd, gitBin) {
   // `gitBin` is resolved inside the Electron main process from known install
   // locations or PATH — never renderer/user input, and the Windows tuple below is
@@ -144,25 +116,18 @@ function gitFor(cwd, gitBin) {
   // an explicit allowEnvironment opt-in for the Windows host path below.
   const host = windowsGitHost()
   const binary = simpleGitBinary(gitBin, host)
-  const unsafe = Boolean(gitBin) || Array.isArray(binary)
-  const needsWindowsEnv = Array.isArray(binary)
+  const unsafeBinary = Boolean(gitBin) || Array.isArray(binary)
 
-  const makeGit = () =>
-    simpleGit({
-      baseDir: cwd,
-      binary,
-      maxConcurrentProcesses: 4,
-      trimmed: false,
-      ...(needsWindowsEnv ? { allowEnvironment: [...SIMPLE_GIT_WINDOWS_ENV_ALLOWLIST] } : {}),
-      ...(unsafe ? { unsafe: { allowUnsafeCustomBinary: true } } : {})
-    })
+  const git = simpleGit({
+    allowEnvironment: SIMPLE_GIT_ALLOWED_ENV,
+    baseDir: cwd,
+    binary,
+    maxConcurrentProcesses: 4,
+    trimmed: false,
+    unsafe: { ...SIMPLE_GIT_ALLOWED_ENV_UNSAFE, ...(unsafeBinary ? { allowUnsafeCustomBinary: true } : {}) }
+  })
 
-  // v4: the escape hatch no longer console.warns (it logs via `debug`
-  // `plugin:binary` instead); the throw without the hatch is unchanged, and
-  // SIMPLE_GIT_UNSAFE_BINARY_WARN still names that error text.
-  const git = makeGit()
-
-  return needsWindowsEnv ? git.env(simpleGitWindowsEnv(process.env, gitBin || 'git')) : git
+  return Array.isArray(binary) ? git.env(simpleGitHostEnv(process.env, gitBin || 'git')) : git
 }
 
 // simple-git reports renames as `old => new` (and `dir/{old => new}/f`); resolve
